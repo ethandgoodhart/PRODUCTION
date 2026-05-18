@@ -190,7 +190,8 @@ elif [[ "$MODEL" == "segmentation" ]]; then
     # publishes seg + bev viz tiles. Pedals hold a constant target
     # speed; default is 8 mph unless --mph overrides it.
     INFER_ARGS=(--frames-dir "$FRAMES_DIR" --state-file "$AUTOWARE_STATE_FILE"
-                --target-mph "$SEGMENTATION_MPH")
+                --target-mph "$SEGMENTATION_MPH"
+                --source realsense --no-depth)
     if [[ -n "$VIDEO" ]]; then
         INFER_ARGS+=(--video "$VIDEO")
         [[ -n "$NO_LOOP" ]] && INFER_ARGS+=(--no-loop)

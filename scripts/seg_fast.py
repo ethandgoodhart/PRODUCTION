@@ -52,11 +52,21 @@ def build_bev_remap(calib: dict, img_h: int, img_w: int,
 
     Mirrors ``drive-by-segmentation/render.create_bev`` projection math.
     """
-    f = calib["intrinsics"]["focal_length"]
-    cx_param = calib["intrinsics"]["cx"]
-    cy_param = calib["intrinsics"]["cy"]
-    k1 = calib["intrinsics"]["k1"]
-    k2 = calib["intrinsics"]["k2"]
+    intr = calib["intrinsics"]
+    # Two supported projection models:
+    #   pinhole / brown_conrady — used by the RealSense D435i color stream
+    #       (already factory-rectified, so distortion coeffs are zero).
+    #   equidistant_fisheye — legacy ELP-USBFHD04H-L170 wide lens.
+    # New JSON exposes fx/fy separately; old JSON had a single focal_length.
+    model = (intr.get("model") or "equidistant_fisheye").lower()
+    is_pinhole = model in ("pinhole", "brown_conrady", "inverse_brown_conrady",
+                            "modified_brown_conrady", "rectilinear")
+    fx = float(intr.get("fx", intr.get("focal_length")))
+    fy = float(intr.get("fy", intr.get("focal_length", fx)))
+    cx_param = float(intr["cx"])
+    cy_param = float(intr["cy"])
+    k1 = float(intr.get("k1", 0.0))
+    k2 = float(intr.get("k2", 0.0))
     h = calib["extrinsics"]["height_m"]
 
     FT_TO_M = 0.3048
@@ -99,18 +109,30 @@ def build_bev_remap(calib: dict, img_h: int, img_w: int,
     cam_x = cam_x[m2]; cam_y = cam_y[m2]; cam_z = cam_z[m2]
     by_v = by_v[m2]; bx_v = bx_v[m2]
 
-    r3d = np.sqrt(cam_x * cam_x + cam_y * cam_y)
-    theta = np.arctan2(r3d, cam_z)
-    m3 = theta < math.pi * 0.47
-    cam_x = cam_x[m3]; cam_y = cam_y[m3]; r3d = r3d[m3]; theta = theta[m3]
-    by_v = by_v[m3]; bx_v = bx_v[m3]
+    if is_pinhole:
+        # Rectilinear projection — the RealSense color stream is already
+        # rectified to a pinhole model, so distortion coeffs are zero.
+        # FOV cutoff at ~85° off-axis to avoid catastrophic tan() blow-up
+        # when a ground-plane point lies almost in the principal-plane.
+        cos_theta = cam_z / np.sqrt(cam_x * cam_x + cam_y * cam_y + cam_z * cam_z)
+        m3 = cos_theta > math.cos(math.radians(85.0))
+        cam_x = cam_x[m3]; cam_y = cam_y[m3]; cam_z = cam_z[m3]
+        by_v = by_v[m3]; bx_v = bx_v[m3]
+        u = fx * cam_x / cam_z + cx_param
+        v = fy * cam_y / cam_z + cy_param
+    else:
+        r3d = np.sqrt(cam_x * cam_x + cam_y * cam_y)
+        theta = np.arctan2(r3d, cam_z)
+        m3 = theta < math.pi * 0.47
+        cam_x = cam_x[m3]; cam_y = cam_y[m3]; r3d = r3d[m3]; theta = theta[m3]
+        by_v = by_v[m3]; bx_v = bx_v[m3]
 
-    t2 = theta * theta
-    td = theta * (1 + k1 * t2 + k2 * t2 * t2)
-    rp = f * td
-    safe = r3d > 1e-8
-    u = np.where(safe, cx_param + rp * cam_x / r3d, cx_param)
-    v = np.where(safe, cy_param + rp * cam_y / r3d, cy_param)
+        t2 = theta * theta
+        td = theta * (1 + k1 * t2 + k2 * t2 * t2)
+        rp = fx * td
+        safe = r3d > 1e-8
+        u = np.where(safe, cx_param + rp * cam_x / r3d, cx_param)
+        v = np.where(safe, cy_param + rp * cam_y / r3d, cy_param)
     iu = np.floor(u).astype(np.int32)
     iv = np.floor(v).astype(np.int32)
     m4 = (iu >= 0) & (iu < img_w) & (iv >= 0) & (iv < img_h)

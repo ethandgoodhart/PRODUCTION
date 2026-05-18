@@ -507,21 +507,45 @@ def render_bev(pred_xy: "np.ndarray | None",
         v = int(round(cy - xf * pxm))
         return u, v
 
-    # Grid lines every 2 m, lighter every 10 m.
-    for m in range(-int(half_range_m), int(half_range_m) + 1):
-        if m == 0:
+    # Grid lines on a feet ruler — minor every 5 ft, major (brighter
+    # + labelled) every 10 ft. half_range_m=12 m ≈ 39.4 ft, so we
+    # walk ±35 ft in 5 ft steps. Labels are placed along the +x axis
+    # (vertical center column, marking forward distance) and along the
+    # +y axis (horizontal center row, marking lateral distance).
+    FT_PER_M = 3.28084
+    half_range_ft = half_range_m * FT_PER_M
+    ft_step = 5
+    ft_major = 10
+    for ft in range(-int(half_range_ft // ft_step) * ft_step,
+                    int(half_range_ft // ft_step) * ft_step + 1, ft_step):
+        if ft == 0:
             continue
-        col = (60, 60, 60) if m % 10 else (90, 90, 90)
-        # vertical (constant y, full x range)
-        u_left, _ = to_px(half_range_m, m)
-        u_right, _ = to_px(-half_range_m, m)
-        cv2.line(img, (u_left, 0), (u_right, h - 1), col, 1, cv2.LINE_AA)
-        # horizontal (constant x, full y range)
+        m = ft / FT_PER_M
+        is_major = (ft % ft_major == 0)
+        col = (95, 95, 95) if is_major else (55, 55, 55)
+        # vertical line at lateral offset m (constant y)
+        u_top, _ = to_px(half_range_m, m)
+        u_bot, _ = to_px(-half_range_m, m)
+        cv2.line(img, (u_top, 0), (u_bot, h - 1), col, 1, cv2.LINE_AA)
+        # horizontal line at forward distance m (constant x)
         _, v = to_px(m, half_range_m)
         cv2.line(img, (0, v), (w - 1, v), col, 1, cv2.LINE_AA)
+        # Labels on majors only — keep the ruler readable.
+        if is_major:
+            label = f"{ft:+d}ft"
+            # horizontal axis label (lateral) below the center row
+            ux, _ = to_px(0.0, m)
+            cv2.putText(img, label, (ux + 3, cy + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                        (150, 150, 150), 1, cv2.LINE_AA)
+            # vertical axis label (forward) right of the center column
+            _, vy = to_px(m, 0.0)
+            cv2.putText(img, label, (cx + 4, vy - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                        (150, 150, 150), 1, cv2.LINE_AA)
     # axes
-    cv2.line(img, (cx, 0), (cx, h - 1), (140, 140, 140), 1, cv2.LINE_AA)
-    cv2.line(img, (0, cy), (w - 1, cy), (140, 140, 140), 1, cv2.LINE_AA)
+    cv2.line(img, (cx, 0), (cx, h - 1), (170, 170, 170), 1, cv2.LINE_AA)
+    cv2.line(img, (0, cy), (w - 1, cy), (170, 170, 170), 1, cv2.LINE_AA)
 
     # Ego marker: filled triangle pointing up.
     pts = np.array([
@@ -543,7 +567,7 @@ def render_bev(pred_xy: "np.ndarray | None",
         cv2.circle(img, path_px[-1], 6, (255, 220, 100), -1, cv2.LINE_AA)
 
     # Title strip
-    title = "Alpamayo BEV  (x=forward, y=left, m)"
+    title = "Alpamayo BEV  (x=forward, y=left, ft)"
     cv2.putText(img, title, (12, 26),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
     return img

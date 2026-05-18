@@ -514,6 +514,34 @@ body.compact-cams .cam-tile .cam-badge {
 .cam-tile.viz-tile.viz-ready .cam-pending { display: none; }
 .cam-tile.viz-tile:not(.viz-ready) img { opacity: 0; }
 
+/* Enlarged viz tiles for BEV (alpamayo) and Segmentation (segmentation
+   model) — make their preview 3× the standard 300×180 cam tile so the
+   operator can read the BEV grid and segmentation detail. Spans 3
+   columns × 3 rows; gaps make the final footprint exactly 3× the base.
+   compact-cams (manual mode) isn't expected here since viz tiles only
+   appear when a model is engaged, but cover both cases for safety. */
+.cam-grid { grid-auto-rows: 180px; }
+body.compact-cams .cam-grid { grid-auto-rows: 96px; }
+.cam-tile[data-cam="bev"],
+.cam-tile[data-cam="seg"] {
+    grid-column: span 3;
+    grid-row: span 3;
+}
+/* The enlarged BEV/seg images are letterboxed instead of cropped so
+   the grid labels (and the seg image's bottom edge) stay visible.
+   Black background fills any leftover area inside the tile. */
+.cam-tile[data-cam="bev"] img,
+.cam-tile[data-cam="seg"] img {
+    object-fit: contain;
+    background: #000;
+}
+/* Push the autoware HUD up to clear the enlarged viz tile (base 424px
+   + 2 extra 180px rows + 2×12px gaps = 808px). */
+body:has(.cam-tile[data-cam="bev"].viz-ready) .autoware-hud,
+body:has(.cam-tile[data-cam="seg"].viz-ready) .autoware-hud {
+    bottom: 808px;
+}
+
 /* Autoware HUD — a small readout above the cam grid with predicted angle
    + status (autoware/human/stale/idle). Sits where the route-time footer
    used to, so we don't crowd the speed cluster. */

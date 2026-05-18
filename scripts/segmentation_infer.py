@@ -54,29 +54,31 @@ INFER_HZ_DEFAULT = 0.0
 MODEL_NAME = "segmentation"
 STEERING_SIGN = -1.0
 STEERING_COLUMN_RATIO = 15.0
-STEERING_EMA = 1.0
+STEERING_EMA = 0.35
 LOOKAHEAD_MIN_M = 2.5
 LOOKAHEAD_MAX_M = 10.0
 LOOKAHEAD_TIME_S = 0.9
+# Scalar gain on the pure-pursuit road-wheel angle. PP is geometrically
+# correct but tends to feel under-geared on a short-wheelbase low-speed
+# kart; bump above 1.0 for more aggressive turn-in.
+STEER_GAIN = 1.6
 
-LOOKAHEAD_HEADING_EMA = 0.4
+# Pure-pursuit on an arc-length-parameterized BEV centerline.
+# WHEELBASE_M : kart rear-to-front axle. ~0.8 m placeholder; tune live.
+# CENTERLINE_SMOOTH_WIN : window (in lane_local samples) for rolling-mean
+#   smoothing of the centerline before arc-length resampling. Tames per-
+#   frame planner jitter without lagging genuine path bends.
+# LOOKAHEAD_POINT_EMA : EMA on the (xL, yL) lookahead point itself. Smooths
+#   point jitter without adding lag to the steering response — preferred
+#   over cranking STEERING_EMA, which would delay sharp turns.
+WHEELBASE_M = 0.8
+CENTERLINE_SMOOTH_WIN = 5
+LOOKAHEAD_POINT_EMA = 0.3
 
-# Polynomial-decomposition steering gains.
-# Evaluated against recorded driving on 2026-05-03. The planner's lane_local
-# starts ~2 m ahead of the cart, so we evaluate the polynomial at the
-# lookahead distance (not at x=0) — the offset/heading terms then have
-# their conventional pure-pursuit meaning.
-#   STEER_K_CROSSTRACK : per meter of lateral offset at the lookahead
-#   STEER_K_HEADING    : per radian of path tangent at the lookahead
-#   STEER_K_CURVATURE  : per (1/m) of path curvature × lookahead_m
-STEER_K_CROSSTRACK = 0.04
-STEER_K_HEADING = 0.15
-STEER_K_CURVATURE = 0.08
-
-# Limit polynomial fit to a near-only window — the far end of the planner's
-# polyline is too noisy to inform our slope/curvature.
+# Limit pure-pursuit input to a near window — the far end of the planner's
+# polyline is too noisy to inform the lookahead point reliably.
 STEER_FIT_MIN_M = 1.0
-STEER_FIT_MAX_M = 6.0
+STEER_FIT_MAX_M = 10.0
 
 # Constant-speed target. ps5_drive consumes absolute pedal pot targets, so
 # keep this conservative and publish the intended speed separately for UI/logs.
@@ -84,6 +86,48 @@ TARGET_MPH = 8.0
 GAS_CONSTANT = 0.24
 GAS_PER_MPH = GAS_CONSTANT / TARGET_MPH
 BRAKE_CONSTANT = 0.0
+
+# Closed-loop speed control: PI on (target_mph − ego_mph) when ARKit is
+# fresh. Output is added to the open-loop feed-forward gas. Conservative
+# gains — we'd rather creep up than overshoot into the cart's natural
+# spring-back. Reset integrator when ARKit drops to avoid wind-up.
+SPEED_KP = 0.03   # gas per mph error
+SPEED_KI = 0.02   # gas per (mph·s) error
+SPEED_I_CLAMP = 0.30  # safety cap on |integral term| (gas units)
+# Trim clamp scales with the feed-forward so behavior is consistent across
+# target speeds — at 2 mph (ff≈0.06) we allow ±0.10 trim, at 8 mph (ff≈0.24)
+# we allow ±0.36. Prevents the wild 4× swing the fixed ±0.25 caused at low mph.
+GAS_TRIM_FLOOR = 0.20
+GAS_TRIM_SCALE = 1.5
+# Rolling-resistance floor: below this gas the kart barely moves. The pot↔mph
+# mapping (GAS_PER_MPH) is calibrated against the linear 5–8 mph regime; at
+# low mph the kart needs more gas than the linear extrapolation suggests just
+# to overcome rolling friction. Force feed-forward to at least this when the
+# user actually wants to move.
+ROLLING_GAS_FLOOR = 0.18
+
+# Brake-on-overshoot: when ego > target AND gas has already hit 0 (cannot
+# trim further), engage brake proportional to overshoot. Brake and gas are
+# mutually exclusive — coast-then-brake, never both — to avoid pad wear
+# under normal cruise. Only activates after BRAKE_DEADBAND_MPH of overshoot
+# so small ARKit jitter doesn't pulse the brake.
+BRAKE_KP = 0.06           # brake per mph overshoot
+BRAKE_MAX = 0.25          # absolute brake-pot ceiling under autosteer
+BRAKE_DEADBAND_MPH = 0.3  # mph overshoot before brake engages
+
+# Launch ramp: start at LAUNCH_GAS_MIN and ease up to the commanded gas
+# over LAUNCH_RAMP_S seconds so the kart doesn't jerk off the line. The
+# ramp is applied to the *final* commanded gas (ff + PI trim), so the PI
+# loop still corrects within the ramp ceiling instead of fighting it.
+LAUNCH_RAMP_S = 3.75
+LAUNCH_GAS_MIN = 0.02
+# Below this gas the kart can't break static friction. Ramp always rises to
+# at least this value (regardless of target_mph), and the stuck-detector
+# punches gas to it if we haven't started moving after the ramp ends. Once
+# the kart is rolling, the PI naturally trims back down to feed-forward.
+STICTION_GAS_BREAK = 0.22
+STICTION_EGO_MPH = 0.3
+STICTION_STUCK_S = 1.0
 
 
 def discover_v4l2_indices(count: int = 4, max_scan: int = 16) -> list[int]:
@@ -126,24 +170,30 @@ class RealSenseReader(threading.Thread):
     """
 
     def __init__(self, slug: str, width: int = 640, height: int = 480,
-                 fps: int = 30):
+                 fps: int = 30, enable_depth: bool = True):
         super().__init__(daemon=True, name=f"cam-{slug}")
         import pyrealsense2 as rs
         self.rs = rs
         self.slug = slug
+        self.enable_depth = enable_depth
         self.flip_code = CAMERA_ORIENTATION_FIX.get(slug)
         self.pipeline = rs.pipeline()
         cfg = rs.config()
         cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
+        if enable_depth:
+            cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
         profile = self.pipeline.start(cfg)
-        depth_sensor = profile.get_device().first_depth_sensor()
-        self.depth_scale = float(depth_sensor.get_depth_scale())
+        if enable_depth:
+            depth_sensor = profile.get_device().first_depth_sensor()
+            self.depth_scale = float(depth_sensor.get_depth_scale())
+            self.align = rs.align(rs.stream.color)
+        else:
+            self.depth_scale = 0.0
+            self.align = None
         color_prof = profile.get_stream(rs.stream.color).as_video_stream_profile()
         intr = color_prof.get_intrinsics()
         self.intrinsics = (float(intr.fx), float(intr.fy),
                            float(intr.ppx), float(intr.ppy))
-        self.align = rs.align(rs.stream.color)
         self.lock = threading.Lock()
         self.frame: np.ndarray | None = None
         self.depth: np.ndarray | None = None
@@ -158,16 +208,25 @@ class RealSenseReader(threading.Thread):
             except Exception:
                 time.sleep(0.05)
                 continue
-            aligned = self.align.process(frames)
-            c = aligned.get_color_frame()
-            d = aligned.get_depth_frame()
-            if not c or not d:
-                continue
-            color = np.asanyarray(c.get_data())
-            depth = np.asanyarray(d.get_data()).astype(np.float32) * self.depth_scale
-            if self.flip_code is not None:
-                color = cv2.flip(color, self.flip_code)
-                depth = cv2.flip(depth, self.flip_code)
+            if self.enable_depth:
+                aligned = self.align.process(frames)
+                c = aligned.get_color_frame()
+                d = aligned.get_depth_frame()
+                if not c or not d:
+                    continue
+                color = np.asanyarray(c.get_data())
+                depth = np.asanyarray(d.get_data()).astype(np.float32) * self.depth_scale
+                if self.flip_code is not None:
+                    color = cv2.flip(color, self.flip_code)
+                    depth = cv2.flip(depth, self.flip_code)
+            else:
+                c = frames.get_color_frame()
+                if not c:
+                    continue
+                color = np.asanyarray(c.get_data())
+                depth = None
+                if self.flip_code is not None:
+                    color = cv2.flip(color, self.flip_code)
             with self.lock:
                 self.frame = color
                 self.depth = depth
@@ -178,9 +237,13 @@ class RealSenseReader(threading.Thread):
         with self.lock:
             return None if self.frame is None else self.frame.copy()
 
-    def latest_color_depth(self) -> tuple[np.ndarray, np.ndarray] | None:
+    def latest_color_depth(self) -> tuple[np.ndarray, np.ndarray | None] | None:
         with self.lock:
-            if self.frame is None or self.depth is None:
+            if self.frame is None:
+                return None
+            if not self.enable_depth:
+                return self.frame.copy(), None
+            if self.depth is None:
                 return None
             return self.frame.copy(), self.depth.copy()
 
@@ -356,68 +419,161 @@ def adaptive_lookahead_m(speed_mph: float, speed_ok: bool) -> float:
 
 
 def constant_gas_for_mph(target_mph: float) -> float:
-    return float(np.clip(target_mph * GAS_PER_MPH, 0.0, 1.0))
+    # Linear pot↔mph map, but raised to ROLLING_GAS_FLOOR whenever the user
+    # asks for any forward motion. Without the floor, low-mph targets sit
+    # under the kart's actual rolling-resistance gas and the loop tops out
+    # short of the setpoint.
+    if target_mph <= 0.0:
+        return 0.0
+    return float(np.clip(max(target_mph * GAS_PER_MPH, ROLLING_GAS_FLOOR), 0.0, 1.0))
 
 
-_lookahead_heading_filt_deg: float | None = None
+class SpeedController:
+    """PI on (target_mph - ego_mph), output added to the open-loop gas."""
+
+    def __init__(self) -> None:
+        self.integral = 0.0
+        self.last_t = None
+
+    def reset(self) -> None:
+        self.integral = 0.0
+        self.last_t = None
+
+    def step(self, target_mph: float, ego_mph: float, ego_ok: bool,
+             feed_forward_gas: float, gas_ceiling: float = 1.0) -> tuple[float, float, float]:
+        """Return (gas, trim, brake). Gas/brake are mutually exclusive.
+
+        `gas_ceiling` lets the launch ramp cap the output without winding
+        the integrator: when the ramp is clipping us low, we suppress
+        integration in the direction that would wind further into the
+        clip — classic conditional-integration anti-windup.
+        """
+        now = time.monotonic()
+        if not ego_ok:
+            self.reset()
+            return float(np.clip(feed_forward_gas, 0.0, gas_ceiling)), 0.0, 0.0
+        dt = 0.1 if self.last_t is None else max(0.0, now - self.last_t)
+        self.last_t = now
+        err = target_mph - ego_mph
+
+        # Trim clamp scales with feed-forward → consistent authority at any
+        # target speed. At 2 mph: ±0.10 ; at 8 mph: ±0.36.
+        trim_clamp = max(GAS_TRIM_FLOOR, GAS_TRIM_SCALE * feed_forward_gas)
+
+        # Provisional integral, with conditional anti-windup:
+        # don't integrate further into the direction we're already saturated.
+        trial_integral = self.integral + err * dt
+        trim_unclipped = SPEED_KP * err + SPEED_KI * trial_integral
+        gas_unclipped = feed_forward_gas + trim_unclipped
+        saturated_high = gas_unclipped > gas_ceiling
+        saturated_low = gas_unclipped < 0.0
+        winding_into_clip = (
+            (saturated_high and err > 0) or (saturated_low and err < 0)
+        )
+        if not winding_into_clip:
+            self.integral = float(np.clip(
+                trial_integral,
+                -SPEED_I_CLAMP / max(SPEED_KI, 1e-6),
+                 SPEED_I_CLAMP / max(SPEED_KI, 1e-6),
+            ))
+
+        trim = SPEED_KP * err + SPEED_KI * self.integral
+        trim = float(np.clip(trim, -trim_clamp, trim_clamp))
+        gas = float(np.clip(feed_forward_gas + trim, 0.0, gas_ceiling))
+
+        # Engine braking via gas-off comes "free" — only blend in pad brake
+        # when we're still over target *with gas already at zero*. This keeps
+        # cruise running on gas alone and only touches the pedal pad when
+        # gravity (downhill) wants to push us past target.
+        brake = 0.0
+        overshoot = ego_mph - target_mph - BRAKE_DEADBAND_MPH
+        if gas <= 1e-3 and overshoot > 0.0:
+            brake = float(np.clip(BRAKE_KP * overshoot, 0.0, BRAKE_MAX))
+        return gas, trim, brake
+
+
+_lookahead_point_filt: tuple[float, float] | None = None
 
 
 def reset_lookahead_heading_filter() -> None:
-    global _lookahead_heading_filt_deg
-    _lookahead_heading_filt_deg = None
+    global _lookahead_point_filt
+    _lookahead_point_filt = None
+
+
+def _smooth_centerline(pts: np.ndarray, win: int) -> np.ndarray:
+    if win <= 1 or len(pts) < win:
+        return pts
+    k = np.ones(win, dtype=np.float64) / win
+    xs = np.convolve(pts[:, 0], k, mode="same")
+    ys = np.convolve(pts[:, 1], k, mode="same")
+    return np.stack([xs, ys], axis=1)
+
+
+def _resample_lookahead_point(pts: np.ndarray, lookahead_m: float) -> tuple[float, float] | None:
+    """Interpolate the lane point at arc length ≈ lookahead_m.
+
+    Works for arbitrarily sharp turns because arc length grows monotonically
+    even when the path curls past 90° (where y(x) breaks down)."""
+    if len(pts) < 2:
+        return None
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    if s[-1] <= 0.0:
+        return None
+    s_target = min(float(lookahead_m), float(s[-1]))
+    xL = float(np.interp(s_target, s, pts[:, 0]))
+    yL = float(np.interp(s_target, s, pts[:, 1]))
+    return xL, yL
 
 
 def lookahead_heading_steering_deg(lane_local: np.ndarray, lookahead_m: float) -> float | None:
-    """Polynomial-decomposition steering from a BEV lane centerline.
+    """Pure-pursuit steering from a BEV lane centerline.
 
-    Fits y(x) = a0 + a1 x + a2 x^2 to the lane points (x forward, y lateral)
-    inside a near-only window, then evaluates at the lookahead distance:
-        y_lh = y(lookahead_m)         (cross-track at the lookahead)
-        y'_lh = a1 + 2 a2 lookahead_m (heading at the lookahead)
-        kappa = 2 a2                  (path curvature)
-    Commanded heading = Ky·y_lh + Kh·y'_lh + Kκ·kappa·lookahead_m.
+    1. Smooth lane_local with a rolling mean (kills planner jitter).
+    2. Resample by arc length to get a stable lookahead point P=(xL, yL) —
+       this works at any turn sharpness, unlike a y(x) polynomial fit.
+    3. EMA the lookahead point (not the angle) so jitter is removed without
+       lagging real steering response.
+    4. Apply the bicycle pure-pursuit law:
+           alpha = atan2(yL, xL)                          # bearing, ±π
+           delta = atan2(2 L sin(alpha), Ld)              # road-wheel rad
+       alpha ranges across the full ±π, so delta * STEERING_COLUMN_RATIO
+       can ride all the way to ±270°.
     """
-    global _lookahead_heading_filt_deg
+    global _lookahead_point_filt
 
-    if lane_local is None or len(lane_local) < 6:
+    if lane_local is None or len(lane_local) < 4:
         return None
 
     pts = np.asarray(lane_local, dtype=np.float64)
     pts = pts[np.isfinite(pts).all(axis=1)]
     pts = pts[(pts[:, 0] > STEER_FIT_MIN_M) & (pts[:, 0] < STEER_FIT_MAX_M)]
-    if len(pts) < 6:
+    if len(pts) < 4:
         return None
 
-    x = pts[:, 0]
-    y = pts[:, 1]
-
-    # Sharper near-weighting than 1/(1+x) so the far end of the window doesn't
-    # dominate sheer-numerically when the planner emits many close-spaced points.
-    weights = np.exp(-x / 2.5)
-    try:
-        a2, a1, a0 = np.polyfit(x, y, deg=2, w=weights)
-    except (np.linalg.LinAlgError, ValueError):
+    pts = _smooth_centerline(pts, CENTERLINE_SMOOTH_WIN)
+    p = _resample_lookahead_point(pts, lookahead_m)
+    if p is None:
         return None
+    xL, yL = p
 
-    y_lh = float(a0 + a1 * lookahead_m + a2 * lookahead_m * lookahead_m)
-    yp_lh = float(a1 + 2.0 * a2 * lookahead_m)
-    kappa = 2.0 * float(a2)
-
-    crosstrack_rad = STEER_K_CROSSTRACK * y_lh
-    heading_rad = STEER_K_HEADING * yp_lh
-    curvature_rad = STEER_K_CURVATURE * kappa * float(lookahead_m)
-
-    raw_heading_deg = math.degrees(crosstrack_rad + heading_rad + curvature_rad)
-
-    if _lookahead_heading_filt_deg is None:
-        _lookahead_heading_filt_deg = raw_heading_deg
+    if _lookahead_point_filt is None:
+        _lookahead_point_filt = (xL, yL)
     else:
-        _lookahead_heading_filt_deg = (
-            LOOKAHEAD_HEADING_EMA * raw_heading_deg
-            + (1.0 - LOOKAHEAD_HEADING_EMA) * _lookahead_heading_filt_deg
+        a = LOOKAHEAD_POINT_EMA
+        _lookahead_point_filt = (
+            a * xL + (1.0 - a) * _lookahead_point_filt[0],
+            a * yL + (1.0 - a) * _lookahead_point_filt[1],
         )
+    xLf, yLf = _lookahead_point_filt
 
-    return float(np.clip(_lookahead_heading_filt_deg * STEERING_COLUMN_RATIO, -270.0, 270.0))
+    Ld = math.hypot(xLf, yLf)
+    if Ld < 1e-3:
+        return None
+    alpha = math.atan2(yLf, xLf)
+    delta = math.atan2(2.0 * WHEELBASE_M * math.sin(alpha), Ld)
+    column_deg = math.degrees(delta) * STEERING_COLUMN_RATIO * STEER_GAIN
+    return float(np.clip(column_deg, -270.0, 270.0))
 
 
 def make_sources(args) -> list[CameraReader | VideoReader | RealSenseReader]:
@@ -430,6 +586,7 @@ def make_sources(args) -> list[CameraReader | VideoReader | RealSenseReader]:
         rs_reader = RealSenseReader(
             slug=ACTIVE_SLUG,
             width=args.rs_width, height=args.rs_height, fps=args.rs_fps,
+            enable_depth=not args.no_depth,
         )
         return [rs_reader]
 
@@ -605,13 +762,64 @@ def cloud_bev_rgb(depth_m: np.ndarray, seg_map: np.ndarray,
 def draw_bev_viz(bev_rgb: np.ndarray, lane_traj: np.ndarray | None,
                  lane_local: np.ndarray | None, rt) -> np.ndarray:
     out = bev_rgb.copy()
+    # Foot-labelled distance grid. RANGE_FWD covers 0..forward_ft (ego at
+    # bottom); RANGE_SIDE covers ±side_ft (ego column at horizontal
+    # center). Minor lines every 5 ft, major + label every 10 ft.
+    FT_PER_M = 3.28084
+    fwd_ft = rt.RANGE_FWD * FT_PER_M
+    side_ft = rt.RANGE_SIDE * FT_PER_M
+    h, w = out.shape[:2]
+    ego_bx, ego_by = w // 2, h - 1
+    minor_col = (90, 90, 90)
+    major_col = (180, 180, 180)
+    label_col = (255, 255, 255)
+    label_shadow = (0, 0, 0)
+
+    def put_label(img, text, org):
+        cv2.putText(img, text, (org[0] + 1, org[1] + 1),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_shadow, 2, cv2.LINE_AA)
+        cv2.putText(img, text, org,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_col, 1, cv2.LINE_AA)
+
+    # Forward ticks (horizontal lines), every 5 ft up to fwd_ft.
+    for ft in range(5, int(fwd_ft) + 1, 5):
+        x_m = ft / FT_PER_M
+        by = int(round((1.0 - x_m / rt.RANGE_FWD) * h))
+        if not (0 <= by < h):
+            continue
+        is_major = (ft % 10 == 0)
+        cv2.line(out, (0, by), (w - 1, by),
+                 major_col if is_major else minor_col, 1, cv2.LINE_AA)
+        if is_major:
+            put_label(out, f"{ft}ft", (ego_bx + 6, by - 3))
+
+    # Lateral ticks (vertical lines), every 5 ft from -side_ft..+side_ft.
+    side_max = int(side_ft)
+    for ft in range(-side_max, side_max + 1, 5):
+        if ft == 0:
+            continue
+        y_m = ft / FT_PER_M
+        bx = int(round((y_m / rt.RANGE_SIDE * 0.5 + 0.5) * w))
+        if not (0 <= bx < w):
+            continue
+        is_major = (ft % 10 == 0)
+        cv2.line(out, (bx, 0), (bx, h - 1),
+                 major_col if is_major else minor_col, 1, cv2.LINE_AA)
+        if is_major:
+            put_label(out, f"{ft:+d}ft", (bx + 3, ego_by - 6))
+
+    # Axes through the ego.
+    cv2.line(out, (ego_bx, 0), (ego_bx, h - 1), (220, 220, 220), 1, cv2.LINE_AA)
+    cv2.line(out, (0, ego_by), (w - 1, ego_by), (220, 220, 220), 1, cv2.LINE_AA)
+    put_label(out, "x=forward (ft)", (ego_bx + 6, 16))
+    put_label(out, "y=lateral (ft)", (8, ego_by - 6))
+
     if lane_traj is not None:
         rt.draw_trajectory(out, lane_traj, (255, 255, 0), 3)
     la_point, _ = rt.lookahead_point(lane_local)
     if la_point is not None:
         la_bx = int((la_point[1] / rt.RANGE_SIDE * 0.5 + 0.5) * rt.BEV_SIZE)
         la_by = int((1 - la_point[0] / rt.RANGE_FWD) * rt.BEV_SIZE)
-        ego_bx, ego_by = rt.BEV_SIZE // 2, rt.BEV_SIZE - 1
         if 0 <= la_bx < rt.BEV_SIZE and 0 <= la_by < rt.BEV_SIZE:
             cv2.line(out, (ego_bx, ego_by), (la_bx, la_by),
                      (0, 255, 255), 2, cv2.LINE_AA)
@@ -640,6 +848,9 @@ def main() -> None:
     p.add_argument("--rs-width", type=int, default=640)
     p.add_argument("--rs-height", type=int, default=480)
     p.add_argument("--rs-fps", type=int, default=30)
+    p.add_argument("--no-depth", action="store_true",
+                   help="With --source realsense, skip the depth stream "
+                        "(color only). Forces --bev-mode homography.")
     p.add_argument("--bev-splat", type=int, default=1,
                    help="Half-width (px) of the box used to splat each cloud point in the BEV.")
     p.add_argument("--bev-depth-stride", type=int, default=2,
@@ -674,7 +885,10 @@ def main() -> None:
     )
     args = p.parse_args()
     args.target_mph = max(0.0, float(args.target_mph))
-    target_gas = constant_gas_for_mph(args.target_mph)
+    target_gas_ff = constant_gas_for_mph(args.target_mph)
+    speed_ctrl = SpeedController()
+    launch_start_t: float | None = None
+    stuck_since: float | None = None
 
     seg_live, rt, plan_path, create_bev, create_overlay, colors = (
         import_segmentation_stack(args.seg_repo)
@@ -732,6 +946,9 @@ def main() -> None:
     latest_lookahead_m = 0.0
     latest_ego_speed_mph = 0.0
     latest_ego_speed_ok = False
+    latest_target_gas = target_gas_ff
+    latest_gas_trim = 0.0
+    latest_target_brake = 0.0
     inference_ok = False
     latest_latency_ms: dict[str, float] = {}
     infer_count = 0
@@ -826,31 +1043,72 @@ def main() -> None:
                         )
                     mark("path_plan_ms")
 
-                    if lane_local is not None and len(lane_local) >= 4:
+                    path_ok = lane_local is not None and len(lane_local) >= 4
+                    if path_ok:
                         steer_est.update_bev(lane_local)
                         latest_path = [
                             [float(x), float(y)] for x, y in lane_local[:: max(1, len(lane_local) // 40)]
                         ]
-                        inference_ok = True
                     else:
                         latest_path = []
-                        inference_ok = False
+                    # Keep autosteer "fresh" even when the planner fails — we
+                    # hold the last commanded steering so the wheel doesn't
+                    # toggle stale on momentary centerline dropouts.
+                    inference_ok = True
                     mark("path_state_ms")
 
                     latest_ego_speed_mph, latest_ego_speed_ok = read_ego_speed_mph(
                         args.ego_state_file
                     )
                     latest_lookahead_m = adaptive_lookahead_m(latest_ego_speed_mph, latest_ego_speed_ok)
-                    heading_steer = lookahead_heading_steering_deg(lane_local, latest_lookahead_m)
-                    if heading_steer is not None:
-                        latest_steer_base = heading_steer * STEERING_SIGN
+                    if launch_start_t is None:
+                        launch_start_t = time.monotonic()
+                    ramp_age = time.monotonic() - launch_start_t
+                    # Always ramp toward at least stiction-break gas so low
+                    # mph targets (ff < stiction) still get the kart rolling.
+                    ramp_top = max(target_gas_ff, STICTION_GAS_BREAK)
+                    if LAUNCH_RAMP_S > 0.0 and ramp_age < LAUNCH_RAMP_S:
+                        frac = max(0.0, ramp_age / LAUNCH_RAMP_S)
+                        gas_ceiling = LAUNCH_GAS_MIN + frac * max(
+                            0.0, ramp_top - LAUNCH_GAS_MIN
+                        )
                     else:
-                        latest_steer_base = float(steer_est.steering_deg) * STEERING_SIGN
-                    latest_steer_filtered = (
-                        STEERING_EMA * latest_steer_base
-                        + (1.0 - STEERING_EMA) * latest_steer_filtered
+                        gas_ceiling = 1.0
+                    latest_target_gas, latest_gas_trim, latest_target_brake = speed_ctrl.step(
+                        args.target_mph,
+                        latest_ego_speed_mph,
+                        latest_ego_speed_ok,
+                        target_gas_ff,
+                        gas_ceiling=gas_ceiling,
                     )
-                    latest_steer_raw = float(np.clip(latest_steer_filtered, -270.0, 270.0))
+                    # Stuck-detector: if we're still essentially parked after
+                    # the launch ramp ends, override the controller with
+                    # stiction-break gas to get the wheels rolling. Once ego
+                    # > STICTION_EGO_MPH the PI takes over and pulls back.
+                    now_mono = time.monotonic()
+                    if (latest_ego_speed_ok
+                            and ramp_age > LAUNCH_RAMP_S
+                            and args.target_mph > STICTION_EGO_MPH
+                            and latest_ego_speed_mph < STICTION_EGO_MPH):
+                        if stuck_since is None:
+                            stuck_since = now_mono
+                        elif now_mono - stuck_since > STICTION_STUCK_S:
+                            latest_target_gas = max(latest_target_gas, STICTION_GAS_BREAK)
+                            latest_target_brake = 0.0
+                    else:
+                        stuck_since = None
+                    if path_ok:
+                        heading_steer = lookahead_heading_steering_deg(lane_local, latest_lookahead_m)
+                        if heading_steer is not None:
+                            latest_steer_base = heading_steer * STEERING_SIGN
+                        else:
+                            latest_steer_base = float(steer_est.steering_deg) * STEERING_SIGN
+                        latest_steer_filtered = (
+                            STEERING_EMA * latest_steer_base
+                            + (1.0 - STEERING_EMA) * latest_steer_filtered
+                        )
+                        latest_steer_raw = float(np.clip(latest_steer_filtered, -270.0, 270.0))
+                    # else: no path — hold latest_steer_* at their previous values.
                     mark("steer_ms")
                     overlay_rgb = create_overlay(frame_rgb, seg_map)
                     latest_overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
@@ -914,8 +1172,11 @@ def main() -> None:
                     "ego_speed_ok": latest_ego_speed_ok,
                     "steer_deg_base": latest_steer_base,
                     "steer_lookahead_m": latest_lookahead_m,
-                    "target_gas": target_gas if inference_ok else 0.0,
-                    "target_brake": BRAKE_CONSTANT,
+                    "target_gas": latest_target_gas if inference_ok else 0.0,
+                    "target_gas_ff": target_gas_ff,
+                    "target_gas_trim": latest_gas_trim,
+                    "speed_mode": "arkit_pi" if latest_ego_speed_ok else "feedforward_pot",
+                    "target_brake": latest_target_brake if inference_ok else 0.0,
                     "predicted_path": latest_path if inference_ok else [],
                     "segmentation": {
                         "bev_mode": args.bev_mode,

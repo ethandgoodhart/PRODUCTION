@@ -69,7 +69,7 @@
             <div><span class="ego-k">x</span><span class="ego-v" id="ego-x">—</span><span class="ego-u">m</span></div>
             <div><span class="ego-k">y</span><span class="ego-v" id="ego-y">—</span><span class="ego-u">m</span></div>
             <div><span class="ego-k">z</span><span class="ego-v" id="ego-z">—</span><span class="ego-u">m</span></div>
-            <div><span class="ego-k">speed</span><span class="ego-v" id="ego-speed">—</span><span class="ego-u">m/s</span></div>
+            <div><span class="ego-k">speed</span><span class="ego-v" id="ego-speed">—</span><span class="ego-u">mph</span></div>
             <div><span class="ego-k">yaw</span><span class="ego-v" id="ego-yaw">—</span><span class="ego-u">°</span></div>
             <div><span class="ego-k">curv</span><span class="ego-v" id="ego-curv">—</span><span class="ego-u">/m</span></div>
         </div>
@@ -797,7 +797,7 @@
                 egoX.textContent = (Number(sample.x_m) || 0).toFixed(2);
                 egoY.textContent = (Number(sample.y_m) || 0).toFixed(2);
                 egoZ.textContent = (Number(sample.z_m) || 0).toFixed(2);
-                egoSpeed.textContent = (Number(sample.speed_mps) || 0).toFixed(2);
+                egoSpeed.textContent = ((Number(sample.speed_mps) || 0) * 2.23694).toFixed(2);
                 egoYaw.textContent = ((Number(sample.yaw_rad) || 0) * 180 / Math.PI).toFixed(1);
                 egoCurv.textContent = (Number(sample.curvature_inv_m) || 0).toFixed(3);
             } else if (!connected) {
