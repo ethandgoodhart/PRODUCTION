@@ -1,16 +1,23 @@
 import json
 import os
+import signal
+import subprocess
 import time
 
-from flask import Flask, Response, abort, jsonify, render_template
+from flask import Flask, Response, abort, jsonify, render_template, request
 
 STATE_FILE = os.environ.get("CART_STATE_FILE", "/tmp/cart_state.json")
 AUTOWARE_STATE_FILE = os.environ.get(
     "AUTOWARE_STATE_FILE", "/tmp/autoware_state.json"
 )
+EGO_STATE_FILE = os.environ.get("EGO_STATE_FILE", "/tmp/ego_state.json")
 FRAMES_DIR = os.environ.get("CART_FRAMES_DIR", "/tmp/cart_frames")
+TELEOP_CMD_FILE = "/tmp/teleop_cmd.json"
+TELEOP_CMD_FRESH_S = 0.50
+TELEOP_TUNNEL_URL = "https://caddy.ethandgoodhart.com"
 STATE_FRESH_S = 1.0
 AUTOWARE_FRESH_S = 0.5  # autoware_infer writes at ~15 Hz; >500 ms = stale
+EGO_FRESH_S = 1.0       # ego_state_writer writes at 10 Hz; >1 s = writer died
 
 # Must match scripts/autoware_infer.py::ALL_STREAM_SLUGS. A request for
 # any other slug returns 404 — never stream arbitrary paths off the
@@ -21,6 +28,8 @@ CAM_SLUGS = (
     "front_wide", "front_narrow", "left", "right",
     "lanes", "depth", "seg", "objects",
     "lanes_solo",
+    # Alpamayo-only viz: top-down trajectory tile written by alpamayo_infer.py.
+    "bev",
 )
 MJPEG_FPS = 15           # per-client frame rate
 MJPEG_STALE_S = 2.0      # stop streaming if frame file hasn't updated
@@ -69,6 +78,9 @@ def state():
     # fetches. Field names mirror autoware_infer.py's state JSON 1:1
     # (running/stale are server-derived; everything else is pass-through).
     auto, auto_stale = _load_json(AUTOWARE_STATE_FILE, AUTOWARE_FRESH_S)
+    # ``model`` (default "autoware" for backwards compat with older state
+    # files) tells the UI which brain wrote this state — drives the badge
+    # text on each camera tile + the status pill verb.
     data["autoware"] = {
         "running": bool(auto) and not auto_stale,
         "inference": bool(auto.get("inference", False)),
@@ -80,8 +92,44 @@ def state():
         "active_cam": auto.get("active_cam"),
         "fps": float(auto.get("fps", 0.0)) if auto else 0.0,
         "cams": auto.get("cams", []),
+        "model": str(auto.get("model", "autoware")) if auto else "autoware",
+        # Alpamayo-only fields (autoware doesn't write these — defaults
+        # to 0 / [] so the UI can blindly read them either way).
+        "target_speed_mph": float(auto.get("target_speed_mph", 0.0)) if auto else 0.0,
+        "ego_speed_mph": float(auto.get("ego_speed_mph", 0.0)) if auto else 0.0,
+        "ego_speed_ok": bool(auto.get("ego_speed_ok", False)) if auto else False,
+        "steer_deg_base": float(auto.get("steer_deg_base", 0.0)) if auto else 0.0,
+        "steer_gain": float(auto.get("steer_gain", 1.0)) if auto else 1.0,
+        "steer_lookahead_m": float(auto.get("steer_lookahead_m", 0.0)) if auto else 0.0,
+        "target_gas": float(auto.get("target_gas", 0.0)) if auto else 0.0,
+        "target_brake": float(auto.get("target_brake", 0.0)) if auto else 0.0,
+        "predicted_path": list(auto.get("predicted_path", [])),
+        # Pass the alpamayo diagnostics block through verbatim so the UI
+        # can show the per-prediction latency breakdown + live MB/s.
+        # Empty dict for autoware (it never writes one), so the JS can
+        # safely read .alpamayo?.latency_ms?.gpu etc.
+        "alpamayo": dict(auto.get("alpamayo", {})) if auto else {},
+        "segmentation": dict(auto.get("segmentation", {})) if auto else {},
         "stale": auto_stale,
     }
+
+    # iPhone ego-motion publisher status. ego_state_writer.py mirrors the
+    # EgoSensor's connected flag + latest sample at ~10 Hz; if the writer
+    # dies or the iOS app stops streaming, the file goes stale and the UI
+    # dot turns red.
+    ego, ego_stale = _load_json(EGO_STATE_FILE, EGO_FRESH_S)
+    data["ego_connected"] = bool(ego.get("connected", False)) and not ego_stale
+    data["ego"] = {
+        "connected": data["ego_connected"],
+        "host": ego.get("host"),
+        "sample": ego.get("sample"),
+        "history_len": int(ego.get("history_len", 0)),
+        "stale": ego_stale,
+    }
+
+    if data.get("teleop_active"):
+        data["teleop_url"] = TELEOP_TUNNEL_URL + "/teleop"
+
     return jsonify(data)
 
 
@@ -160,6 +208,35 @@ def cam_mjpeg(slug: str):
     return Response(_mjpeg_stream(path),
                      mimetype="multipart/x-mixed-replace; boundary=caddyframe",
                      headers={"Cache-Control": "no-store, must-revalidate"})
+
+
+@app.route("/teleop")
+def teleop():
+    return render_template("teleop.html")
+
+
+@app.route("/teleop/command", methods=["POST"])
+def teleop_command():
+    data = request.get_json(silent=True)
+    if not data:
+        abort(400)
+    cmd = {
+        "steer": float(data.get("steer", 0.0)),
+        "gas": float(data.get("gas", 0.0)),
+        "brake": float(data.get("brake", 0.0)),
+        "ts": time.time(),
+    }
+    tmp = TELEOP_CMD_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cmd, f)
+    os.replace(tmp, TELEOP_CMD_FILE)
+    return "", 204
+
+
+@app.route("/quit", methods=["POST"])
+def quit_app():
+    subprocess.Popen(["pkill", "-f", "firefox"])
+    return "", 204
 
 
 if __name__ == "__main__":

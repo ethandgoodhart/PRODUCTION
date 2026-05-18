@@ -61,19 +61,23 @@ STATE_FILE_DEFAULT = Path("/tmp/autoware_state.json")
 
 # Order of physical USB cameras after v4l2 auto-discovery. Index `i` in
 # the scan maps to SLUGS[i].
-# Verified live (2026-04-25): on this cart's current USB topology, the
-# discovery order is wide / narrow / left / right — index 1 is the
-# narrow-FOV varifocal lens used for inference, index 2 is the left-side
-# fisheye. Re-plug USB cables and this order may change; that's the time
-# to revisit this list.
-SLUGS = ("front_wide", "front_narrow", "left", "right")
+# Verified live (2026-04-29): on this cart's current USB topology the
+# discovery order is narrow / left / wide / right — i.e. /dev/video0 is
+# the narrow-FOV varifocal lens used for inference, /dev/video2 is the
+# left-side fisheye, /dev/video6 is the (upside-down-mounted) wide
+# front, /dev/video10 is the right fisheye. Re-plug USB cables and this
+# order may change; that's the time to revisit this list.
+SLUGS = ("front_narrow", "front_wide", "left", "right")
 INFERENCE_SLUG = "front_narrow"
 # Cameras with non-standard install orientation. cv2.flip codes:
 #   0  = flip across the x-axis (vertical),
 #   1  = flip across the y-axis (horizontal),
 #  -1  = both (180° rotation).
 CAMERA_ORIENTATION_FIX = {
-    "front_wide": 0,    # flip across x-axis — camera mount inverts vertically
+    # Verified empirically: narrow needs full 180° rotation (mounted
+    # upside-down + y-axis mirrored); wide / left / right are
+    # right-side up natively.
+    "front_narrow": -1,
 }
 # The 4 model-output streams that ride alongside the camera streams in the
 # UI. These slugs land in /tmp/cart_frames/ exactly like the cameras and
@@ -954,6 +958,7 @@ def main() -> int:
                 "fps": (1.0 / mean_dt) if mean_dt > 0 else 0.0,
                 "cams": [r.slug for r in readers],
                 "source": "video" if video_source is not None else "camera",
+                "model": "autoware",
                 "ts": time.time(),
             }
             if video_source is not None:

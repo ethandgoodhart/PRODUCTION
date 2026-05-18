@@ -108,7 +108,7 @@ html, body {
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: #c9ccd3;
+    background: #d84a4a;
     border: 1.5px solid #ffffff;
     transition: background-color 180ms ease, box-shadow 180ms ease;
     pointer-events: none;
@@ -138,7 +138,7 @@ html, body {
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: #c9ccd3;
+    background: #d84a4a;
     transition: background-color 180ms ease, box-shadow 180ms ease;
 }
 .hw-item.connected .hw-dot {
@@ -336,13 +336,29 @@ html, body {
     transform-box: fill-box;
     transition: transform 90ms linear;
 }
+.steering-readouts {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    min-height: 14px;
+    font-variant-numeric: tabular-nums;
+}
 .steering-angle {
     font-size: 11px;
     font-weight: 500;
     letter-spacing: 0.14em;
     color: var(--muted);
-    font-variant-numeric: tabular-nums;
     text-transform: none;
+}
+.model-steering-angle {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #00bcd4;
+    text-shadow: 0 0 10px rgba(0, 188, 212, 0.35);
+}
+.model-steering-angle[hidden] {
+    display: none;
 }
 
 .pedal-stack {
@@ -548,4 +564,209 @@ body.compact-cams .autoware-hud {
     letter-spacing: 0;
     font-size: 13px;
     text-transform: none;
+}
+
+/* Top-of-screen alpamayo per-prediction latency + live MB/s strip.
+   Only shown while the alpamayo backend is publishing the latency_ms
+   and bandwidth_mbps fields (`hidden` toggled by JS). */
+.alpamayo-stats {
+    position: fixed;
+    top: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 11;
+    display: flex;
+    gap: 18px;
+    padding: 6px 14px;
+    background: rgba(18, 20, 26, 0.72);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    font-variant-numeric: tabular-nums;
+    pointer-events: none;
+    backdrop-filter: blur(6px);
+}
+.alpamayo-stats[hidden] { display: none; }
+.alpamayo-stats .stat {
+    display: inline-flex;
+    gap: 6px;
+    align-items: baseline;
+}
+.alpamayo-stats .lbl {
+    text-transform: uppercase;
+    color: rgba(220, 224, 232, 0.55);
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    font-size: 10px;
+}
+.alpamayo-stats .val {
+    color: #ffffff;
+    font-weight: 600;
+}
+.alpamayo-stats .stat.up   .lbl { color: #4cc38a; }
+.alpamayo-stats .stat.down .lbl { color: #58a6ff; }
+
+/* Live VLM chain-of-thought panel. Sits under the brand mark in the
+   top-left. Single line of text that wraps; capped width so it
+   doesn't bleed into the center HUD on long rationales. */
+.model-reasoning {
+    margin-top: 10px;
+    max-width: 320px;
+    padding: 6px 10px;
+    background: rgba(18, 20, 26, 0.72);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    pointer-events: none;
+    backdrop-filter: blur(6px);
+}
+.model-reasoning[hidden] { display: none; }
+.model-reasoning .mr-label {
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    color: rgba(220, 224, 232, 0.55);
+    font-weight: 700;
+    margin-bottom: 2px;
+}
+.model-reasoning .mr-text {
+    font-size: 12px;
+    line-height: 1.32;
+    color: #ffffff;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* ===== Quit hot-corner (top-right) ===== */
+.quit-corner {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: 60px;
+    height: 60px;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 200ms ease;
+}
+.quit-corner:hover,
+.quit-corner.active {
+    opacity: 1;
+}
+.quit-ring {
+    position: absolute;
+    width: 36px;
+    height: 36px;
+}
+.quit-ring-bg {
+    fill: none;
+    stroke: rgba(0, 0, 0, 0.08);
+    stroke-width: 2.5;
+}
+.quit-ring-fg {
+    fill: none;
+    stroke: #d84a4a;
+    stroke-width: 2.5;
+    stroke-linecap: round;
+    transform: rotate(-90deg);
+    transform-origin: center;
+}
+.quit-x {
+    position: relative;
+    font-size: 16px;
+    font-weight: 300;
+    color: var(--muted);
+    line-height: 1;
+    transition: color 180ms ease;
+}
+.quit-corner.active .quit-x {
+    color: #d84a4a;
+}
+
+/* Ego-motion 3D mini-cube panel (upper-right, below time/battery).
+   The canvas hosts a hand-rolled isometric wireframe — no three.js
+   for this widget; the projection is a 6-line affine transform. */
+.ego-panel {
+    position: fixed;
+    top: 86px;
+    right: 12px;
+    width: 232px;
+    padding: 10px 12px 8px 12px;
+    background: rgba(255, 255, 255, 0.86);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    z-index: 5;
+    font-size: 10px;
+    color: var(--ink-soft);
+    letter-spacing: 0.05em;
+}
+.ego-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-weight: 600;
+    font-size: 9.5px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 4px;
+}
+.ego-conn-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #d84a4a;
+    transition: background-color 180ms ease, box-shadow 180ms ease;
+}
+.ego-conn-dot.connected {
+    background: #7ed488;
+    box-shadow: 0 0 0 1.5px rgba(126, 212, 136, 0.18);
+}
+.ego-canvas {
+    display: block;
+    width: 100%;
+    height: 180px;
+    background: rgba(245, 247, 250, 0.6);
+    border-radius: 10px;
+}
+.ego-readout {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 2px 10px;
+    margin-top: 6px;
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+}
+.ego-readout > div {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+}
+.ego-k {
+    color: var(--muted);
+    font-weight: 500;
+    min-width: 32px;
+}
+.ego-v {
+    color: var(--ink);
+    font-weight: 500;
+    margin-left: auto;
+}
+.ego-u {
+    color: var(--muted);
+    font-size: 9.5px;
+}
+
+/* Teleop link next to the mode pill */
+.teleop-link {
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 400;
+    margin-left: 8px;
+    letter-spacing: 0.01em;
 }

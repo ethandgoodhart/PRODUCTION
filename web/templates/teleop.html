@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Caddy Teleop</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; background: #0e1013; color: #e6e9ef;
+            font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+
+        .top-bar {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 6px 16px; background: #16181d; border-bottom: 1px solid #2a2d33;
+            font-size: 13px; z-index: 10; position: relative;
+        }
+        .top-bar .brand { font-weight: 700; font-size: 16px; letter-spacing: 0.02em; }
+        .top-bar .brand small { font-weight: 400; font-size: 11px; color: #7e8896; margin-left: 6px; }
+        .teleop-badge {
+            display: inline-flex; align-items: center; gap: 6px;
+            background: #1a3a2a; border: 1px solid #2d6b45; border-radius: 6px;
+            padding: 3px 10px; font-size: 12px; font-weight: 600; color: #7ed488;
+        }
+        .teleop-badge.inactive { background: #3a1a1a; border-color: #6b2d2d; color: #e8605c; }
+        .teleop-badge .dot {
+            width: 7px; height: 7px; border-radius: 50%; background: #7ed488;
+        }
+        .teleop-badge.inactive .dot { background: #e8605c; }
+        .status-row { display: flex; gap: 16px; align-items: center; font-variant-numeric: tabular-nums; }
+        .status-item { display: flex; align-items: baseline; gap: 4px; }
+        .status-item .lbl { color: #7e8896; font-size: 10px; text-transform: uppercase; font-weight: 600; letter-spacing: 0.05em; }
+        .status-item .val { font-size: 18px; font-weight: 600; }
+
+        .main-layout {
+            display: grid; grid-template-columns: 1fr 280px;
+            height: calc(100vh - 40px);
+        }
+
+        .cam-grid {
+            display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+            gap: 2px; padding: 2px; height: 100%;
+        }
+        .cam-cell { position: relative; background: #000; overflow: hidden; }
+        .cam-cell img { width: 100%; height: 100%; object-fit: cover; }
+        .cam-label {
+            position: absolute; top: 6px; left: 8px;
+            background: rgba(0,0,0,0.7); padding: 2px 8px;
+            font-size: 11px; border-radius: 3px; color: #aab;
+        }
+
+        .sidebar {
+            background: #16181d; border-left: 1px solid #2a2d33;
+            display: flex; flex-direction: column; padding: 12px; gap: 12px;
+            overflow-y: auto;
+        }
+        .panel {
+            background: #1a1c20; border: 1px solid #2a2d33; border-radius: 10px;
+            padding: 10px 12px;
+        }
+        .panel-title {
+            font-weight: 600; font-size: 10px; text-transform: uppercase;
+            color: #7e8896; letter-spacing: 0.05em; margin-bottom: 8px;
+        }
+
+        .wheel-wrap { display: flex; flex-direction: column; align-items: center; }
+        .wheel-svg { width: 100px; height: 100px; color: #cfd6e2; }
+        .wheel-svg #tele-wheel-g { transform-origin: 50px 50px; transition: transform 60ms linear; }
+        .steer-val { font-family: monospace; font-size: 20px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+
+        .pedal-row {
+            display: grid; grid-template-columns: 40px 1fr 40px;
+            gap: 6px; align-items: center; font-size: 11px;
+            font-variant-numeric: tabular-nums; margin-top: 4px;
+        }
+        .pedal-row .pk { color: #7e8896; font-weight: 500; }
+        .pedal-row .pv { color: #e6e9ef; text-align: right; }
+        .pedal-bar { height: 8px; background: #0e1013; border-radius: 4px; overflow: hidden; }
+        .pedal-bar > div { height: 100%; width: 0%; border-radius: 4px; transition: width 60ms linear; }
+        .pedal-bar.gas > div { background: #7ed488; }
+        .pedal-bar.brake > div { background: #e8605c; }
+
+        .speed-display { text-align: center; }
+        .speed-num { font-size: 48px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+        .speed-unit { font-size: 12px; color: #7e8896; font-weight: 600; }
+
+        .controls-help {
+            font-size: 11px; color: #7e8896; line-height: 1.6;
+        }
+        .controls-help kbd {
+            display: inline-block; background: #2a2d33; border: 1px solid #3a3d43;
+            border-radius: 3px; padding: 1px 6px; font-family: monospace;
+            font-size: 11px; color: #cfd6e2; min-width: 22px; text-align: center;
+        }
+
+        .cmd-indicator {
+            display: flex; align-items: center; gap: 6px;
+            font-size: 11px; color: #7e8896;
+        }
+        .cmd-dot {
+            width: 6px; height: 6px; border-radius: 50%;
+            background: #666; transition: background 120ms;
+        }
+        .cmd-dot.sending { background: #7ed488; }
+
+        .touch-controls {
+            display: none; position: fixed; bottom: 0; left: 0; right: 280px;
+            height: 180px; z-index: 20;
+            background: linear-gradient(transparent, rgba(0,0,0,0.7));
+            pointer-events: none;
+        }
+        @media (pointer: coarse) {
+            .touch-controls { display: flex; align-items: center; justify-content: space-around; }
+            .touch-btn {
+                pointer-events: auto; width: 70px; height: 70px; border-radius: 50%;
+                background: rgba(255,255,255,0.12); border: 2px solid rgba(255,255,255,0.25);
+                display: flex; align-items: center; justify-content: center;
+                font-size: 28px; color: rgba(255,255,255,0.7); user-select: none;
+                -webkit-user-select: none; touch-action: none;
+            }
+            .touch-btn:active { background: rgba(255,255,255,0.3); }
+        }
+    </style>
+</head>
+<body>
+    <div class="top-bar">
+        <div style="display:flex;align-items:center;gap:12px">
+            <span class="brand">Caddy <small>TELEOP</small></span>
+            <span class="teleop-badge inactive" id="teleop-badge">
+                <span class="dot"></span>
+                <span id="teleop-status">WAITING</span>
+            </span>
+        </div>
+        <div class="status-row">
+            <div class="cmd-indicator">
+                <span class="cmd-dot" id="cmd-dot"></span>
+                <span id="cmd-status">idle</span>
+            </div>
+            <div class="status-item">
+                <span class="lbl">HW</span>
+                <span class="val" id="hw-status" style="font-size:11px;color:#7e8896">--</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="main-layout">
+        <div class="cam-grid">
+            <div class="cam-cell">
+                <img id="cam-front-wide" alt="" />
+                <div class="cam-label">Front Wide</div>
+            </div>
+            <div class="cam-cell">
+                <img id="cam-front-narrow" alt="" />
+                <div class="cam-label">Front Narrow</div>
+            </div>
+            <div class="cam-cell">
+                <img id="cam-left" alt="" />
+                <div class="cam-label">Left</div>
+            </div>
+            <div class="cam-cell">
+                <img id="cam-right" alt="" />
+                <div class="cam-label">Right</div>
+            </div>
+        </div>
+
+        <div class="sidebar">
+            <div class="panel speed-display">
+                <div class="speed-num" id="speed-val">0</div>
+                <div class="speed-unit">MPH</div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-title">Steering</div>
+                <div class="wheel-wrap">
+                    <svg class="wheel-svg" viewBox="0 0 100 100">
+                        <g id="tele-wheel-g">
+                            <circle cx="50" cy="50" r="40" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                            <circle cx="50" cy="50" r="10.5" fill="none" stroke="currentColor" stroke-width="3"/>
+                            <line x1="11" y1="50" x2="39" y2="50" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                            <line x1="61" y1="50" x2="89" y2="50" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                            <line x1="50" y1="61" x2="50" y2="89" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                        </g>
+                    </svg>
+                    <div class="steer-val" id="steer-val">0&deg;</div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-title">Pedals</div>
+                <div class="pedal-row">
+                    <span class="pk">GAS</span>
+                    <div class="pedal-bar gas"><div id="gas-bar"></div></div>
+                    <span class="pv" id="gas-val">0%</span>
+                </div>
+                <div class="pedal-row">
+                    <span class="pk">BRAKE</span>
+                    <div class="pedal-bar brake"><div id="brake-bar"></div></div>
+                    <span class="pv" id="brake-val">0%</span>
+                </div>
+            </div>
+
+            <div class="panel controls-help">
+                <div class="panel-title">Controls</div>
+                <div><kbd>W</kbd> / <kbd>&uarr;</kbd> &mdash; Gas</div>
+                <div><kbd>S</kbd> / <kbd>&darr;</kbd> &mdash; Brake</div>
+                <div><kbd>A</kbd> / <kbd>&larr;</kbd> &mdash; Steer left</div>
+                <div><kbd>D</kbd> / <kbd>&rarr;</kbd> &mdash; Steer right</div>
+                <div style="margin-top:6px"><kbd>Space</kbd> &mdash; E-brake</div>
+                <div style="margin-top:8px;color:#e8605c;font-weight:600">
+                    Teleop must be enabled on controller (Square btn)
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="touch-controls">
+        <div class="touch-btn" data-key="steer-left">&#9664;</div>
+        <div class="touch-btn" data-key="gas">&#9650;</div>
+        <div class="touch-btn" data-key="brake">&#9660;</div>
+        <div class="touch-btn" data-key="steer-right">&#9654;</div>
+    </div>
+
+<script>
+(function() {
+    const SEND_HZ = 20;
+    const CAM_REFRESH_MS = 80;
+    const STATE_POLL_MS = 100;
+
+    const keys = { gas: false, brake: false, steerLeft: false, steerRight: false, ebrake: false };
+    let steerAccum = 0.0;
+    const STEER_RATE = 1.8;
+    const STEER_RETURN = 4.0;
+
+    document.addEventListener('keydown', e => {
+        if (e.repeat) return;
+        switch (e.key) {
+            case 'w': case 'W': case 'ArrowUp':    keys.gas = true; break;
+            case 's': case 'S': case 'ArrowDown':  keys.brake = true; break;
+            case 'a': case 'A': case 'ArrowLeft':   keys.steerLeft = true; break;
+            case 'd': case 'D': case 'ArrowRight':  keys.steerRight = true; break;
+            case ' ':                                keys.ebrake = true; break;
+        }
+    });
+    document.addEventListener('keyup', e => {
+        switch (e.key) {
+            case 'w': case 'W': case 'ArrowUp':    keys.gas = false; break;
+            case 's': case 'S': case 'ArrowDown':  keys.brake = false; break;
+            case 'a': case 'A': case 'ArrowLeft':   keys.steerLeft = false; break;
+            case 'd': case 'D': case 'ArrowRight':  keys.steerRight = false; break;
+            case ' ':                                keys.ebrake = false; break;
+        }
+    });
+
+    // Touch controls
+    document.querySelectorAll('.touch-btn').forEach(btn => {
+        const k = btn.dataset.key;
+        const handler = (on) => {
+            if (k === 'gas') keys.gas = on;
+            else if (k === 'brake') keys.brake = on;
+            else if (k === 'steer-left') keys.steerLeft = on;
+            else if (k === 'steer-right') keys.steerRight = on;
+        };
+        btn.addEventListener('touchstart', e => { e.preventDefault(); handler(true); });
+        btn.addEventListener('touchend', e => { e.preventDefault(); handler(false); });
+        btn.addEventListener('touchcancel', e => handler(false));
+    });
+
+    const cmdDot = document.getElementById('cmd-dot');
+    const cmdStatus = document.getElementById('cmd-status');
+
+    let lastSendOk = 0;
+    async function sendCommand() {
+        const dt = 1.0 / SEND_HZ;
+        const steerInput = (keys.steerRight ? 1 : 0) - (keys.steerLeft ? 1 : 0);
+        if (steerInput !== 0) {
+            steerAccum += steerInput * STEER_RATE * dt;
+            steerAccum = Math.max(-1, Math.min(1, steerAccum));
+        } else {
+            if (Math.abs(steerAccum) < 0.01) {
+                steerAccum = 0;
+            } else {
+                steerAccum *= Math.exp(-STEER_RETURN * dt);
+            }
+        }
+
+        const gas = keys.ebrake ? 0 : (keys.gas ? 0.5 : 0);
+        const brake = keys.ebrake ? 1.0 : (keys.brake ? 0.6 : 0);
+
+        const body = JSON.stringify({ steer: steerAccum, gas, brake });
+        try {
+            await fetch('/teleop/command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body,
+            });
+            lastSendOk = Date.now();
+            cmdDot.classList.add('sending');
+            cmdStatus.textContent = `steer=${steerAccum.toFixed(2)} gas=${gas.toFixed(1)} brake=${brake.toFixed(1)}`;
+        } catch (e) {
+            cmdDot.classList.remove('sending');
+            cmdStatus.textContent = 'send failed';
+        }
+    }
+    setInterval(sendCommand, 1000 / SEND_HZ);
+
+    // Fade the command dot if no activity
+    setInterval(() => {
+        if (Date.now() - lastSendOk > 300) cmdDot.classList.remove('sending');
+    }, 200);
+
+    // Camera snapshot polling (same approach as main UI for reliability)
+    function refreshCams() {
+        const t = Date.now();
+        for (const slug of ['front_wide', 'front_narrow', 'left', 'right']) {
+            const img = document.getElementById('cam-' + slug.replace('_', '-'));
+            if (img) img.src = `/cam/${slug}.jpg?t=${t}`;
+        }
+    }
+    refreshCams();
+    setInterval(refreshCams, CAM_REFRESH_MS);
+
+    // State polling
+    const speedEl = document.getElementById('speed-val');
+    const steerEl = document.getElementById('steer-val');
+    const wheelG = document.getElementById('tele-wheel-g');
+    const gasBar = document.getElementById('gas-bar');
+    const brakeBar = document.getElementById('brake-bar');
+    const gasVal = document.getElementById('gas-val');
+    const brakeVal = document.getElementById('brake-val');
+    const teleopBadge = document.getElementById('teleop-badge');
+    const teleopStatus = document.getElementById('teleop-status');
+    const hwStatus = document.getElementById('hw-status');
+
+    async function pollState() {
+        try {
+            const r = await fetch('/state', { cache: 'no-store' });
+            if (!r.ok) return;
+            const s = await r.json();
+
+            const mph = Number(s.mph) || 0;
+            speedEl.textContent = Math.round(mph);
+
+            const deg = Number(s.steer_deg) || 0;
+            wheelG.style.transform = `rotate(${deg}deg)`;
+            steerEl.innerHTML = `${deg >= 0 ? '+' : ''}${deg.toFixed(0)}&deg;`;
+
+            const gf = Math.max(0, Math.min(1, Number(s.gas_frac) || 0));
+            const bf = Math.max(0, Math.min(1, Number(s.brake_frac) || 0));
+            gasBar.style.width = (gf * 100) + '%';
+            brakeBar.style.width = (bf * 100) + '%';
+            gasVal.textContent = Math.round(gf * 100) + '%';
+            brakeVal.textContent = Math.round(bf * 100) + '%';
+
+            const active = !!s.teleop_active;
+            const driving = !!s.teleop_driving;
+            teleopBadge.classList.toggle('inactive', !active);
+            if (driving) {
+                teleopStatus.textContent = 'DRIVING';
+            } else if (active) {
+                teleopStatus.textContent = 'ENABLED';
+            } else {
+                teleopStatus.textContent = 'WAITING';
+            }
+
+            const parts = [];
+            if (s.controller_connected) parts.push('PS5');
+            if (s.arduino_connected) parts.push('Arduino');
+            if (s.motor_connected) parts.push('Motor');
+            hwStatus.textContent = parts.length ? parts.join(' / ') : 'no hardware';
+            hwStatus.style.color = parts.length >= 2 ? '#7ed488' : '#e8605c';
+        } catch (e) {
+            teleopBadge.classList.add('inactive');
+            teleopStatus.textContent = 'OFFLINE';
+        }
+    }
+    pollState();
+    setInterval(pollState, STATE_POLL_MS);
+})();
+</script>
+</body>
+</html>

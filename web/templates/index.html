@@ -17,6 +17,14 @@
                 <div class="brand-mark">Caddy</div>
                 <div class="brand-version">v1.0.0</div>
             </div>
+            <!-- Live chain-of-thought from the alpamayo VLM rollout
+                 (server-side ALPAMAYO_MAX_GEN_LEN must be > 1 to
+                 produce text). Hidden when no reasoning is being
+                 published — kiosk doesn't show an empty panel. -->
+            <div class="model-reasoning" id="model-reasoning" hidden>
+                <div class="mr-label">REASONING</div>
+                <div class="mr-text" id="mr-text">—</div>
+            </div>
         </div>
         <div class="top-center">
             <div class="autopilot-badge">
@@ -24,14 +32,18 @@
                     <img class="ap-icon" src="{{ url_for('static', filename='img/ps5-controller.png') }}" alt="" aria-hidden="true" />
                     <span class="status-dot" id="controller-dot" title="Controller"></span>
                 </span>
-                <span>Controller Mode</span>
+                <span id="mode-label">Controller Mode</span>
             </div>
+            <span class="teleop-link" id="teleop-link" hidden></span>
             <div class="hw-status" id="hw-status">
                 <span class="hw-item" id="hw-motor" title="Motor / ODrive">
                     <span class="hw-dot"></span><span class="hw-label">Motor</span>
                 </span>
                 <span class="hw-item" id="hw-arduino" title="Arduino / Pedals">
                     <span class="hw-dot"></span><span class="hw-label">Arduino</span>
+                </span>
+                <span class="hw-item" id="hw-ego" title="iPhone ARKit ego-motion stream (TCP via usbmuxd)">
+                    <span class="hw-dot"></span><span class="hw-label">Ego Motion Data Stream</span>
                 </span>
             </div>
         </div>
@@ -43,6 +55,25 @@
             </div>
         </div>
     </header>
+
+    <!-- Ego-motion 3D mini-cube. Wireframe cube viewed from the upper-
+         right octant; black dot = current iPhone-reported position,
+         red polyline = recent trajectory tail. Below: live numbers. -->
+    <div class="ego-panel" id="ego-panel">
+        <div class="ego-title">
+            <span>EGO MOTION</span>
+            <span class="ego-conn-dot" id="ego-conn-dot"></span>
+        </div>
+        <canvas class="ego-canvas" id="ego-canvas" width="220" height="180"></canvas>
+        <div class="ego-readout">
+            <div><span class="ego-k">x</span><span class="ego-v" id="ego-x">—</span><span class="ego-u">m</span></div>
+            <div><span class="ego-k">y</span><span class="ego-v" id="ego-y">—</span><span class="ego-u">m</span></div>
+            <div><span class="ego-k">z</span><span class="ego-v" id="ego-z">—</span><span class="ego-u">m</span></div>
+            <div><span class="ego-k">speed</span><span class="ego-v" id="ego-speed">—</span><span class="ego-u">m/s</span></div>
+            <div><span class="ego-k">yaw</span><span class="ego-v" id="ego-yaw">—</span><span class="ego-u">°</span></div>
+            <div><span class="ego-k">curv</span><span class="ego-v" id="ego-curv">—</span><span class="ego-u">/m</span></div>
+        </div>
+    </div>
 
     <!-- Center speed readout -->
     <div class="speed-cluster">
@@ -89,7 +120,10 @@
                     <line x1="50" y1="61" x2="50" y2="89" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
                 </g>
             </svg>
-            <div class="steering-angle" id="steer-angle">0°</div>
+            <div class="steering-readouts">
+                <span class="steering-angle" id="steer-angle">0°</span>
+                <span class="model-steering-angle" id="model-steer-angle">SEG —</span>
+            </div>
         </div>
         <div class="pedal-stack" id="pedal-stack" aria-hidden="true"></div>
     </div>
@@ -106,6 +140,22 @@
         <div class="indicator-dot"></div>
     </div>
 
+    <!-- Top-of-screen stats strip: per-prediction latency breakdown +
+         live up/down MB/s. Populated only while the alpamayo backend
+         is running (autoware doesn't expose latency/bandwidth fields). -->
+    <div class="alpamayo-stats" id="alpamayo-stats" hidden>
+        <span class="stat"><span class="lbl">INFERENCE</span><span class="val" id="stat-gpu">—</span></span>
+        <span class="stat"><span class="lbl">SERVER TOTAL</span><span class="val" id="stat-srv">—</span></span>
+        <span class="stat"><span class="lbl">DECODE</span><span class="val" id="stat-pre">—</span></span>
+        <span class="stat"><span class="lbl">RTT</span><span class="val" id="stat-rtt">—</span></span>
+        <span class="stat"><span class="lbl">NET</span><span class="val" id="stat-net">—</span></span>
+        <span class="stat"><span class="lbl">AGE</span><span class="val" id="stat-age">—</span></span>
+        <span class="stat"><span class="lbl">HZ</span><span class="val" id="stat-hz">—</span></span>
+        <span class="stat up"><span class="lbl">▲ UP</span><span class="val" id="stat-up">—</span></span>
+        <span class="stat down"><span class="lbl">▼ DOWN</span><span class="val" id="stat-down">—</span></span>
+        <span class="stat"><span class="lbl">REGION</span><span class="val" id="stat-region">—</span></span>
+    </div>
+
     <!-- Autoware status + predicted angle readout -->
     <div class="autoware-hud" id="autoware-hud">
         <span class="aw-status-dot"></span>
@@ -113,6 +163,7 @@
         <span class="aw-angle" id="aw-angle">—</span>
         <span id="aw-fps">—</span>
     </div>
+
 
     <!-- 4x2 stream grid.
          Row 1: raw cameras (slugs match scripts/autoware_infer.py::SLUGS).
@@ -125,29 +176,35 @@
          polling would push some tiles into a queued state that freezes
          them once the persistent socket eventually drops. -->
     <div class="cam-grid" id="cam-grid">
-        <!-- Row 1: cameras -->
+        <!-- Row 1: cameras. The badge text is overwritten in JS from
+             aw.model so the same HTML works for both autoware (AUTOWARE)
+             and alpamayo (ALPAMAYO) backends. -->
         <div class="cam-tile" data-cam="front_wide">
             <img alt="" />
             <div class="cam-label">Front Wide</div>
-            <div class="cam-badge">AUTOWARE</div>
+            <div class="cam-badge">—</div>
         </div>
         <div class="cam-tile" data-cam="front_narrow">
             <img alt="" />
             <div class="cam-label">Front Narrow</div>
-            <div class="cam-badge">AUTOWARE</div>
+            <div class="cam-badge">—</div>
         </div>
         <div class="cam-tile" data-cam="left">
             <img alt="" />
             <div class="cam-label">Left</div>
-            <div class="cam-badge">AUTOWARE</div>
+            <div class="cam-badge">—</div>
         </div>
         <div class="cam-tile" data-cam="right">
             <img alt="" />
             <div class="cam-label">Right</div>
-            <div class="cam-badge">AUTOWARE</div>
+            <div class="cam-badge">—</div>
         </div>
 
-        <!-- Row 2: model outputs. Hidden until Autoware viz is live. -->
+        <!-- Row 2: model output viz tiles. Each tile is shown only while
+             its slug appears in aw.viz_streams. Autoware publishes
+             lanes/depth/objects/seg; Alpamayo publishes bev. Tiles whose
+             slug isn't being published get display:none in JS so the
+             grid auto-collapses. -->
         <div class="cam-tile viz-tile" data-cam="lanes">
             <img alt="" />
             <div class="cam-label">Lanes</div>
@@ -168,6 +225,20 @@
             <div class="cam-label">Segmentation</div>
             <div class="cam-pending">model loading…</div>
         </div>
+        <div class="cam-tile viz-tile" data-cam="bev">
+            <img alt="" />
+            <div class="cam-label">BEV (Alpamayo)</div>
+            <div class="cam-pending">awaiting prediction…</div>
+        </div>
+    </div>
+
+    <!-- Quit hot-corner: mouse dwell in top-right for 1.5 s triggers exit -->
+    <div class="quit-corner" id="quit-corner">
+        <svg class="quit-ring" viewBox="0 0 36 36">
+            <circle class="quit-ring-bg" cx="18" cy="18" r="15.5" />
+            <circle class="quit-ring-fg" id="quit-ring-fg" cx="18" cy="18" r="15.5" />
+        </svg>
+        <span class="quit-x">&times;</span>
     </div>
 
     <script type="importmap">
@@ -193,6 +264,7 @@
         const speedEl = document.getElementById('speed');
         const wheelEl = document.getElementById('wheel-rotate');
         const angleEl = document.getElementById('steer-angle');
+        const modelAngleEl = document.getElementById('model-steer-angle');
 
         // Pedal stack: 10 gas dashes (top) + 10 brake dashes (bottom). Dashes
         // closest to the center light up first, extending outward as the
@@ -232,6 +304,7 @@
         const controllerDot = document.getElementById('controller-dot');
         const motorItem = document.getElementById('hw-motor');
         const arduinoItem = document.getElementById('hw-arduino');
+        const egoItem = document.getElementById('hw-ego');
 
         function setConnected(el, connected) {
             el.classList.toggle('connected', !!connected);
@@ -242,11 +315,30 @@
         const awStatus = document.getElementById('aw-status-text');
         const awAngle = document.getElementById('aw-angle');
         const awFps = document.getElementById('aw-fps');
+        // Top-of-screen alpamayo stats strip (latency + bandwidth).
+        const alpStats = document.getElementById('alpamayo-stats');
+        const statGpu = document.getElementById('stat-gpu');
+        const statSrv = document.getElementById('stat-srv');
+        const statPre = document.getElementById('stat-pre');
+        const statRtt = document.getElementById('stat-rtt');
+        const statNet = document.getElementById('stat-net');
+        const statAge = document.getElementById('stat-age');
+        const statHz  = document.getElementById('stat-hz');
+        const statUp  = document.getElementById('stat-up');
+        const statDown = document.getElementById('stat-down');
+        const statRegion = document.getElementById('stat-region');
+        const reasoningPanel = document.getElementById('model-reasoning');
+        const reasoningText  = document.getElementById('mr-text');
         const camTiles = {};
         const vizTiles = [];
+        // Camera tiles (front_*) get their badge text overwritten from
+        // aw.model so the same HTML serves both autoware + alpamayo.
+        const camBadgeEls = {};
         document.querySelectorAll('.cam-tile').forEach(el => {
             camTiles[el.dataset.cam] = el;
             if (el.classList.contains('viz-tile')) vizTiles.push(el);
+            const badge = el.querySelector('.cam-badge');
+            if (badge) camBadgeEls[el.dataset.cam] = badge;
         });
 
         // Snapshot polling.
@@ -279,28 +371,45 @@
         function updateAutoware(s) {
             const aw = s.autoware || {};
             const running = !!aw.running;
+            // Active model (autoware|alpamayo|…) drives the cam-badge
+            // text + the status pill verb. Default 'autoware' for
+            // backwards compat with state files written before the
+            // ``model`` field existed.
+            const model = (aw.model || 'autoware').toLowerCase();
+            const modelUpper = model.toUpperCase();
+            // Status pill: when the brain is engaged, label it with the
+            // model name (so "AUTOWARE" or "ALPAMAYO" instead of a
+            // hardcoded literal). Status CSS classes still use the
+            // generic 'engaged' verb so the existing CSS rules apply
+            // regardless of which model.
             // Precedence — ps5_drive's authoritative status wins when present,
             // else we infer from the running flag so the UI is still useful
             // when ps5_drive isn't launched with --autosteer.
-            let status = (s.autosteer_status || (running ? 'autoware' : 'idle'));
-            if (s.human_override) status = 'human';
+            let rawStatus = (s.autosteer_status || (running ? 'autoware' : 'idle'));
+            if (s.human_override) rawStatus = 'human';
+            // 'autoware' as a status string is now a generic "model is
+            // steering" indicator (kept for CSS compat). The visible text
+            // shows the model name instead.
+            const engaged = rawStatus === 'autoware';
             awHud.classList.remove(
                 'status-idle', 'status-autoware', 'status-human', 'status-stale'
             );
-            awHud.classList.add('status-' + status);
-            awStatus.textContent = status.toUpperCase();
+            awHud.classList.add('status-' + rawStatus);
+            awStatus.textContent = engaged ? modelUpper : rawStatus.toUpperCase();
+
+            // Update the cam-badge text on each camera tile to match the
+            // running model. Hidden ('—') when nothing is running.
+            const badgeText = running ? modelUpper : '—';
+            for (const slug of ['front_wide', 'front_narrow', 'left', 'right']) {
+                const b = camBadgeEls[slug];
+                if (b) b.textContent = badgeText;
+            }
 
             // Camera tile sizing follows drive mode: full-size only while
-            // Autoware is actively steering, compact in every other state
-            // (idle / human override / stale) so the cards don't dominate
-            // the screen during manual driving.
-            document.body.classList.toggle(
-                'compact-cams', status !== 'autoware'
-            );
+            // the model is actively steering, compact in every other state.
+            document.body.classList.toggle('compact-cams', !engaged);
 
-            // Angle shown is what Autoware currently predicts; when idle we
-            // show an em dash because a stale 0° could be misread as "model
-            // thinks we're centered" when really the model isn't running.
+            // Angle shown is what the active model currently predicts.
             if (running && aw.inference) {
                 const d = Number(aw.steer_deg) || 0;
                 awAngle.textContent = `${d >= 0 ? '+' : ''}${d.toFixed(0)}°`;
@@ -309,28 +418,91 @@
             }
             awFps.textContent = aw.fps ? `${aw.fps.toFixed(0)} FPS` : '';
 
-            // Highlight the active camera tile. Only one at a time; when the
-            // inference is off, no tile is highlighted.
+            // Highlight the active camera tile.
             const active = running && aw.inference ? aw.active_cam : null;
             for (const [slug, el] of Object.entries(camTiles)) {
                 el.classList.toggle('active', slug === active);
             }
-            // Viz tiles light up only once the sidecar starts publishing
-            // model outputs (separate flag from inference because we have
-            // a --no-viz mode that runs the steering model alone).
+            // Viz tiles: show only the slugs the active model is publishing
+            // (autoware → lanes/depth/objects/seg; alpamayo → bev). Hide
+            // the rest so the grid doesn't sit forever on "model loading…".
+            const live = new Set(aw.viz_streams || []);
             const vizLive = !!aw.viz;
             for (const el of vizTiles) {
-                el.classList.toggle('viz-ready', vizLive);
+                const inUse = vizLive && live.has(el.dataset.cam);
+                el.style.display = inUse ? '' : 'none';
+                el.classList.toggle('viz-ready', inUse);
             }
 
-            // Recolor the 3D predicted path. Gold the moment Autoware
-            // actually owns the wheel (status === 'autoware'); blue the
-            // instant the human pushes the stick past the deadzone or
-            // when Autoware isn't running. 'stale' / 'idle' fall through
-            // to blue too — gold is reserved for "the model is steering
-            // right now."
+            // Recolor the 3D predicted path: gold while the model owns the
+            // wheel, blue otherwise.
             if (typeof window.__setPathTone === 'function') {
-                window.__setPathTone(status === 'autoware' ? 'autoware' : 'human');
+                window.__setPathTone(engaged ? 'autoware' : 'human');
+            }
+
+            // Per-prediction latency + bandwidth strip. Shown only when
+            // the alpamayo backend is publishing the diagnostics fields.
+            const alp = aw.alpamayo || {};
+            const lat = alp.latency_ms || {};
+            const bw  = alp.bandwidth_mbps || {};
+            const hasLat = (lat.gpu !== undefined) && running;
+            alpStats.hidden = !hasLat;
+            if (hasLat) {
+                const fmtMs = v => (v == null) ? '—'
+                    : (v >= 1000 ? `${(v/1000).toFixed(2)}s` : `${v.toFixed(0)}ms`);
+                const fmtMbps = v => (v == null) ? '—' : `${v.toFixed(2)} MB/s`;
+                statGpu.textContent  = fmtMs(lat.gpu);
+                statSrv.textContent  = fmtMs(lat.srv_total);
+                statPre.textContent  = fmtMs(lat.srv_pre);
+                // RTT: real client-measured per-message round trip
+                // (send→recv), populated by the tunnel transport via
+                // the seq counter in the wire payload. Only meaningful
+                // once at least one prediction has come back; show '—'
+                // before that to avoid a misleading 0 ms reading.
+                statRtt.textContent  = (lat.rtt && lat.rtt > 0)
+                    ? fmtMs(lat.rtt) : '—';
+                // NET: time spent on the wire, after subtracting what
+                // the server self-reported (rtt − srv_total).
+                statNet.textContent  = (lat.net != null && lat.rtt > 0)
+                    ? fmtMs(lat.net) : '—';
+                // AGE: how stale the most-recent prediction is on the
+                // client right now (replay clock anchor). Useful to
+                // spot stalls; was previously labelled "PRED AGE".
+                const ageS = alp.recv_age_s;
+                statAge.textContent  = (ageS == null)
+                    ? '—' : `${(ageS * 1000).toFixed(0)}ms`;
+                statHz.textContent   = (aw.fps != null)
+                    ? `${aw.fps.toFixed(2)}` : '—';
+                statUp.textContent   = fmtMbps(bw.up);
+                statDown.textContent = fmtMbps(bw.down);
+                statRegion.textContent = alp.region || '—';
+            }
+            // Chain-of-thought reasoning panel under the brand mark.
+            // Hidden when no text is being published — kiosk doesn't
+            // show an empty box.
+            const reasoning = (alp.reasoning || '').trim();
+            if (reasoning) {
+                reasoningPanel.hidden = false;
+                if (reasoningText.textContent !== reasoning) {
+                    reasoningText.textContent = reasoning;
+                }
+            } else {
+                reasoningPanel.hidden = true;
+            }
+        }
+
+        const modeLabel = document.getElementById('mode-label');
+        const teleopLinkEl = document.getElementById('teleop-link');
+        function updateTeleop(s) {
+            const active = !!s.teleop_active;
+            const url = s.teleop_url || '';
+            modeLabel.textContent = active ? 'Teleop Mode' : 'Controller Mode';
+            if (active && url) {
+                teleopLinkEl.hidden = false;
+                teleopLinkEl.textContent = url;
+            } else {
+                teleopLinkEl.hidden = !active;
+                teleopLinkEl.textContent = active ? 'tunnel starting…' : '';
             }
         }
 
@@ -360,6 +532,30 @@
                 } else {
                     window.__steerDeg = steerDeg;
                 }
+                if (aw0.running && aw0.inference
+                        && (aw0.model || '').toLowerCase() === 'segmentation') {
+                    const targetDeg = Number.isFinite(Number(s.auto_steer_cmd_deg))
+                        ? Number(s.auto_steer_cmd_deg)
+                        : (Number(aw0.steer_deg) || 0);
+                    modelAngleEl.textContent = `SEG ${targetDeg >= 0 ? '+' : ''}${targetDeg.toFixed(0)}°`;
+                    modelAngleEl.hidden = false;
+                } else {
+                    modelAngleEl.textContent = 'SEG —';
+                    modelAngleEl.hidden = true;
+                }
+                // Hand the alpamayo trajectory (if any) to scene.js so
+                // the 3D path follows the actual predicted line, not
+                // just a single steering angle. autoware doesn't emit
+                // predicted_path → falls back to steerDeg-bent curve.
+                if (aw0.running && aw0.inference
+                        && Array.isArray(aw0.predicted_path)
+                        && aw0.predicted_path.length >= 2) {
+                    window.__predictedPath = aw0.predicted_path;
+                    window.__predictedPathInvertX = (aw0.model || '').toLowerCase() === 'segmentation';
+                } else {
+                    window.__predictedPath = null;
+                    window.__predictedPathInvertX = false;
+                }
 
                 updatePedalStack(
                     Math.max(0, Math.min(1, Number(s.gas_frac) || 0)),
@@ -369,16 +565,247 @@
                 setConnected(controllerDot, s.controller_connected);
                 setConnected(motorItem, s.motor_connected);
                 setConnected(arduinoItem, s.arduino_connected);
+                setConnected(egoItem, s.ego_connected);
+                updateEgo(s);
                 updateAutoware(s);
+                updateTeleop(s);
             } catch (e) {
                 setConnected(controllerDot, false);
                 setConnected(motorItem, false);
                 setConnected(arduinoItem, false);
+                setConnected(egoItem, false);
+                updateEgo({ ego_connected: false });
                 updateAutoware({});
             }
         }
         pollState();
         setInterval(pollState, 80);
+
+        // ===== Ego-motion 3D mini-cube =====
+        // Hand-rolled isometric viewer: viewpoint is the +X/+Y/+Z corner
+        // (upper-right-front in screen-space). Phone frame is +X right,
+        // +Y up, -Z forward — so "forward driving" pushes -Z, and the
+        // tail trails out toward +Z (back of cube). The cube auto-fits
+        // to the recent trail extent; min half-size keeps tiny motion
+        // visible.
+        const egoCanvas = document.getElementById('ego-canvas');
+        const egoCtx = egoCanvas.getContext('2d');
+        const egoConnDot = document.getElementById('ego-conn-dot');
+        const egoX = document.getElementById('ego-x');
+        const egoY = document.getElementById('ego-y');
+        const egoZ = document.getElementById('ego-z');
+        const egoSpeed = document.getElementById('ego-speed');
+        const egoYaw = document.getElementById('ego-yaw');
+        const egoCurv = document.getElementById('ego-curv');
+
+        // Bump canvas to device-pixel resolution once so lines stay crisp.
+        (function fitCanvas() {
+            const dpr = window.devicePixelRatio || 1;
+            const cssW = egoCanvas.clientWidth || 220;
+            const cssH = egoCanvas.clientHeight || 180;
+            egoCanvas.width = cssW * dpr;
+            egoCanvas.height = cssH * dpr;
+            egoCtx.scale(dpr, dpr);
+        })();
+        const EGO_W = egoCanvas.clientWidth || 220;
+        const EGO_H = egoCanvas.clientHeight || 180;
+
+        const egoTrail = [];                 // {x,y,z,t_s} — recentered: current sample is always (0,0,0)
+        const EGO_TRAIL_SECONDS = 6.0;       // show last 6 s of motion
+        const EGO_TRAIL_MAX = 80;            // hard cap; we trim by time below
+        const EGO_HALF_MIN = 1.0;            // metres; floor on cube extent
+        let egoLastTs = null;
+
+        // Camera: azimuth around Y (right of front), elevation above
+        // horizon. Picked off-isometric so the back-top edge isn't on
+        // the canvas centerline.
+        const EGO_CAM_AZ = 32 * Math.PI / 180;
+        const EGO_CAM_EL = 18 * Math.PI / 180;
+        const EGO_COS_AZ = Math.cos(EGO_CAM_AZ);
+        const EGO_SIN_AZ = Math.sin(EGO_CAM_AZ);
+        const EGO_COS_EL = Math.cos(EGO_CAM_EL);
+        const EGO_SIN_EL = Math.sin(EGO_CAM_EL);
+
+        function isoProject(x, y, z, half) {
+            // Phone frame: +X right, +Y up, -Z forward. Treat -Z as the
+            // "into the screen" axis after camera rotation, so flip z.
+            const nx = x / half;
+            const ny = y / half;
+            const nz = -z / half;
+            // Yaw around Y (camera moves to the right of forward).
+            const x1 = nx * EGO_COS_AZ + nz * EGO_SIN_AZ;
+            const y1 = ny;
+            const z1 = -nx * EGO_SIN_AZ + nz * EGO_COS_AZ;
+            // Pitch around X (camera tilts down).
+            const x2 = x1;
+            const y2 = y1 * EGO_COS_EL - z1 * EGO_SIN_EL;
+            // z2 unused (orthographic).
+            const cx = EGO_W / 2;
+            const cy = EGO_H / 2 + 4;
+            const scale = Math.min(EGO_W, EGO_H) * 0.34;
+            return [cx + x2 * scale, cy - y2 * scale];
+        }
+
+        function drawEgoCube(half) {
+            const C = [
+                [-1, -1, -1], [+1, -1, -1], [+1, +1, -1], [-1, +1, -1],
+                [-1, -1, +1], [+1, -1, +1], [+1, +1, +1], [-1, +1, +1],
+            ].map(([a, b, c]) => isoProject(a * half, b * half, c * half, half));
+            const E = [
+                [0,1],[1,2],[2,3],[3,0],
+                [4,5],[5,6],[6,7],[7,4],
+                [0,4],[1,5],[2,6],[3,7],
+            ];
+            egoCtx.lineWidth = 1;
+            egoCtx.strokeStyle = 'rgba(60, 70, 90, 0.45)';
+            egoCtx.beginPath();
+            for (const [a, b] of E) {
+                egoCtx.moveTo(C[a][0], C[a][1]);
+                egoCtx.lineTo(C[b][0], C[b][1]);
+            }
+            egoCtx.stroke();
+
+            // Floor grid (y = -half) for depth cue.
+            egoCtx.strokeStyle = 'rgba(60, 70, 90, 0.14)';
+            egoCtx.beginPath();
+            const N = 4;
+            for (let i = 1; i < N; i++) {
+                const t = -half + (2 * half) * (i / N);
+                let p1 = isoProject(t, -half, -half, half);
+                let p2 = isoProject(t, -half, +half, half);
+                egoCtx.moveTo(p1[0], p1[1]); egoCtx.lineTo(p2[0], p2[1]);
+                p1 = isoProject(-half, -half, t, half);
+                p2 = isoProject(+half, -half, t, half);
+                egoCtx.moveTo(p1[0], p1[1]); egoCtx.lineTo(p2[0], p2[1]);
+            }
+            egoCtx.stroke();
+
+            // Origin marker (recenter point).
+            const o = isoProject(0, 0, 0, half);
+            egoCtx.fillStyle = 'rgba(60, 70, 90, 0.35)';
+            egoCtx.beginPath();
+            egoCtx.arc(o[0], o[1], 1.6, 0, Math.PI * 2);
+            egoCtx.fill();
+        }
+
+        function renderEgoScene() {
+            egoCtx.clearRect(0, 0, EGO_W, EGO_H);
+            // Recenter: subtract current position from every trail point so
+            // the black dot is permanently at the cube center and the tail
+            // streams out behind it.
+            const last = egoTrail.length > 0 ? egoTrail[egoTrail.length - 1] : null;
+            const cx0 = last ? last.x : 0;
+            const cy0 = last ? last.y : 0;
+            const cz0 = last ? last.z : 0;
+
+            // Auto-fit half-extent to recentered trail with a floor.
+            let half = EGO_HALF_MIN;
+            for (const p of egoTrail) {
+                half = Math.max(
+                    half,
+                    Math.abs(p.x - cx0),
+                    Math.abs(p.y - cy0),
+                    Math.abs(p.z - cz0),
+                );
+            }
+            half *= 1.15;  // small padding
+
+            drawEgoCube(half);
+
+            // Red trail (recentered).
+            if (egoTrail.length >= 2) {
+                egoCtx.lineWidth = 1.6;
+                egoCtx.strokeStyle = 'rgba(216, 74, 74, 0.85)';
+                egoCtx.beginPath();
+                const p0 = isoProject(egoTrail[0].x - cx0, egoTrail[0].y - cy0, egoTrail[0].z - cz0, half);
+                egoCtx.moveTo(p0[0], p0[1]);
+                for (let i = 1; i < egoTrail.length; i++) {
+                    const p = isoProject(
+                        egoTrail[i].x - cx0,
+                        egoTrail[i].y - cy0,
+                        egoTrail[i].z - cz0,
+                        half,
+                    );
+                    egoCtx.lineTo(p[0], p[1]);
+                }
+                egoCtx.stroke();
+            }
+
+            // Black dot fixed at the cube center (current position).
+            const p = isoProject(0, 0, 0, half);
+            egoCtx.fillStyle = '#111215';
+            egoCtx.beginPath();
+            egoCtx.arc(p[0], p[1], 3.4, 0, Math.PI * 2);
+            egoCtx.fill();
+        }
+
+        // ===== Quit: press Q or dwell in top-right corner =====
+        function doQuit() {
+            fetch('/quit', { method: 'POST' });
+        }
+        document.addEventListener('keydown', e => {
+            if (e.key === 'q' || e.key === 'Q') doQuit();
+        });
+        const QUIT_DWELL_MS = 1500;
+        const quitCorner = document.getElementById('quit-corner');
+        const quitRingFg = document.getElementById('quit-ring-fg');
+        let quitTimer = null;
+        let quitStart = 0;
+        let quitRaf = 0;
+        function quitTick() {
+            const elapsed = Date.now() - quitStart;
+            const frac = Math.min(1, elapsed / QUIT_DWELL_MS);
+            const circ = 2 * Math.PI * 15.5;
+            quitRingFg.style.strokeDashoffset = circ * (1 - frac);
+            if (frac >= 1) { doQuit(); return; }
+            quitRaf = requestAnimationFrame(quitTick);
+        }
+        quitCorner.addEventListener('mouseenter', () => {
+            quitCorner.classList.add('active');
+            quitStart = Date.now();
+            const circ = 2 * Math.PI * 15.5;
+            quitRingFg.style.strokeDasharray = circ;
+            quitRingFg.style.strokeDashoffset = circ;
+            quitRaf = requestAnimationFrame(quitTick);
+        });
+        quitCorner.addEventListener('mouseleave', () => {
+            quitCorner.classList.remove('active');
+            cancelAnimationFrame(quitRaf);
+            const circ = 2 * Math.PI * 15.5;
+            quitRingFg.style.strokeDashoffset = circ;
+        });
+
+        function updateEgo(s) {
+            const connected = !!(s && s.ego_connected);
+            egoConnDot.classList.toggle('connected', connected);
+            const sample = s && s.ego && s.ego.sample;
+            if (sample && typeof sample.t_s === 'number' && sample.t_s !== egoLastTs) {
+                egoLastTs = sample.t_s;
+                egoTrail.push({
+                    x: Number(sample.x_m) || 0,
+                    y: Number(sample.y_m) || 0,
+                    z: Number(sample.z_m) || 0,
+                    t_s: sample.t_s,
+                });
+                // Trim by age: drop anything older than 6 s relative to the
+                // newest sample's t_s. Hard cap as a safety net.
+                const cutoff = sample.t_s - EGO_TRAIL_SECONDS;
+                while (egoTrail.length > 0 && egoTrail[0].t_s < cutoff) egoTrail.shift();
+                while (egoTrail.length > EGO_TRAIL_MAX) egoTrail.shift();
+            }
+            if (sample) {
+                egoX.textContent = (Number(sample.x_m) || 0).toFixed(2);
+                egoY.textContent = (Number(sample.y_m) || 0).toFixed(2);
+                egoZ.textContent = (Number(sample.z_m) || 0).toFixed(2);
+                egoSpeed.textContent = (Number(sample.speed_mps) || 0).toFixed(2);
+                egoYaw.textContent = ((Number(sample.yaw_rad) || 0) * 180 / Math.PI).toFixed(1);
+                egoCurv.textContent = (Number(sample.curvature_inv_m) || 0).toFixed(3);
+            } else if (!connected) {
+                egoX.textContent = egoY.textContent = egoZ.textContent = '—';
+                egoSpeed.textContent = egoYaw.textContent = egoCurv.textContent = '—';
+            }
+            renderEgoScene();
+        }
     </script>
 </body>
 </html>

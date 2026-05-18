@@ -197,107 +197,138 @@ function refreshLanesTexture() {
 refreshLanesTexture();
 setInterval(refreshLanesTexture, LANES_REFRESH_MS);
 
-// ---------- Predicted path strips ----------
-// Two glowing strips flanking the cart's predicted path. Color tracks
-// authority — blue when the human is driving (normal PS5 mode, or human
-// override during --autosteer), gold while Autoware is in command.
-// Recoloring is cheap (we mutate the existing materials) and the angle
-// shown is always ps5_drive's commanded steer, so the path follows
-// whoever owns the wheel without any sample race.
+// ---------- Predicted path (single centered tube) ----------
+// One glowing tube tracing the cart's predicted path. Color tracks
+// authority — blue when the human is driving (normal PS5 mode, or
+// human override during --autosteer), gold while a model is in command
+// (autoware OR alpamayo).
+//
+// Two data sources, in order of preference:
+//   1. window.__predictedPath — an array of [x_forward_m, y_left_m]
+//      points published by alpamayo_infer.py via aw.predicted_path.
+//      Maps to scene coords as (-y_left, -x_forward) since the cart
+//      faces -z and right is +x.
+//   2. window.__steerDeg — a single steering angle (autoware path).
+//      We fall back to a quadratic bend whose lateral throw scales
+//      with this angle, matching the legacy two-strip behavior.
 const PATH_SEGS = 60;
 const PATH_TUBE_SEGS = 80;
 const PATH_LENGTH = 70;
 const PATH_TONES = {
     human:    { core: 0x1f6feb, halo: 0x4b8dff, haloOpacity: 0.12 },
-    autoware: { core: 0xd4a017, halo: 0xf2c94c, haloOpacity: 0.18 },
+    autoware: { core: 0xd4a017, halo: 0xf2c94c, haloOpacity: 0.20 },
 };
 
-function buildPathCurve(offsetX, steerDeg) {
-    // Drive the bend from steering angle. At ±45° the far end sweeps
-    // ~7 world-units laterally — enough to read as a decisive turn but
-    // not so far it leaves the frame. Sign flip: positive steerDeg is
-    // a right turn, which should curve the path to +x.
+// Convert a predicted path (x_forward, y_left in meters) into a
+// CatmullRom curve in scene space. The cart sits at scene (0, 0, 0)
+// looking down -z, so forward (x_forward) → -z and left (y_left) →
+// -x (because in this scene right is +x). Segmentation's lateral axis
+// is opposite the scene's real-world steering direction, so the state
+// poller can request a scene-X inversion for that model only.
+const PATH_TRAJ_SCALE = 1.0;     // meters → scene units
+function curveFromTrajectory(traj) {
+    // Always pin the start at the cart so the line emerges from underneath.
+    const pts = [new THREE.Vector3(0, 0.09, 1.5)];
+    const xSign = window.__predictedPathInvertX ? -1 : 1;
+    for (const [xf, yl] of traj) {
+        const sx = xSign * -yl * PATH_TRAJ_SCALE;
+        const sz = -xf * PATH_TRAJ_SCALE;
+        pts.push(new THREE.Vector3(sx, 0.09, sz));
+    }
+    return new THREE.CatmullRomCurve3(pts);
+}
+
+function curveFromSteerDeg(steerDeg) {
+    // Drive a quadratic bend from steering angle (legacy path used when
+    // alpamayo isn't running and only autoware's scalar steer is known).
+    // At ±45° the far end sweeps ~7 world units laterally.
     const lateral = (steerDeg / 45) * 7;
     const pts = [];
     for (let i = 0; i <= PATH_SEGS; i++) {
         const t = i / PATH_SEGS;
         const z = 1.5 - t * PATH_LENGTH;
-        // Quadratic bend: pinned at the cart, full offset at the horizon.
-        // No per-segment jitter — tiny wiggles make TubeGeometry's Frenet
-        // frames flip and render the tube inside-out in patches.
         const bend = (t * t) * lateral;
-        pts.push(new THREE.Vector3(offsetX + bend, 0.09, z));
+        pts.push(new THREE.Vector3(bend, 0.09, z));
     }
     return new THREE.CatmullRomCurve3(pts);
 }
 
-const pathStrips = [];
-function pathStrip(offsetX) {
-    const curve = buildPathCurve(offsetX, 0);
-    // Core is opaque — transparency was causing the strips to drop out
-    // when a scrolling lane dash's centroid was closer to the camera
-    // than the long tube's centroid. DoubleSide covers the Frenet-frame
-    // flip glitch on curved tubes.
-    const tone = PATH_TONES.human;
-    const coreMat = new THREE.MeshBasicMaterial({
-        color: tone.core,
-        side: THREE.DoubleSide,
-    });
-    const haloMat = new THREE.MeshBasicMaterial({
-        color: tone.halo, transparent: true, opacity: tone.haloOpacity,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-    });
-    const core = new THREE.Mesh(
-        new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, 0.07, 8, false), coreMat,
-    );
-    const halo = new THREE.Mesh(
-        new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, 0.22, 8, false), haloMat,
-    );
-    core.renderOrder = 2;
-    halo.renderOrder = 1;
-    scene.add(core);
-    scene.add(halo);
-    pathStrips.push({ offsetX, core, halo });
-}
-pathStrip(-0.85);
-pathStrip(0.85);
-
-// Path follows the steering target with no client-side smoothing — the
-// user wants the yellow strips to mirror the autoware prediction
-// exactly (set in index.html from aw.steer_deg_raw). The "skip if change
-// < 0.08°" guard is a cheap GPU-upload short-circuit, not a filter:
-// rebuilding TubeGeometry every frame for sub-bucket noise wastes work
-// without changing what the user sees.
-let lastSteerDeg = 0;
-function updatePaths(targetSteerDeg, _dt) {
-    if (Math.abs(targetSteerDeg - lastSteerDeg) < 0.08) return;
-    lastSteerDeg = targetSteerDeg;
-    for (const strip of pathStrips) {
-        const curve = buildPathCurve(strip.offsetX, targetSteerDeg);
-        const nextCore = new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, 0.07, 8, false);
-        const nextHalo = new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, 0.22, 8, false);
-        strip.core.geometry.dispose();
-        strip.halo.geometry.dispose();
-        strip.core.geometry = nextCore;
-        strip.halo.geometry = nextHalo;
+function buildCurve() {
+    const traj = window.__predictedPath;
+    if (Array.isArray(traj) && traj.length >= 2) {
+        return curveFromTrajectory(traj);
     }
+    return curveFromSteerDeg(window.__steerDeg || 0);
 }
 
-// Recolor the path strips between blue (human-driven) and gold (Autoware-
-// driven). pollState in index.html calls this every state update; we
-// short-circuit no-op recolors so material.needsUpdate isn't flagged for
+// Single centered tube. Slightly larger radius than the old strips so
+// it reads as the dominant path indicator now that there's only one.
+// DoubleSide covers Frenet-frame flips on tight curves.
+const TUBE_RADIUS_CORE = 0.10;
+const TUBE_RADIUS_HALO = 0.32;
+const initialTone = PATH_TONES.human;
+const pathCoreMat = new THREE.MeshBasicMaterial({
+    color: initialTone.core,
+    side: THREE.DoubleSide,
+});
+const pathHaloMat = new THREE.MeshBasicMaterial({
+    color: initialTone.halo, transparent: true, opacity: initialTone.haloOpacity,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+});
+const pathCore = new THREE.Mesh(
+    new THREE.TubeGeometry(buildCurve(), PATH_TUBE_SEGS, TUBE_RADIUS_CORE, 8, false),
+    pathCoreMat,
+);
+const pathHalo = new THREE.Mesh(
+    new THREE.TubeGeometry(buildCurve(), PATH_TUBE_SEGS, TUBE_RADIUS_HALO, 8, false),
+    pathHaloMat,
+);
+pathCore.renderOrder = 2;
+pathHalo.renderOrder = 1;
+scene.add(pathCore);
+scene.add(pathHalo);
+
+// Cheap rebuild — only when either input meaningfully changed. We
+// fingerprint the trajectory + steer scalar so still frames don't
+// rebuild TubeGeometry every animation tick.
+let lastFingerprint = "";
+function trajFingerprint() {
+    const traj = window.__predictedPath;
+    if (Array.isArray(traj) && traj.length >= 2) {
+        // Round to 1 cm — matches the scale at which the user could
+        // possibly notice a shape change.
+        const inv = window.__predictedPathInvertX ? "I" : "N";
+        return `T:${inv}:` + traj.map(p => `${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("|");
+    }
+    return "S:" + (Math.round((window.__steerDeg || 0) * 12) / 12);
+}
+function updatePaths(_targetSteerDeg, _dt) {
+    const fp = trajFingerprint();
+    if (fp === lastFingerprint) return;
+    lastFingerprint = fp;
+    const curve = buildCurve();
+    const nextCore = new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, TUBE_RADIUS_CORE, 8, false);
+    const nextHalo = new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, TUBE_RADIUS_HALO, 8, false);
+    pathCore.geometry.dispose();
+    pathHalo.geometry.dispose();
+    pathCore.geometry = nextCore;
+    pathHalo.geometry = nextHalo;
+}
+
+// Recolor between blue (human-driven) and gold (model-driven). Either
+// "autoware" or "alpamayo" status maps to gold; everything else is
+// blue. pollState in index.html calls this every state tick — short-
+// circuit no-op recolors so material.needsUpdate isn't flagged for
 // nothing every frame.
 let currentTone = "human";
 window.__setPathTone = function (tone) {
     if (!PATH_TONES[tone] || tone === currentTone) return;
     currentTone = tone;
     const t = PATH_TONES[tone];
-    for (const strip of pathStrips) {
-        strip.core.material.color.setHex(t.core);
-        strip.halo.material.color.setHex(t.halo);
-        strip.halo.material.opacity = t.haloOpacity;
-    }
+    pathCoreMat.color.setHex(t.core);
+    pathHaloMat.color.setHex(t.halo);
+    pathHaloMat.opacity = t.haloOpacity;
 };
 
 // ============ GOLF CART ============

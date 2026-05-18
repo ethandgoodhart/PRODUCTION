@@ -20,3 +20,11 @@ cart_state.json.tmp
 # Local artifacts
 camera_snapshots/
 .DS_Store
+
+# Large data / models / archives
+Caddy-Training-Data-*/
+Depth_Caddy-Training-Data-*/
+*.zip
+models/
+ego_evals/
+.claude/
