@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Caddy — Stanford Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #111; }
+    #map { position: absolute; inset: 0; }
+    #hud {
+      position: absolute; top: 10px; left: 10px; z-index: 1000;
+      background: rgba(0,0,0,0.65); color: #fff;
+      font: 13px/1.3 -apple-system, BlinkMacSystemFont, sans-serif;
+      padding: 8px 10px; border-radius: 6px; min-width: 180px;
+    }
+    #hud .dot { display: inline-block; width: 8px; height: 8px;
+                border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+    #hud .ok { background: #4ade80; }
+    #hud .bad { background: #ef4444; }
+    .ego-marker {
+      width: 18px; height: 18px; border-radius: 50%;
+      background: #2563eb; border: 3px solid #fff;
+      box-shadow: 0 0 0 2px rgba(37,99,235,0.4), 0 0 12px rgba(0,0,0,0.6);
+    }
+    .dest-marker {
+      width: 16px; height: 16px; border-radius: 50%;
+      background: #f59e0b; border: 3px solid #fff;
+      box-shadow: 0 0 0 2px rgba(245,158,11,0.4), 0 0 12px rgba(0,0,0,0.6);
+    }
+    #route-hud {
+      position: absolute; top: 10px; right: 10px; z-index: 1000;
+      background: rgba(0,0,0,0.65); color: #fff;
+      font: 13px/1.3 -apple-system, BlinkMacSystemFont, sans-serif;
+      padding: 8px 10px; border-radius: 6px; min-width: 180px;
+      display: none;
+    }
+    #route-hud button {
+      margin-top: 6px; background: #374151; color: #fff;
+      border: 0; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+      font: inherit;
+    }
+    #route-hud button:hover { background: #4b5563; }
+    #hint {
+      position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+      z-index: 1000; background: rgba(0,0,0,0.55); color: #fff;
+      font: 12px/1.3 -apple-system, BlinkMacSystemFont, sans-serif;
+      padding: 6px 10px; border-radius: 4px; pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="hud">
+    <div><span id="status-dot" class="dot bad"></span><span id="status-text">disconnected</span></div>
+    <div id="coords">— , —</div>
+    <div id="speed">— m/s</div>
+    <div id="heading">course —</div>
+    <div id="accuracy">±— m</div>
+  </div>
+  <div id="route-hud">
+    <div id="route-info">routing…</div>
+    <button id="route-clear">Clear route</button>
+  </div>
+  <div id="hint">Click anywhere to route from current position</div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script>
+    const STANFORD = [37.4275, -122.1697];
+    const map = L.map('map', { zoomControl: true }).setView(STANFORD, 17);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    const icon = L.divIcon({ className: 'ego-marker', iconSize: [18, 18] });
+    const marker = L.marker(STANFORD, { icon }).addTo(map);
+
+    const statusDot = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+    const coordsEl = document.getElementById('coords');
+    const speedEl = document.getElementById('speed');
+    const headingEl = document.getElementById('heading');
+    const accEl = document.getElementById('accuracy');
+
+    let firstFix = true;
+
+    async function tick() {
+      try {
+        const r = await fetch('/gps', { cache: 'no-store' });
+        const d = await r.json();
+        const ok = d.has_fix && !d.stale;
+        statusDot.className = 'dot ' + (ok ? 'ok' : 'bad');
+        statusText.textContent = ok ? 'connected'
+          : (d.tcp_connected ? 'no fix' : 'disconnected');
+        if (d.has_fix && d.lat != null && d.lon != null) {
+          const ll = [d.lat, d.lon];
+          marker.setLatLng(ll);
+          window.__lastPos = ll;
+          map.panTo(ll, { animate: !firstFix, duration: 0.25 });
+          if (firstFix) { map.setView(ll, 18); firstFix = false; }
+          coordsEl.textContent = d.lat.toFixed(6) + ', ' + d.lon.toFixed(6);
+          speedEl.textContent = (d.speed_mps != null && d.speed_mps >= 0)
+            ? d.speed_mps.toFixed(2) + ' m/s' : '— m/s';
+          headingEl.textContent = (d.course_deg != null && d.course_deg >= 0)
+            ? 'course ' + d.course_deg.toFixed(0) + '°' : 'course —';
+          accEl.textContent = (d.h_acc_m != null && d.h_acc_m >= 0)
+            ? '±' + d.h_acc_m.toFixed(1) + ' m' : '±— m';
+        }
+      } catch (e) {
+        statusDot.className = 'dot bad';
+        statusText.textContent = 'server error';
+      }
+    }
+    tick();
+    setInterval(tick, 200);
+
+    // --- Click-to-route -------------------------------------------------
+    // Uses the public OSRM demo router. Foot profile is closest to a
+    // golf-cart's reach (cuts through paths, no highway snapping).
+    const destIcon = L.divIcon({ className: 'dest-marker', iconSize: [16, 16] });
+    let destMarker = null;
+    let routeLine = null;
+    let lastDest = null;
+    // Seed with the Stanford default so the map + routing work before
+    // the first GPS fix lands. The /gps tick overwrites this with the
+    // real position as soon as one arrives.
+    let lastPos = STANFORD.slice();
+    let havePosFix = false;
+    let routeReqId = 0;
+    let inflightCtrl = null;
+
+    const routeHud = document.getElementById('route-hud');
+    const routeInfo = document.getElementById('route-info');
+    const hintEl = document.getElementById('hint');
+
+    function fmtDist(m) {
+      return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : m.toFixed(0) + ' m';
+    }
+    function fmtDur(s) {
+      const m = Math.round(s / 60);
+      if (m < 1) return Math.round(s) + ' s';
+      if (m < 60) return m + ' min';
+      return Math.floor(m / 60) + ' h ' + (m % 60) + ' min';
+    }
+
+    async function recomputeRoute() {
+      if (!lastDest || !lastPos) return;
+      // Cancel any in-flight request immediately — we want the freshest
+      // origin in flight, not a queue of stale ones.
+      if (inflightCtrl) inflightCtrl.abort();
+      const ctrl = new AbortController();
+      inflightCtrl = ctrl;
+      const id = ++routeReqId;
+      const url = `/route?from_lat=${lastPos[0]}&from_lon=${lastPos[1]}`
+        + `&to_lat=${lastDest[0]}&to_lon=${lastDest[1]}&profile=foot`;
+      routeHud.style.display = 'block';
+      const prevText = routeInfo.textContent;
+      routeInfo.textContent = routeLine ? (prevText + ' · updating…') : 'routing…';
+      try {
+        const r = await fetch(url, { signal: ctrl.signal });
+        const d = await r.json();
+        if (id !== routeReqId) return;  // a newer recompute superseded us
+        const route = d.routes && d.routes[0];
+        if (!route) { routeInfo.textContent = 'no route found'; return; }
+        const coords = route.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
+        if (routeLine) routeLine.setLatLngs(coords);
+        else routeLine = L.polyline(coords, {
+          color: '#2563eb', weight: 5, opacity: 0.85,
+        }).addTo(map);
+        routeInfo.textContent =
+          fmtDist(route.distance) + ' · ' + fmtDur(route.duration);
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+        if (id !== routeReqId) return;
+        routeInfo.textContent = 'router error: ' + (e.message || e);
+        console.error('route failed', e);
+      } finally {
+        if (inflightCtrl === ctrl) inflightCtrl = null;
+      }
+    }
+
+    function clearRoute() {
+      lastDest = null;
+      routeReqId++;
+      if (routeLine) { routeLine.remove(); routeLine = null; }
+      if (destMarker) { destMarker.remove(); destMarker = null; }
+      routeHud.style.display = 'none';
+    }
+
+    map.on('click', (e) => {
+      lastDest = [e.latlng.lat, e.latlng.lng];
+      if (destMarker) destMarker.setLatLng(lastDest);
+      else destMarker = L.marker(lastDest, { icon: destIcon }).addTo(map);
+      hintEl.style.display = 'none';
+      recomputeRoute();
+    });
+
+    document.getElementById('route-clear').addEventListener('click', clearRoute);
+
+    // Recompute the route whenever the cart has moved more than ~10 m, so
+    // the blue line stays anchored to the current position as we drive.
+    function distM(a, b) {
+      const R = 6371000;
+      const dLat = (b[0] - a[0]) * Math.PI / 180;
+      const dLon = (b[1] - a[1]) * Math.PI / 180;
+      const la1 = a[0] * Math.PI / 180, la2 = b[0] * Math.PI / 180;
+      const x = Math.sin(dLat/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
+      return 2 * R * Math.asin(Math.sqrt(x));
+    }
+    let lastReroutePos = null;
+    setInterval(() => {
+      if (!lastDest || !lastPos) return;
+      if (!lastReroutePos || distM(lastReroutePos, lastPos) > 3) {
+        lastReroutePos = lastPos;
+        recomputeRoute();
+      }
+    }, 1000);
+
+    // Mirror /gps tick output (window.__lastPos) into our routing state.
+    // First real fix triggers an immediate reroute so the seeded
+    // Stanford-default route snaps to the actual position.
+    setInterval(() => {
+      const ll = window.__lastPos;
+      if (!ll) return;
+      lastPos = ll;
+      if (!havePosFix) {
+        havePosFix = true;
+        if (lastDest) recomputeRoute();
+      }
+    }, 250);
+  </script>
+</body>
+</html>

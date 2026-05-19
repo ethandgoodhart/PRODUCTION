@@ -90,7 +90,6 @@ cleanup() {
     kill "$AUTOWARE_PID" 2>/dev/null || true
     kill "$EGO_PID" 2>/dev/null || true
     kill "$EGO_LINK_PID" 2>/dev/null || true
-    kill "$TUNNEL_PID" 2>/dev/null || true
     pkill -P "$DRIVE_LOOP" 2>/dev/null || true
     pkill -P "$EGO_LINK_PID" 2>/dev/null || true
     pkill -f "scripts/ps5_drive.py" 2>/dev/null || true
@@ -284,19 +283,5 @@ for i in {1..30}; do
     curl -s -o /dev/null http://127.0.0.1:5050 && break
     sleep 0.2
 done
-
-# Cloudflare named tunnel — exposes the Flask server at
-# https://caddy.ethandgoodhart.com so the teleop page (/teleop) is
-# reachable from any network. Persistent outbound connection; no port
-# forwarding or firewall changes needed.
-TUNNEL_PID=""
-if command -v cloudflared &>/dev/null; then
-    cloudflared tunnel run caddy \
-        >>/tmp/cloudflared.log 2>&1 &
-    TUNNEL_PID=$!
-    echo "[start] cloudflared tunnel pid=$TUNNEL_PID (caddy.ethandgoodhart.com)"
-else
-    echo "[start] cloudflared not installed — teleop tunnel disabled."
-fi
 
 firefox --no-remote --new-instance --profile "$PROFILE" --kiosk http://127.0.0.1:5050

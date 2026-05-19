@@ -210,6 +210,154 @@ def cam_mjpeg(slug: str):
                      headers={"Cache-Control": "no-store, must-revalidate"})
 
 
+@app.route("/map")
+def campus_map():
+    # Disable caching so iterative dev (and kiosk reload) always picks up
+    # the latest template + JS; the file is tiny so caching gains nothing.
+    resp = Response(render_template("map.html"), mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    return resp
+
+
+# iPhone CoreLocation publisher (Georg-Stanford-GC-iOS-Sensor GPSServer)
+# exposes JSONL fixes on a sibling TCP port to the ego-motion stream.
+# Wire format mirrors scripts/record_cameras.py::GpsRecorder.
+GPS_HOST = os.environ.get("GPS_HOST", "127.0.0.1")
+GPS_PORT = int(os.environ.get("GPS_PORT", "5006"))
+GPS_FRESH_S = 5.0  # fixes arrive 1-5 Hz depending on phone state
+
+
+class _GpsReader:
+    """Background thread that holds the latest iPhone GPS fix.
+
+    Same protocol as scripts/record_cameras.py::GpsRecorder but read-only —
+    we never write the jsonl log here. Auto-reconnects on socket drops.
+    """
+
+    def __init__(self, host: str, port: int):
+        import socket as _socket
+        import threading as _threading
+        self._socket = _socket
+        self.host = host
+        self.port = port
+        self._lock = _threading.Lock()
+        self._latest: dict | None = None
+        self._latest_wall: float = 0.0
+        self._tcp_connected = False
+        self._stop = _threading.Event()
+        t = _threading.Thread(target=self._loop, name="GpsReader", daemon=True)
+        t.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                with self._socket.create_connection(
+                    (self.host, self.port), timeout=2.0
+                ) as s:
+                    s.settimeout(1.0)
+                    self._tcp_connected = True
+                    buf = b""
+                    while not self._stop.is_set():
+                        try:
+                            chunk = s.recv(4096)
+                        except self._socket.timeout:
+                            continue
+                        if not chunk:
+                            break
+                        buf += chunk
+                        while b"\n" in buf:
+                            line, buf = buf.split(b"\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                fix = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            now = time.time()
+                            with self._lock:
+                                self._latest = fix
+                                self._latest_wall = now
+            except (ConnectionRefusedError, OSError):
+                pass
+            finally:
+                self._tcp_connected = False
+            if not self._stop.is_set():
+                time.sleep(0.5)
+
+    def latest(self) -> dict:
+        with self._lock:
+            fix = dict(self._latest) if self._latest is not None else None
+            wall = self._latest_wall
+        stale = (time.time() - wall) > GPS_FRESH_S if fix is not None else True
+        return {
+            "tcp_connected": self._tcp_connected,
+            "connected": self._tcp_connected and not stale and fix is not None,
+            "stale": stale,
+            "host": f"{self.host}:{self.port}",
+            "fix": fix,
+        }
+
+
+_gps_reader = _GpsReader(GPS_HOST, GPS_PORT)
+
+
+@app.route("/route")
+def route():
+    """Proxy to the public OSRM demo router. Browser-side fetches sometimes
+    fail (CORS, captive portal, kiosk network policy), so we relay from the
+    Jetson which already has outbound HTTPS.
+    """
+    try:
+        from_lat = float(request.args["from_lat"])
+        from_lon = float(request.args["from_lon"])
+        to_lat = float(request.args["to_lat"])
+        to_lon = float(request.args["to_lon"])
+    except (KeyError, ValueError):
+        abort(400)
+    profile = request.args.get("profile", "foot")
+    if profile not in ("foot", "driving", "bike"):
+        abort(400)
+
+    import urllib.request
+    import urllib.error
+    # overview=simplified cuts geometry size ~5-10x for long routes — the
+    # demo router's payload was the slow part on Stanford-scale distances.
+    url = (
+        f"https://router.project-osrm.org/route/v1/{profile}/"
+        f"{from_lon},{from_lat};{to_lon},{to_lat}"
+        f"?overview=simplified&geometries=geojson"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=5.0) as resp:
+            body = resp.read()
+            return Response(body, mimetype="application/json")
+    except (urllib.error.URLError, TimeoutError) as e:
+        return jsonify({"code": "ProxyError", "message": repr(e)}), 502
+
+
+@app.route("/gps")
+def gps():
+    snap = _gps_reader.latest()
+    fix = snap.get("fix") or {}
+    has_fix = bool(fix) and "lat_deg" in fix and "lon_deg" in fix
+    return jsonify({
+        "connected": snap["connected"],
+        "tcp_connected": snap["tcp_connected"],
+        "stale": snap["stale"],
+        "host": snap["host"],
+        "has_fix": has_fix,
+        "lat": fix.get("lat_deg"),
+        "lon": fix.get("lon_deg"),
+        "alt_m": fix.get("alt_m"),
+        "h_acc_m": fix.get("h_acc_m"),
+        "v_acc_m": fix.get("v_acc_m"),
+        "speed_mps": fix.get("speed_mps"),
+        "course_deg": fix.get("course_deg"),
+        "t_unix": fix.get("t_unix"),
+    })
+
+
 @app.route("/teleop")
 def teleop():
     return render_template("teleop.html")
