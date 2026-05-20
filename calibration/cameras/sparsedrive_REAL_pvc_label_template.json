@@ -1,5 +1,5 @@
 {
-  "instructions": "SparseDrive REAL PVC default: three calibrated front cameras are reused for the rear slots until the remaining cameras are calibrated.",
+  "instructions": "SparseDrive REAL PVC front-only default: three calibrated front cameras are real, and the rear slots are synthetic black frames.",
   "slots": [
     {
       "slot": "CAM_FRONT",
@@ -30,30 +30,30 @@
     },
     {
       "slot": "CAM_BACK",
-      "source": "/dev/video4",
-      "physical_position": "front_duplicate_for_back",
+      "source": "black://CAM_BACK",
+      "physical_position": "black_back",
       "rotate_deg": 0,
       "flip_horizontal": false,
       "flip_vertical": false,
-      "notes": "temporary duplicate of CAM_FRONT"
+      "notes": "synthetic black frame; no rear camera used"
     },
     {
       "slot": "CAM_BACK_LEFT",
-      "source": "/dev/video2",
-      "physical_position": "front_left_duplicate_for_back_left",
+      "source": "black://CAM_BACK_LEFT",
+      "physical_position": "black_back_left",
       "rotate_deg": 0,
       "flip_horizontal": false,
       "flip_vertical": false,
-      "notes": "temporary duplicate of CAM_FRONT_LEFT"
+      "notes": "synthetic black frame; no rear-left camera used"
     },
     {
       "slot": "CAM_BACK_RIGHT",
-      "source": "/dev/video0",
-      "physical_position": "front_right_duplicate_for_back_right",
+      "source": "black://CAM_BACK_RIGHT",
+      "physical_position": "black_back_right",
       "rotate_deg": 0,
       "flip_horizontal": false,
       "flip_vertical": false,
-      "notes": "temporary duplicate of CAM_FRONT_RIGHT"
+      "notes": "synthetic black frame; no rear-right camera used"
     }
   ]
 }
