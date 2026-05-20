@@ -1,0 +1,59 @@
+{
+  "instructions": "SparseDrive REAL PVC default: three calibrated front cameras are reused for the rear slots until the remaining cameras are calibrated.",
+  "slots": [
+    {
+      "slot": "CAM_FRONT",
+      "source": "/dev/video4",
+      "physical_position": "front",
+      "rotate_deg": 0,
+      "flip_horizontal": false,
+      "flip_vertical": false,
+      "notes": "REAL center front PVC camera"
+    },
+    {
+      "slot": "CAM_FRONT_RIGHT",
+      "source": "/dev/video0",
+      "physical_position": "front_right",
+      "rotate_deg": 0,
+      "flip_horizontal": false,
+      "flip_vertical": false,
+      "notes": "REAL front-right PVC camera"
+    },
+    {
+      "slot": "CAM_FRONT_LEFT",
+      "source": "/dev/video2",
+      "physical_position": "front_left",
+      "rotate_deg": 0,
+      "flip_horizontal": false,
+      "flip_vertical": false,
+      "notes": "REAL front-left PVC camera"
+    },
+    {
+      "slot": "CAM_BACK",
+      "source": "/dev/video4",
+      "physical_position": "front_duplicate_for_back",
+      "rotate_deg": 0,
+      "flip_horizontal": false,
+      "flip_vertical": false,
+      "notes": "temporary duplicate of CAM_FRONT"
+    },
+    {
+      "slot": "CAM_BACK_LEFT",
+      "source": "/dev/video2",
+      "physical_position": "front_left_duplicate_for_back_left",
+      "rotate_deg": 0,
+      "flip_horizontal": false,
+      "flip_vertical": false,
+      "notes": "temporary duplicate of CAM_FRONT_LEFT"
+    },
+    {
+      "slot": "CAM_BACK_RIGHT",
+      "source": "/dev/video0",
+      "physical_position": "front_right_duplicate_for_back_right",
+      "rotate_deg": 0,
+      "flip_horizontal": false,
+      "flip_vertical": false,
+      "notes": "temporary duplicate of CAM_FRONT_RIGHT"
+    }
+  ]
+}
