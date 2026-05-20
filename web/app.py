@@ -25,6 +25,7 @@ EGO_FRESH_S = 1.0       # ego_state_writer writes at 10 Hz; >1 s = writer died
 # any auxiliary streams. ``lanes_solo`` is consumed by scene.js (not as
 # a UI tile) to project the predicted lanes into the 3D cart scene.
 CAM_SLUGS = (
+    "front", "front_left", "front_right",
     "front_wide", "front_narrow", "left", "right",
     "lanes", "depth", "seg", "objects",
     "lanes_solo",

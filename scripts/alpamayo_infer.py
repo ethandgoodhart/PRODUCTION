@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-alpamayo_infer.py — 4-camera capture + Alpamayo-R1 (remote Modal) steering.
+alpamayo_infer.py — camera capture + Alpamayo-R1 (remote Modal) steering.
 
 Drop-in alternative to ``autoware_infer.py``. Same physical cameras, same
 ``/tmp/cart_frames/`` JPEG layout, same ``/tmp/autoware_state.json`` schema —
@@ -26,7 +26,7 @@ Differences from autoware_infer.py:
     trajectory_to_steer_deg). ps5_drive.py consumes the column angle
     directly (AUTOSTEER_GAIN=1.0).
   * No viz tiles published (lanes/depth/seg/objects). The web UI keeps
-    the four camera tiles + a BEV tile.
+    the camera tiles + a BEV tile.
 
 Usage:
     /home/caddy/mayo/.venv-client/bin/python scripts/alpamayo_infer.py \
@@ -139,60 +139,37 @@ def build_ego_tensors(history) -> "tuple[np.ndarray, np.ndarray] | None":
 FRAMES_DIR_DEFAULT = Path("/tmp/cart_frames")
 STATE_FILE_DEFAULT = Path("/tmp/autoware_state.json")
 
-# Same physical camera layout as autoware_infer.py — 4 USB cameras at
-# v4l2 indices [0, 2, 6, 10] that auto-discover to (front_narrow,
-# front_wide, left, right) on this cart. We then map them onto the 4
-# channels Alpamayo-R1 was trained on.
-# v4l2 device order on this cart, observed empirically from the live UI:
-#   /dev/video0  = front_narrow  (mounted upside-down — flip=-1 below)
-#   /dev/video2  = left
-#   /dev/video6  = front_wide
-#   /dev/video10 = right
-# Per-slug flip + FOV-crop tables ride along with the slug, so they
-# automatically apply to the right physical camera regardless of which
-# v4l2 index it lands on.
-SLUGS = ("front_narrow", "left", "front_wide", "right")
-# Mapping cart camera slug -> Alpamayo channel slot (0..3).
-# Alpamayo's channel order: front_wide, front_tele, cross_left, cross_right.
-# The cart has no separate tele lens — front_narrow (varifocal cropped to
-# ~30°) is the closest available stand-in for the front_tele slot.
-ALPAMAYO_CHANNEL_FOR_SLUG = {
-    "front_wide":   0,  # front_wide
-    "front_narrow": 1,  # front_tele (close enough)
-    "left":         2,  # cross_left
-    "right":        3,  # cross_right
-}
+CALIBRATION_DIR = Path("calibration/cameras")
+CAMERA_MAPPING_DEFAULT = CALIBRATION_DIR / "camera_mapping.json"
+MANUAL_EXTRINSICS_DEFAULT = (
+    CALIBRATION_DIR / "REAL_manual_extrinsics_front_reference.json"
+)
+
+# Secured PVC-pipe rig, measured 2026-05-20:
+#   /dev/video0 = front_right
+#   /dev/video2 = front_left
+#   /dev/video4 = front
+#
+# Alpamayo-R1 still expects 4 channel slots:
+#   0 front_wide, 1 front_tele, 2 cross_left, 3 cross_right.
+# The real rig has one center front camera, so we feed it twice: raw into
+# front_wide and center-cropped to ~30° into front_tele.
+SLUGS = ("front_right", "front_left", "front")
+ALPAMAYO_CHANNEL_SPECS = (
+    {"channel": 0, "label": "front_wide", "slug": "front", "target_fov_deg": None},
+    {"channel": 1, "label": "front_tele", "slug": "front", "target_fov_deg": 30.0},
+    {"channel": 2, "label": "cross_left", "slug": "front_left", "target_fov_deg": None},
+    {"channel": 3, "label": "cross_right", "slug": "front_right", "target_fov_deg": None},
+)
 # Cameras with non-standard install orientation. cv2.flip codes:
 #   0 = vertical flip (across x-axis), 1 = horizontal, -1 = both.
-CAMERA_ORIENTATION_FIX = {
-    # The cart's narrow lens (front_narrow, /dev/video0) is mounted
-    # upside-down with its housing flipped left-for-right. Code -1 =
-    # flip across both axes = 180° rotation, which fixes both. The
-    # other three lenses are right-side-up natively.
-    "front_narrow": -1,
-}
+CAMERA_ORIENTATION_FIX = {}
 
-# Per-camera FOV correction. Alpamayo-R1 was trained on PAI cameras
-# with FIXED FOV per slot (see load_physical_aiavdataset.py:53):
-#   front_wide   = 120°
-#   front_tele   =  30°
-#   cross_left   = 120°
-#   cross_right  = 120°
-# The cart's lenses are wider than these (front_wide/left/right are
-# ~170° fisheye USB units). To match the training distribution we
-# center-crop each frame so the visible FOV shrinks to ~120°, then
-# resize back to the source resolution so downstream code is
-# resolution-agnostic. The ratio is computed as
-# ``target_fov / source_fov`` under the equidistant fisheye model
-# (r ∝ θ), which is the closest cheap approximation to the typical
-# wide-angle USB fisheye lens. Set to 1.0 (or remove) to skip the
-# crop on a particular camera.
-SOURCE_FOV_DEG = {"front_wide": 170.0, "left": 170.0, "right": 170.0}
-TARGET_FOV_DEG = {"front_wide": 120.0, "left": 120.0, "right": 120.0}
-CAMERA_FOV_CROP_RATIO = {
-    slug: TARGET_FOV_DEG[slug] / SOURCE_FOV_DEG[slug]
-    for slug in SOURCE_FOV_DEG
-}
+# Per-camera FOV correction is no longer applied to the raw PVC-rig
+# streams. The lenses are measured as non-fisheye ~74° horizontal at
+# 640x480, already narrower than Alpamayo's 120° wide/cross slots. The
+# only crop is per-channel: front -> front_tele (~30°) in main().
+CAMERA_FOV_CROP_RATIO = {}
 
 CAM_W, CAM_H = 640, 480
 JPEG_QUALITY = 72
@@ -326,6 +303,40 @@ def center_crop_zoom(frame: np.ndarray, ratio: float) -> np.ndarray:
     x0 = (w - nw) // 2
     cropped = frame[y0:y0 + nh, x0:x0 + nw]
     return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def load_camera_mapping(path: Path) -> "dict[str, dict]":
+    """Load the REAL camera mapping written during calibration."""
+    with path.open() as f:
+        data = json.load(f)
+    out: dict[str, dict] = {}
+    for item in data.get("mappings", []):
+        name = item["logical_name"]
+        entry = dict(item)
+        intr_path = path.parent / item["intrinsics"]
+        with intr_path.open() as f:
+            intr = json.load(f)
+        entry["intrinsics_path"] = str(intr_path)
+        entry["intrinsics"] = intr
+        out[name] = entry
+    return out
+
+
+def calibrated_hfov_deg(intrinsics: dict) -> float:
+    """Horizontal pinhole FOV from calibrated K at the calibration size."""
+    w = float(intrinsics["image_width"])
+    fx = float(intrinsics["camera_matrix"][0][0])
+    return math.degrees(2.0 * math.atan(w / (2.0 * fx)))
+
+
+def pinhole_crop_ratio_for_fov(source_fov_deg: float, target_fov_deg: float) -> float:
+    """Center-crop ratio for pinhole cameras: tan(target/2) / tan(source/2)."""
+    if target_fov_deg >= source_fov_deg:
+        return 1.0
+    return (
+        math.tan(math.radians(target_fov_deg / 2.0))
+        / math.tan(math.radians(source_fov_deg / 2.0))
+    )
 
 
 def open_camera(index: int) -> "cv2.VideoCapture | None":
@@ -1331,7 +1342,13 @@ def parse_args() -> argparse.Namespace:
                         "ahead of where the cart currently is on the "
                         f"trajectory. Default {REPLAY_LEAD_S}.")
     p.add_argument("--indices", type=int, nargs="*", default=None,
-                   help="Override v4l2 indices (e.g. --indices 0 2 6 10).")
+                   help="Override v4l2 indices (e.g. --indices 0 2 4).")
+    p.add_argument("--camera-mapping", type=Path,
+                   default=CAMERA_MAPPING_DEFAULT,
+                   help="REAL camera mapping JSON from calibration.")
+    p.add_argument("--extrinsics", type=Path,
+                   default=MANUAL_EXTRINSICS_DEFAULT,
+                   help="Manual REAL extrinsics JSON for logging/state.")
     p.add_argument("--video", default=None,
                    help="Replay an MP4 instead of opening cameras. The clip "
                         "is broadcast into all 4 alpamayo channel slots.")
@@ -1388,6 +1405,44 @@ def main() -> int:
     state_path = Path(args.state_file)
     state_path.parent.mkdir(parents=True, exist_ok=True)
 
+    camera_mapping: dict[str, dict] = {}
+    manual_extrinsics: dict | None = None
+    if args.camera_mapping.exists():
+        camera_mapping = load_camera_mapping(args.camera_mapping)
+        print(f"[calib] camera mapping: {args.camera_mapping}")
+        for slug in SLUGS:
+            item = camera_mapping.get(slug)
+            if item is None:
+                print(f"[calib] WARN: no mapping for {slug}")
+                continue
+            hfov = calibrated_hfov_deg(item["intrinsics"])
+            print(
+                f"[calib] {slug:<12} idx={item['camera_index']} "
+                f"hfov={hfov:.1f}° intr={Path(item['intrinsics']).name}"
+            )
+    else:
+        print(f"[calib] WARN: camera mapping not found: {args.camera_mapping}")
+    if args.extrinsics.exists():
+        with args.extrinsics.open() as f:
+            manual_extrinsics = json.load(f)
+        print(f"[calib] extrinsics: {args.extrinsics}")
+    else:
+        print(f"[calib] WARN: extrinsics not found: {args.extrinsics}")
+
+    channel_specs = [dict(spec) for spec in ALPAMAYO_CHANNEL_SPECS]
+    for spec in channel_specs:
+        target_fov = spec.get("target_fov_deg")
+        slug = spec["slug"]
+        spec["crop_ratio"] = 1.0
+        if target_fov is not None and slug in camera_mapping:
+            source_fov = calibrated_hfov_deg(camera_mapping[slug]["intrinsics"])
+            spec["source_fov_deg"] = source_fov
+            spec["crop_ratio"] = pinhole_crop_ratio_for_fov(source_fov, float(target_fov))
+            print(
+                f"[calib] channel {spec['channel']} {spec['label']} <- {slug}: "
+                f"{source_fov:.1f}°→{target_fov:.1f}° crop={spec['crop_ratio']:.3f}"
+            )
+
     readers: list = []
     if args.video:
         if not Path(args.video).exists():
@@ -1400,11 +1455,21 @@ def main() -> int:
         for slug in SLUGS:
             print(f"[video] {slug:<12} <- {Path(args.video).name}")
     else:
-        print("[cams] discovering v4l2 devices...")
-        indices = args.indices or discover_v4l2_indices(count=len(SLUGS))
+        if args.indices:
+            print("[cams] using CLI v4l2 indices...")
+            indices = args.indices
+        elif all(slug in camera_mapping for slug in SLUGS):
+            print("[cams] using calibrated v4l2 mapping...")
+            indices = [int(camera_mapping[slug]["camera_index"]) for slug in SLUGS]
+        else:
+            print("[cams] discovering v4l2 devices...")
+            indices = discover_v4l2_indices(count=len(SLUGS))
         print(f"[cams] indices: {indices}")
         if not indices:
             print("ERROR: no cameras found. Try: v4l2-ctl --list-devices")
+            return 1
+        if len(indices) < len(SLUGS):
+            print(f"ERROR: expected {len(SLUGS)} camera indices for {SLUGS}, got {indices}")
             return 1
 
         for idx, slug in zip(indices, SLUGS):
@@ -1421,9 +1486,7 @@ def main() -> int:
             if flip is not None:
                 bits.append(f"flip={flip}")
             if crop is not None and crop < 1.0:
-                src = SOURCE_FOV_DEG.get(slug)
-                tgt = TARGET_FOV_DEG.get(slug)
-                bits.append(f"fov {src:.0f}°→{tgt:.0f}° (crop_ratio={crop:.3f})")
+                bits.append(f"raw crop_ratio={crop:.3f}")
             tail = ("  (" + ", ".join(bits) + ")") if bits else ""
             print(f"[cams] {slug:<12} -> /dev/video{idx}{tail}")
 
@@ -1432,16 +1495,30 @@ def main() -> int:
         return 1
 
     slug_map = {r.slug: r for r in readers}
-    # Order readers into Alpamayo channel slots (0..3).
+    # Order readers into Alpamayo channel slots (0..3). Duplicate source
+    # slugs are allowed: the center `front` camera feeds both front_wide
+    # and front_tele (the latter with a calibrated center crop).
     channel_slugs = [None] * 4
-    for slug, ch in ALPAMAYO_CHANNEL_FOR_SLUG.items():
+    channel_labels = [None] * 4
+    channel_crop_ratios = [1.0] * 4
+    for spec in channel_specs:
+        ch = int(spec["channel"])
+        slug = str(spec["slug"])
         if slug in slug_map:
             channel_slugs[ch] = slug
+            channel_labels[ch] = str(spec["label"])
+            channel_crop_ratios[ch] = float(spec.get("crop_ratio", 1.0))
     missing = [i for i, s in enumerate(channel_slugs) if s is None]
     if missing:
         print(f"ERROR: missing alpamayo channel slots: {missing}")
         return 1
-    print(f"[cams] alpamayo channels: {channel_slugs}")
+    print(
+        "[cams] alpamayo channels:",
+        [
+            f"{i}:{channel_labels[i]}<-{channel_slugs[i]} crop={channel_crop_ratios[i]:.3f}"
+            for i in range(4)
+        ],
+    )
 
     time.sleep(0.4)  # let cameras prime
 
@@ -1471,12 +1548,14 @@ def main() -> int:
             channel_frames = []
             channel_frame_times = []
             ready = True
-            for slug in channel_slugs:
+            for slug, crop_ratio in zip(channel_slugs, channel_crop_ratios):
                 r = slug_map[slug]
                 f = r.latest()
                 if f is None:
                     ready = False
                     break
+                if crop_ratio < 1.0:
+                    f = center_crop_zoom(f, crop_ratio)
                 channel_frames.append(f)
                 channel_frame_times.append(float(getattr(r, "last_ok_s", 0.0)))
             if ready:
@@ -1537,7 +1616,7 @@ def main() -> int:
             state_payload = {
                 "steer_deg": float(client.latest_steer_smoothed),
                 "steer_deg_raw": float(client.latest_steer_deg),
-                "active_cam": "front_wide",  # alpamayo uses all 4; report front
+                "active_cam": "front",
                 "inference": inference,
                 "viz": bev_ready,
                 "viz_streams": ["bev"] if bev_ready else [],
@@ -1610,6 +1689,21 @@ def main() -> int:
                     "bytes_total": {
                         "sent": int(client.bytes_sent),
                         "recv": int(client.bytes_recv),
+                    },
+                    "camera_rig": {
+                        "mapping": str(args.camera_mapping),
+                        "extrinsics": str(args.extrinsics),
+                        "slugs": list(SLUGS),
+                        "channels": [
+                            {
+                                "channel": i,
+                                "label": channel_labels[i],
+                                "slug": channel_slugs[i],
+                                "crop_ratio": channel_crop_ratios[i],
+                            }
+                            for i in range(4)
+                        ],
+                        "manual_extrinsics_loaded": manual_extrinsics is not None,
                     },
                     # Chain-of-thought string from the VLM rollout (only
                     # populated when the server has ALPAMAYO_MAX_GEN_LEN
