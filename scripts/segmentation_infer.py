@@ -4,7 +4,9 @@ segmentation_infer.py — drive-by-segmentation live planner sidecar.
 
 Uses the cloned https://github.com/ethandgoodhart/drive-by-segmentation
 implementation for SegFormer semantic segmentation, BEV projection,
-lane-aware trajectory planning, and steering estimation. Publishes the
+lane-aware trajectory planning, and steering estimation. Also runs the local
+CLRerNet lane detector; any current lane detection with score >= 0.40
+overrides the segmentation steering centerline for that frame. Publishes the
 same /tmp contract as the other model sidecars:
 
   /tmp/cart_frames/{front_narrow,left,front_wide,right}.jpg  raw cameras
@@ -22,6 +24,7 @@ import argparse
 import json
 import math
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -33,18 +36,28 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import seg_fast  # noqa: E402
+import seg_occupancy  # noqa: E402
 
 
 SEG_REPO_DEFAULT = Path("/home/caddy/drive-by-segmentation")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from limits import BRAKE_POT_MAX  # noqa: E402
+
+E2E_CALIB_DEFAULT = PROJECT_ROOT / "calibration/cameras/sparsedrive_REAL_pvc_calibration.json"
 FRAMES_DIR_DEFAULT = Path("/tmp/cart_frames")
 STATE_FILE_DEFAULT = Path("/tmp/autoware_state.json")
+SEGMENTATION_MAP_FILE_DEFAULT = Path(
+    os.environ.get("SEGMENTATION_MAP_FILE", str(FRAMES_DIR_DEFAULT / "segmentation_map.json"))
+)
 EGO_STATE_FILE_DEFAULT = Path(os.environ.get("EGO_STATE_FILE", "/tmp/ego_state.json"))
+GPS_STATE_FILE_DEFAULT = Path(os.environ.get("GPS_STATE_FILE", "/tmp/gps_state.json"))
+NAV_ROUTE_FILE_DEFAULT = Path(os.environ.get("NAV_ROUTE_FILE", "/tmp/nav_route.json"))
 
-# Match the usual live-model camera labels on this cart. The second and
-# third discovered cameras are front_wide / left respectively; if these are
-# reversed, segmentation will infer from the side-facing left camera.
-SLUGS = ("front_narrow", "front_wide", "left", "right")
-ACTIVE_SLUG = "front_wide"
+# Segmentation currently drives from the center-front E2E-calibrated camera.
+SLUGS = ("front",)
+ACTIVE_SLUG = "front"
 CAMERA_ORIENTATION_FIX = {"front_narrow": -1}
 
 CAM_W, CAM_H = 640, 480
@@ -52,9 +65,11 @@ JPEG_QUALITY = 72
 PUBLISH_HZ_DEFAULT = 15.0
 INFER_HZ_DEFAULT = 0.0
 MODEL_NAME = "segmentation"
+FRONT_CAMERA_BRIGHTNESS = 32
 STEERING_SIGN = -1.0
 STEERING_COLUMN_RATIO = 15.0
 STEERING_EMA = 0.35
+CLRNET_CONF_THRESHOLD = 0.40
 LOOKAHEAD_MIN_M = 2.5
 LOOKAHEAD_MAX_M = 10.0
 LOOKAHEAD_TIME_S = 0.9
@@ -91,14 +106,14 @@ BRAKE_CONSTANT = 0.0
 # fresh. Output is added to the open-loop feed-forward gas. Conservative
 # gains — we'd rather creep up than overshoot into the cart's natural
 # spring-back. Reset integrator when ARKit drops to avoid wind-up.
-SPEED_KP = 0.03   # gas per mph error
-SPEED_KI = 0.02   # gas per (mph·s) error
-SPEED_I_CLAMP = 0.30  # safety cap on |integral term| (gas units)
-# Trim clamp scales with the feed-forward so behavior is consistent across
-# target speeds — at 2 mph (ff≈0.06) we allow ±0.10 trim, at 8 mph (ff≈0.24)
-# we allow ±0.36. Prevents the wild 4× swing the fixed ±0.25 caused at low mph.
-GAS_TRIM_FLOOR = 0.20
-GAS_TRIM_SCALE = 1.5
+SPEED_KP = 0.018  # gas per mph error
+SPEED_KI = 0.006  # gas per (mph.s) error
+SPEED_I_CLAMP = 0.12  # safety cap on |integral term| (gas units)
+# Trim clamp scales with the feed-forward but stays small at low speeds. This
+# prevents the PI loop from adding a large gas jump while the cart is still
+# accelerating toward a 2-4 mph target.
+GAS_TRIM_FLOOR = 0.06
+GAS_TRIM_SCALE = 0.75
 # Rolling-resistance floor: below this gas the kart barely moves. The pot↔mph
 # mapping (GAS_PER_MPH) is calibrated against the linear 5–8 mph regime; at
 # low mph the kart needs more gas than the linear extrapolation suggests just
@@ -111,9 +126,9 @@ ROLLING_GAS_FLOOR = 0.18
 # mutually exclusive — coast-then-brake, never both — to avoid pad wear
 # under normal cruise. Only activates after BRAKE_DEADBAND_MPH of overshoot
 # so small ARKit jitter doesn't pulse the brake.
-BRAKE_KP = 0.06           # brake per mph overshoot
+BRAKE_KP = 0.035          # brake per mph overshoot
 BRAKE_MAX = 0.25          # absolute brake-pot ceiling under autosteer
-BRAKE_DEADBAND_MPH = 0.3  # mph overshoot before brake engages
+BRAKE_DEADBAND_MPH = 0.8  # mph overshoot before brake engages
 
 # Launch ramp: start at LAUNCH_GAS_MIN and ease up to the commanded gas
 # over LAUNCH_RAMP_S seconds so the kart doesn't jerk off the line. The
@@ -121,13 +136,60 @@ BRAKE_DEADBAND_MPH = 0.3  # mph overshoot before brake engages
 # loop still corrects within the ramp ceiling instead of fighting it.
 LAUNCH_RAMP_S = 3.75
 LAUNCH_GAS_MIN = 0.02
-# Below this gas the kart can't break static friction. Ramp always rises to
-# at least this value (regardless of target_mph), and the stuck-detector
-# punches gas to it if we haven't started moving after the ramp ends. Once
-# the kart is rolling, the PI naturally trims back down to feed-forward.
+SPEED_SETPOINT_RAMP_MPH_S = 0.65
+GAS_RISE_RATE_PER_S = 0.055
+GAS_FALL_RATE_PER_S = 0.16
+# Below this gas the kart may not break static friction. Do not force this
+# during the initial ramp because it can launch low-speed targets too hard;
+# only ease toward it after the ramp if the phone says we are still parked.
 STICTION_GAS_BREAK = 0.22
 STICTION_EGO_MPH = 0.3
 STICTION_STUCK_S = 1.0
+
+# GPS route bias: route following is deliberately a bias, not a takeover. The
+# BEV segmentation centerline must still exist; GPS only nudges the chosen
+# lookahead direction toward the active route drawn in the map UI.
+GPS_ROUTE_FRESH_S = 2.0
+GPS_ROUTE_MAX_ACC_M = 8.0
+GPS_ROUTE_MIN_SPEED_MPS = 0.35
+GPS_ROUTE_LOOKAHEAD_M = 7.0
+GPS_ROUTE_GAIN = 0.35
+GPS_ROUTE_MAX_BIAS_DEG = 35.0
+GPS_ROUTE_DONE_M = 2.0
+
+# Turn announcements: surface the next significant route turn (direction +
+# distance) so the UI can show "RIGHT TURN NOW" / "left turn in 18 m".
+TURN_MIN_DEG = 25.0          # heading change at a route vertex to count as a turn
+TURN_NOW_M = 5.0             # within this distance the call becomes "NOW"
+TURN_ANNOUNCE_MAX_M = 40.0   # don't announce turns farther out than this
+
+# Environment brake. Independent of steering: moving objects (pedestrians,
+# riders, bikes, vehicles) are detected from the SegFormer BEV class map,
+# tracked to estimate velocity, and extrapolated into a future-occupancy risk
+# mask (scripts/seg_occupancy.py, ported from drive-by-segmentation's
+# unified-planner live.py). The planner's trajectory is braked in proportion to
+# how much of it conflicts with that risk mask, with an immediate semantic
+# override for a vulnerable road user sitting directly on the planned path.
+#
+# Smoothed brake fraction (0..1) maps onto the pedal pot:
+#   * gas is cut to 0 once the brake fraction clears ENV_BRAKE_GAS_CUT_FRAC
+#     (coast-then-brake), and
+#   * the UI "protective stop" state / STOP badge trips at ENV_BRAKE_STOP_FRAC.
+ENV_BRAKE_GAS_CUT_FRAC = 0.15
+ENV_BRAKE_STOP_FRAC = 0.5
+# Braking is judged against a fixed NEAR FORWARD CORRIDOR — the strip of ground
+# the cart will physically roll over next — not the steering centerline. The
+# centerline is derived from the road mask and bends *around* an obstacle (a
+# person is "not road"), so keying the brake off it makes the cart dodge instead
+# of stop. With a mono camera and no depth, an obstacle's BEV blob smears up its
+# image column but its *feet* land at the right near distance, so limiting the
+# corridor to ENV_BRAKE_NEAR_STOP_M keeps far objects from false-braking while
+# still catching anything directly ahead.
+ENV_BRAKE_CORRIDOR_HALF_M = 0.9   # half-width of the forward stop corridor
+ENV_BRAKE_NEAR_STOP_M = 6.0       # only obstacles within this forward range brake
+# When a hard protective stop is active, freeze steering (hold the last command)
+# instead of letting the road-mask centerline swerve around the obstacle.
+ENV_BRAKE_FREEZE_STEER = True
 
 
 def discover_v4l2_indices(count: int = 4, max_scan: int = 16) -> list[int]:
@@ -159,6 +221,32 @@ def open_camera(index: int) -> cv2.VideoCapture | None:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
+
+
+def apply_front_camera_controls(index: int, slug: str) -> None:
+    if not slug.startswith("front"):
+        return
+    for ctrl, value in (("auto_exposure", 3), ("brightness", FRONT_CAMERA_BRIGHTNESS)):
+        try:
+            subprocess.run(
+                ["v4l2-ctl", "-d", f"/dev/video{index}", "-c", f"{ctrl}={value}"],
+                check=False, timeout=2,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return
+
+
+def camera_index_from_source(source: str | None) -> int | None:
+    if not source:
+        return None
+    name = str(source)
+    if name.startswith("/dev/video"):
+        name = name.removeprefix("/dev/video")
+    try:
+        return int(name)
+    except ValueError:
+        return None
 
 
 class RealSenseReader(threading.Thread):
@@ -237,6 +325,11 @@ class RealSenseReader(threading.Thread):
         with self.lock:
             return None if self.frame is None else self.frame.copy()
 
+    def latest_with_meta(self) -> tuple[np.ndarray | None, int, float]:
+        with self.lock:
+            frame = None if self.frame is None else self.frame.copy()
+            return frame, int(self.frame_count), float(self.last_ok_s)
+
     def latest_color_depth(self) -> tuple[np.ndarray, np.ndarray | None] | None:
         with self.lock:
             if self.frame is None:
@@ -284,6 +377,11 @@ class CameraReader(threading.Thread):
         with self.lock:
             return None if self.frame is None else self.frame.copy()
 
+    def latest_with_meta(self) -> tuple[np.ndarray | None, int, float]:
+        with self.lock:
+            frame = None if self.frame is None else self.frame.copy()
+            return frame, int(self.frame_count), float(self.last_ok_s)
+
     def stop(self) -> None:
         self._stop.set()
         self.cap.release()
@@ -330,6 +428,11 @@ class VideoReader(threading.Thread):
         with self.lock:
             return None if self.frame is None else self.frame.copy()
 
+    def latest_with_meta(self) -> tuple[np.ndarray | None, int, float]:
+        with self.lock:
+            frame = None if self.frame is None else self.frame.copy()
+            return frame, int(self.frame_count), float(self.last_ok_s)
+
     def stop(self) -> None:
         self._stop.set()
 
@@ -345,10 +448,49 @@ def write_jpeg_atomic(path: Path, frame_bgr: np.ndarray, quality: int = JPEG_QUA
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w") as f:
         json.dump(payload, f, separators=(",", ":"))
     os.replace(tmp, path)
+
+
+def encode_segmentation_rle(seg_map: np.ndarray) -> dict:
+    """Run-length encode a uint8 label map in row-major order for JSON."""
+    flat = np.ascontiguousarray(seg_map, dtype=np.uint8).ravel()
+    if flat.size == 0:
+        return {"values": [], "counts": []}
+    changes = np.flatnonzero(flat[1:] != flat[:-1]) + 1
+    starts = np.concatenate(([0], changes))
+    ends = np.concatenate((changes, [flat.size]))
+    return {
+        "values": flat[starts].astype(int).tolist(),
+        "counts": (ends - starts).astype(int).tolist(),
+    }
+
+
+def segmentation_map_payload(seg_map: np.ndarray, colors: list,
+                             active_cam: str, infer_count: int,
+                             model_name: str) -> dict:
+    h, w = seg_map.shape[:2]
+    return {
+        "_schema": "caddy.segmentation_map.v1",
+        "ts": time.time(),
+        "infer_count": int(infer_count),
+        "active_cam": active_cam,
+        "model": MODEL_NAME,
+        "model_full": model_name,
+        "shape": [int(h), int(w)],
+        "dtype": "uint8",
+        "encoding": "rle_flat_c_order",
+        "rle": encode_segmentation_rle(seg_map),
+        "palette_rgb": [[int(c) for c in color] for color in colors],
+        "note": (
+            "Decode with np.repeat(rle.values, rle.counts).astype(np.uint8)"
+            ".reshape(shape). Labels use the drive-by-segmentation Cityscapes"
+            " palette order."
+        ),
+    }
 
 
 def sync_cuda_if_needed(device: str) -> None:
@@ -434,10 +576,12 @@ class SpeedController:
     def __init__(self) -> None:
         self.integral = 0.0
         self.last_t = None
+        self.last_gas = 0.0
 
     def reset(self) -> None:
         self.integral = 0.0
         self.last_t = None
+        self.last_gas = 0.0
 
     def step(self, target_mph: float, ego_mph: float, ego_ok: bool,
              feed_forward_gas: float, gas_ceiling: float = 1.0) -> tuple[float, float, float]:
@@ -449,11 +593,13 @@ class SpeedController:
         clip — classic conditional-integration anti-windup.
         """
         now = time.monotonic()
-        if not ego_ok:
-            self.reset()
-            return float(np.clip(feed_forward_gas, 0.0, gas_ceiling)), 0.0, 0.0
         dt = 0.1 if self.last_t is None else max(0.0, now - self.last_t)
         self.last_t = now
+        if not ego_ok:
+            self.integral = 0.0
+            gas_raw = float(np.clip(feed_forward_gas, 0.0, gas_ceiling))
+            gas = self.slew_gas(gas_raw, dt)
+            return gas, 0.0, 0.0
         err = target_mph - ego_mph
 
         # Trim clamp scales with feed-forward → consistent authority at any
@@ -479,7 +625,8 @@ class SpeedController:
 
         trim = SPEED_KP * err + SPEED_KI * self.integral
         trim = float(np.clip(trim, -trim_clamp, trim_clamp))
-        gas = float(np.clip(feed_forward_gas + trim, 0.0, gas_ceiling))
+        gas_raw = float(np.clip(feed_forward_gas + trim, 0.0, gas_ceiling))
+        gas = self.slew_gas(gas_raw, dt)
 
         # Engine braking via gas-off comes "free" — only blend in pad brake
         # when we're still over target *with gas already at zero*. This keeps
@@ -490,6 +637,86 @@ class SpeedController:
         if gas <= 1e-3 and overshoot > 0.0:
             brake = float(np.clip(BRAKE_KP * overshoot, 0.0, BRAKE_MAX))
         return gas, trim, brake
+
+    def slew_gas(self, gas: float, dt: float) -> float:
+        dt = max(0.0, min(0.25, dt))
+        rise = GAS_RISE_RATE_PER_S * dt
+        fall = GAS_FALL_RATE_PER_S * dt
+        lo = self.last_gas - fall
+        hi = self.last_gas + rise
+        out = float(np.clip(gas, lo, hi))
+        self.last_gas = out
+        return out
+
+    def sync_gas(self, gas: float) -> None:
+        self.last_gas = float(np.clip(gas, 0.0, 1.0))
+
+
+def bev_class_map_cached(seg_map: np.ndarray, remap: seg_fast.BevRemap) -> np.ndarray:
+    """Project segmentation labels into BEV using the cached homography."""
+    cls_ids = seg_map[remap.map_v, remap.map_u]
+    out = np.full((remap.bev_size, remap.bev_size), 255, dtype=np.uint8)
+    np.copyto(out, np.clip(cls_ids, 0, 254).astype(np.uint8), where=remap.valid)
+    return out
+
+
+def build_environment_threat(
+    occ: "seg_occupancy.PredictedOccupancy | None",
+    conflict_frac: float,
+    brake_01: float,
+    enabled: bool,
+) -> dict:
+    """Summarize the predicted-occupancy brake decision for state/UI.
+
+    Mirrors the shape the web UI expects from the old protective-stop block
+    (``active`` / ``objects`` / ``threat.{label,x_m}``) and adds the graded
+    fields (``brake_target`` / ``conflict_frac`` / ``track_count``). The threat
+    label/distance come from the nearest predictable moving track."""
+    active = bool(enabled and brake_01 >= ENV_BRAKE_STOP_FRAC)
+    tracks = occ.tracks if occ is not None else ()
+    threat = {
+        "enabled": bool(enabled),
+        "active": active,
+        "source": "occupancy",
+        "reason": "",
+        "brake_target": round(float(brake_01), 3),
+        "conflict_frac": round(float(conflict_frac), 3),
+        "objects": int(occ.track_count) if occ is not None else 0,
+        "track_count": int(len(tracks)),
+        "threat": None,
+    }
+    if not enabled:
+        threat["source"] = None
+        return threat
+    if tracks:
+        nearest = min(tracks, key=lambda t: t.pos_m[0])
+        threat["threat"] = {
+            "label": "obstacle",
+            "x_m": round(float(nearest.pos_m[0]), 3),
+            "y_m": round(float(nearest.pos_m[1]), 3),
+            "vx_mps": round(float(nearest.vel_mps[0]), 3),
+            "vy_mps": round(float(nearest.vel_mps[1]), 3),
+            "confidence": round(float(nearest.confidence), 3),
+        }
+        if active:
+            threat["reason"] = "predicted obstacle occupancy on planned path"
+    elif active:
+        threat["reason"] = "vulnerable road user on planned path"
+    return threat
+
+
+def forward_stop_corridor_bev(
+    bev_geom: "seg_occupancy.BevGeometry", near_m: float
+) -> np.ndarray:
+    """Straight near-forward corridor centerline in BEV pixels (Nx2 ``[bx, by]``).
+
+    The strip of ground directly ahead the cart will roll over next. Braking is
+    judged against this corridor — independent of the reactive steering
+    centerline — so an obstacle directly ahead stops the cart rather than being
+    steered around."""
+    fwds = np.linspace(0.3, float(near_m), 32)
+    bx, by = bev_geom.local_to_bev(fwds, np.zeros_like(fwds))
+    return np.stack([np.asarray(bx), np.asarray(by)], axis=1).astype(np.int32)
 
 
 _lookahead_point_filt: tuple[float, float] | None = None
@@ -577,18 +804,26 @@ def lookahead_heading_steering_deg(lane_local: np.ndarray, lookahead_m: float) -
 
 
 def make_sources(args) -> list[CameraReader | VideoReader | RealSenseReader]:
+    active_slug = args.active_slug
     if args.video:
         reader = VideoReader(args.video, loop=not args.no_loop)
-        reader.slug = ACTIVE_SLUG
+        reader.slug = active_slug
         return [reader]
 
     if args.source == "realsense":
         rs_reader = RealSenseReader(
-            slug=ACTIVE_SLUG,
+            slug=active_slug,
             width=args.rs_width, height=args.rs_height, fps=args.rs_fps,
             enable_depth=not args.no_depth,
         )
         return [rs_reader]
+
+    if args.camera_index is not None:
+        cap = open_camera(args.camera_index)
+        if cap is None:
+            raise RuntimeError(f"failed to open camera {args.camera_index} for {active_slug}")
+        apply_front_camera_controls(args.camera_index, active_slug)
+        return [CameraReader(cap, active_slug)]
 
     indices = discover_v4l2_indices(count=len(SLUGS), max_scan=args.max_scan)
     if len(indices) < len(SLUGS):
@@ -599,6 +834,7 @@ def make_sources(args) -> list[CameraReader | VideoReader | RealSenseReader]:
         cap = open_camera(idx)
         if cap is None:
             raise RuntimeError(f"failed to open camera {idx} for {slug}")
+        apply_front_camera_controls(idx, slug)
         readers.append(CameraReader(cap, slug))
     return readers
 
@@ -613,6 +849,364 @@ def import_segmentation_stack(repo_dir: Path):
     from render import CITYSCAPES_COLORS, create_bev, create_overlay
 
     return seg_live, rt, lane_aware_centerline_path, create_bev, create_overlay, CITYSCAPES_COLORS
+
+
+def import_clrnet_stack():
+    import clrnet_infer as clrnet
+
+    return clrnet
+
+
+def load_json_file(path: Path) -> dict:
+    with path.open() as f:
+        return json.load(f)
+
+
+def find_e2e_slot(calib: dict, slot_name: str) -> dict | None:
+    for slot in calib.get("slots", []):
+        if str(slot.get("slot", "")).upper() == slot_name.upper():
+            return slot
+    return None
+
+
+def drive_by_height_fallback(seg_repo: Path) -> float:
+    path = seg_repo / "camera_calibration.json"
+    try:
+        old = load_json_file(path)
+        return float(old.get("extrinsics", {}).get("height_m", 0.63094))
+    except Exception:
+        return 0.63094
+
+
+def e2e_slot_to_bev_calib(e2e_calib: dict, slot: dict,
+                          height_m: float) -> dict:
+    intr = slot["intrinsics"]
+    dist = slot.get("distortion_coeffs") or []
+    fx = float(intr[0][0])
+    fy = float(intr[1][1])
+    cx = float(intr[0][2])
+    cy = float(intr[1][2])
+    image_size = slot.get("image_size") or e2e_calib.get("calibrated_image_size") or [CAM_W, CAM_H]
+    return {
+        "intrinsics": {
+            "model": "pinhole",
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+            "k1": float(dist[0]) if len(dist) > 0 else 0.0,
+            "k2": float(dist[1]) if len(dist) > 1 else 0.0,
+            "resolution": [int(image_size[0]), int(image_size[1])],
+        },
+        "extrinsics": {
+            "height_m": float(height_m),
+            "pitch_deg": float(slot.get("camera_pitch_deg", 0.0)),
+            "roll_deg": float(slot.get("camera_roll_deg", 0.0)),
+            "yaw_deg": float(slot.get("camera_yaw_deg", 0.0)),
+            "ego_to_camera": slot.get("ego_to_camera"),
+            "camera_center_ego_m": slot.get("camera_center_ego_m"),
+        },
+        "road_width_ft": 20,
+        "bev_range": {
+            "forward_ft": 100,
+            "side_ft": 50,
+        },
+        "source_calibration": {
+            "type": e2e_calib.get("type", "e2e"),
+            "slot": slot.get("slot"),
+            "source": slot.get("source"),
+            "physical_position": slot.get("physical_position"),
+        },
+    }
+
+
+def load_bev_calibration(args) -> tuple[dict, dict | None]:
+    path = args.calib or (args.seg_repo / "camera_calibration.json")
+    raw = load_json_file(path)
+    if "slots" not in raw:
+        return raw, None
+
+    slot = find_e2e_slot(raw, args.camera_slot)
+    if slot is None:
+        raise RuntimeError(f"E2E calibration {path} has no slot {args.camera_slot}")
+    height_m = (
+        args.camera_height_m
+        if args.camera_height_m is not None
+        else drive_by_height_fallback(args.seg_repo)
+    )
+    return e2e_slot_to_bev_calib(raw, slot, height_m), slot
+
+
+def read_json_if_fresh(path: Path, max_age_s: float | None = None) -> dict | None:
+    try:
+        data = load_json_file(path)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if max_age_s is not None:
+        try:
+            if time.time() - float(data.get("ts", 0.0)) > max_age_s:
+                return None
+        except (TypeError, ValueError):
+            return None
+    return data
+
+
+def latlon_to_enu_m(lat: float, lon: float, ref_lat: float,
+                    ref_lon: float) -> tuple[float, float]:
+    radius_m = 6371000.0
+    d_lat = math.radians(lat - ref_lat)
+    d_lon = math.radians(lon - ref_lon)
+    ref = math.radians(ref_lat)
+    east = d_lon * math.cos(ref) * radius_m
+    north = d_lat * radius_m
+    return east, north
+
+
+def route_target_enu(route_ll: list[list[float]], lat: float, lon: float,
+                     lookahead_m: float) -> tuple[float, float, float] | None:
+    route_pts: list[tuple[float, float]] = []
+    for p in route_ll:
+        if not isinstance(p, (list, tuple)) or len(p) < 2:
+            continue
+        try:
+            p_lat = float(p[0])
+            p_lon = float(p[1])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(p_lat) and math.isfinite(p_lon):
+            route_pts.append(latlon_to_enu_m(p_lat, p_lon, lat, lon))
+    pts = np.array(route_pts, dtype=np.float64)
+    if pts.shape[0] < 2:
+        return None
+    seg = pts[1:] - pts[:-1]
+    seg_len = np.linalg.norm(seg, axis=1)
+    good = seg_len > 1e-3
+    if not np.any(good):
+        return None
+    total_len = float(np.sum(seg_len[good]))
+    if total_len < GPS_ROUTE_DONE_M:
+        return None
+    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+
+    best_dist = float("inf")
+    best_s = 0.0
+    for i, ok in enumerate(good):
+        if not ok:
+            continue
+        a = pts[i]
+        v = seg[i]
+        t = float(np.clip(-np.dot(a, v) / (seg_len[i] * seg_len[i]), 0.0, 1.0))
+        proj = a + t * v
+        dist = float(np.linalg.norm(proj))
+        if dist < best_dist:
+            best_dist = dist
+            best_s = float(cum[i] + t * seg_len[i])
+
+    target_s = min(best_s + lookahead_m, float(cum[-1]))
+    for i, ok in enumerate(good):
+        if not ok:
+            continue
+        if cum[i] <= target_s <= cum[i + 1]:
+            t = (target_s - cum[i]) / max(1e-6, seg_len[i])
+            target = pts[i] + t * seg[i]
+            remaining = max(0.0, float(cum[-1] - best_s))
+            return float(target[0]), float(target[1]), remaining
+    target = pts[-1]
+    remaining = max(0.0, float(cum[-1] - best_s))
+    return float(target[0]), float(target[1]), remaining
+
+
+def route_steering_deg_from_gps(fix: dict, route: dict,
+                                lookahead_m: float) -> tuple[float, dict] | None:
+    if not route.get("active"):
+        return None
+    route_ll = route.get("geometry")
+    if not isinstance(route_ll, list) or len(route_ll) < 2:
+        return None
+    try:
+        lat = float(fix["lat_deg"])
+        lon = float(fix["lon_deg"])
+        course_deg = float(fix["course_deg"])
+        speed_mps = float(fix.get("speed_mps", 0.0) or 0.0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(course_deg) or course_deg < 0.0:
+        return None
+    try:
+        h_acc = float(fix.get("h_acc_m", GPS_ROUTE_MAX_ACC_M))
+    except (TypeError, ValueError):
+        h_acc = GPS_ROUTE_MAX_ACC_M
+    if h_acc > GPS_ROUTE_MAX_ACC_M or speed_mps < GPS_ROUTE_MIN_SPEED_MPS:
+        return None
+
+    target = route_target_enu(route_ll, lat, lon, lookahead_m)
+    if target is None:
+        return None
+    east, north, remaining_m = target
+    if remaining_m < GPS_ROUTE_DONE_M:
+        return None
+
+    course = math.radians(course_deg)
+    # GPS course is degrees clockwise from north. Rotate the ENU target into
+    # the cart frame: x forward, y lateral.
+    #
+    # CRITICAL sign convention: lateral is positive to the RIGHT, to match
+    # seg_fast's lane_local. That array's column is named "local_left" but is
+    # actually right-positive — it's (bx/bev_size - 0.5)*2*range_side, and bx
+    # is the BEV image column, so the cart's right (image-right) is > 0.
+    # Segmentation steering and route steering share the exact same
+    # atan2(lateral, forward) -> RATIO*STEER_GAIN*STEERING_SIGN chain, so the
+    # route MUST use the same lateral sign or it biases toward the opposite
+    # turn (this was the wrong-direction bug).
+    x_fwd = east * math.sin(course) + north * math.cos(course)
+    y_right = east * math.cos(course) - north * math.sin(course)
+    if x_fwd < -1.0:
+        return None
+    ld = math.hypot(x_fwd, y_right)
+    if ld < 1e-3:
+        return None
+    alpha = math.atan2(y_right, x_fwd)
+    delta = math.atan2(2.0 * WHEELBASE_M * math.sin(alpha), ld)
+    column_deg = math.degrees(delta) * STEERING_COLUMN_RATIO * STEER_GAIN
+    diag = {
+        "target_x_m": round(float(x_fwd), 3),
+        "target_y_m": round(float(y_right), 3),
+        "remaining_m": round(float(remaining_m), 2),
+        "course_deg": round(float(course_deg), 1),
+        "h_acc_m": round(float(h_acc), 2),
+    }
+    return float(np.clip(column_deg, -270.0, 270.0)), diag
+
+
+def _wrap_deg(d: float) -> float:
+    return (d + 180.0) % 360.0 - 180.0
+
+
+def next_turn_on_route(route_ll: list, lat: float, lon: float) -> dict | None:
+    """First significant turn ahead of the current GPS position on the route.
+
+    Walks the route polyline (in a local ENU frame centred on the cart),
+    finds where the cart currently projects onto it, then returns the next
+    vertex whose heading change exceeds TURN_MIN_DEG. Direction follows the
+    GPS convention (bearing clockwise from north): a positive heading change
+    is a right turn.
+    """
+    pts_ll: list[tuple[float, float]] = []
+    for p in route_ll:
+        if not isinstance(p, (list, tuple)) or len(p) < 2:
+            continue
+        try:
+            pts_ll.append((float(p[0]), float(p[1])))
+        except (TypeError, ValueError):
+            continue
+    if len(pts_ll) < 3:
+        return None
+    pts = np.array([latlon_to_enu_m(a, b, lat, lon) for a, b in pts_ll],
+                   dtype=np.float64)
+    seg = pts[1:] - pts[:-1]
+    seg_len = np.linalg.norm(seg, axis=1)
+    if not np.any(seg_len > 1e-3):
+        return None
+    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+
+    # Current arc-length position = projection of ego (origin) onto the route.
+    best_dist = float("inf")
+    best_s = 0.0
+    for i in range(len(seg)):
+        if seg_len[i] <= 1e-3:
+            continue
+        a = pts[i]
+        v = seg[i]
+        t = float(np.clip(-np.dot(a, v) / (seg_len[i] * seg_len[i]), 0.0, 1.0))
+        proj = a + t * v
+        d = float(np.linalg.norm(proj))
+        if d < best_dist:
+            best_dist = d
+            best_s = float(cum[i] + t * seg_len[i])
+
+    seg_head = np.degrees(np.arctan2(seg[:, 0], seg[:, 1]))  # cw from north
+    for i in range(1, len(seg)):
+        if seg_len[i - 1] <= 1e-3 or seg_len[i] <= 1e-3:
+            continue
+        turn = _wrap_deg(float(seg_head[i] - seg_head[i - 1]))
+        if abs(turn) < TURN_MIN_DEG:
+            continue
+        dist = float(cum[i] - best_s)  # vertex i sits at arc-length cum[i]
+        if dist <= 0.0:
+            continue
+        return {
+            "turn_dir": "right" if turn > 0 else "left",
+            "turn_dist_m": round(dist, 1),
+            "turn_angle_deg": round(turn, 1),
+        }
+    return None
+
+
+def turn_announce_text(turn: dict | None) -> str:
+    if not turn:
+        return ""
+    d = float(turn["turn_dist_m"])
+    if d > TURN_ANNOUNCE_MAX_M:
+        return ""
+    direction = turn["turn_dir"]
+    if d <= TURN_NOW_M:
+        return f"{direction.upper()} TURN NOW"
+    return f"{direction} turn in {d:.0f} m"
+
+
+def gps_route_bias_deg(seg_steer_deg: float, args) -> tuple[float, dict]:
+    route = read_json_if_fresh(args.route_file, None)
+    if route is None or not route.get("active"):
+        return 0.0, {"active": False}
+    gps = read_json_if_fresh(args.gps_state_file, GPS_ROUTE_FRESH_S)
+    if gps is None or not gps.get("connected", False):
+        return 0.0, {"active": True, "gps_ok": False}
+    fix = gps.get("fix")
+    if not isinstance(fix, dict):
+        return 0.0, {"active": True, "gps_ok": False}
+
+    # Turn announcement is independent of the speed/course gates below, so the
+    # UI can warn about an upcoming turn even while the cart is crawling.
+    turn = None
+    try:
+        turn = next_turn_on_route(
+            route.get("geometry") or [],
+            float(fix["lat_deg"]), float(fix["lon_deg"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        turn = None
+    turn_diag = {
+        "turn_dir": turn["turn_dir"] if turn else None,
+        "turn_dist_m": turn["turn_dist_m"] if turn else None,
+        "turn_text": turn_announce_text(turn),
+    }
+
+    gps_steer = route_steering_deg_from_gps(fix, route, args.gps_route_lookahead_m)
+    if gps_steer is None:
+        return 0.0, {"active": True, "gps_ok": False, **turn_diag}
+    heading_deg, diag = gps_steer
+    desired_deg = heading_deg * STEERING_SIGN
+    bias = float(np.clip(
+        (desired_deg - seg_steer_deg) * args.gps_route_gain,
+        -args.gps_route_max_bias_deg,
+        args.gps_route_max_bias_deg,
+    ))
+    diag.update({
+        "active": True,
+        "gps_ok": True,
+        "route_steer_deg": round(float(desired_deg), 3),
+        "bias_deg": round(float(bias), 3),
+        **turn_diag,
+    })
+    return bias, diag
+
+
+def clrnet_device_from_seg_device(device: str) -> str:
+    if device == "cuda":
+        return "cuda:0"
+    return device
 
 
 def fill_bev_holes(bev_rgb: np.ndarray, mode: str = "fast-inpaint",
@@ -760,7 +1354,12 @@ def cloud_bev_rgb(depth_m: np.ndarray, seg_map: np.ndarray,
 
 
 def draw_bev_viz(bev_rgb: np.ndarray, lane_traj: np.ndarray | None,
-                 lane_local: np.ndarray | None, rt) -> np.ndarray:
+                 lane_local: np.ndarray | None, rt,
+                 occ: "seg_occupancy.PredictedOccupancy | None" = None,
+                 bev_geom: "seg_occupancy.BevGeometry | None" = None,
+                 brake_corridor: np.ndarray | None = None,
+                 brake_01: float = 0.0,
+                 stop_active: bool = False) -> np.ndarray:
     out = bev_rgb.copy()
     # Foot-labelled distance grid. RANGE_FWD covers 0..forward_ft (ego at
     # bottom); RANGE_SIDE covers ±side_ft (ego column at horizontal
@@ -814,6 +1413,39 @@ def draw_bev_viz(bev_rgb: np.ndarray, lane_traj: np.ndarray | None,
     put_label(out, "x=forward (ft)", (ego_bx + 6, 16))
     put_label(out, "y=lateral (ft)", (8, ego_by - 6))
 
+    # Predicted obstacle occupancy + detected obstacles (matches live.py's BEV).
+    # Currently-detected obstacle cells -> orange so a stationary / just-appeared
+    # object is always visible; predicted future-occupancy risk -> red; each
+    # moving track's extrapolated path -> light-red polyline.
+    if occ is not None:
+        cur = occ.current_mask
+        if cur is not None and cur.shape[:2] == out.shape[:2] and cur.any():
+            out[cur] = (0.40 * out[cur] + 0.60 * np.array([255, 140, 0])).astype(np.uint8)
+        risk = occ.risk_mask
+        if risk is not None and risk.shape[:2] == out.shape[:2] and risk.any():
+            out[risk] = (0.45 * out[risk] + 0.55 * np.array([255, 40, 40])).astype(np.uint8)
+        if bev_geom is not None:
+            for track in occ.tracks:
+                pts = []
+                for fwd_m, left_m in track.future_m:
+                    bx, by = bev_geom.local_to_bev(fwd_m, left_m)
+                    bxi, byi = int(round(float(bx))), int(round(float(by)))
+                    if 0 <= bxi < w and 0 <= byi < h:
+                        pts.append((bxi, byi))
+                if len(pts) > 1:
+                    cv2.polylines(out, [np.array(pts, dtype=np.int32)], False,
+                                  (255, 80, 80), 2, cv2.LINE_AA)
+
+    # Near forward stop corridor the brake is actually judged against.
+    if brake_corridor is not None and len(brake_corridor) > 1 and bev_geom is not None:
+        half_px = max(3, int(round(ENV_BRAKE_CORRIDOR_HALF_M * bev_geom.px_per_meter_side)))
+        cc = np.asarray(brake_corridor, dtype=np.int32)
+        corr_col = (255, 60, 60) if stop_active else (90, 220, 120)
+        left = cc.copy(); left[:, 0] -= half_px
+        right = cc.copy(); right[:, 0] += half_px
+        cv2.polylines(out, [left], False, corr_col, 1, cv2.LINE_AA)
+        cv2.polylines(out, [right], False, corr_col, 1, cv2.LINE_AA)
+
     if lane_traj is not None:
         rt.draw_trajectory(out, lane_traj, (255, 255, 0), 3)
     la_point, _ = rt.lookahead_point(lane_local)
@@ -824,6 +1456,20 @@ def draw_bev_viz(bev_rgb: np.ndarray, lane_traj: np.ndarray | None,
             cv2.line(out, (ego_bx, ego_by), (la_bx, la_by),
                      (0, 255, 255), 2, cv2.LINE_AA)
             cv2.circle(out, (la_bx, la_by), 6, (0, 255, 255), -1, cv2.LINE_AA)
+
+    # Brake banner so the environment-brake state is obvious even for a
+    # stationary obstacle (no future polyline to show).
+    if stop_active:
+        cv2.putText(out, "STOP", (w // 2 - 60, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 6, cv2.LINE_AA)
+        cv2.putText(out, "STOP", (w // 2 - 60, 44),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 40, 40), 3, cv2.LINE_AA)
+    elif brake_01 > 0.02:
+        txt = f"BRAKE {brake_01:.2f}"
+        cv2.putText(out, txt, (w // 2 - 70, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(out, txt, (w // 2 - 70, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 210, 0), 2, cv2.LINE_AA)
     return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
 
@@ -831,7 +1477,21 @@ def main() -> None:
     p = argparse.ArgumentParser(description="drive-by-segmentation WebUI sidecar")
     p.add_argument("--frames-dir", type=Path, default=FRAMES_DIR_DEFAULT)
     p.add_argument("--state-file", type=Path, default=STATE_FILE_DEFAULT)
+    p.add_argument("--segmentation-map-file", type=Path, default=None,
+                   help="Path for the latest raw semantic label map JSON. "
+                        "Defaults to <frames-dir>/segmentation_map.json, or "
+                        "SEGMENTATION_MAP_FILE when that environment variable is set.")
     p.add_argument("--seg-repo", type=Path, default=SEG_REPO_DEFAULT)
+    p.add_argument("--calib", type=Path, default=E2E_CALIB_DEFAULT,
+                   help="BEV calibration JSON. Supports the drive-by format or E2E slots.")
+    p.add_argument("--camera-slot", default="CAM_FRONT",
+                   help="E2E calibration slot to use when --calib has slots.")
+    p.add_argument("--camera-index", type=int, default=None,
+                   help="Open only this /dev/videoN camera for UVC input.")
+    p.add_argument("--active-slug", default=ACTIVE_SLUG,
+                   help="Logical name for the active camera frame stream.")
+    p.add_argument("--camera-height-m", type=float, default=None,
+                   help="Ground height for E2E BEV projection when the E2E origin is camera-center.")
     p.add_argument("--model", default="b0", choices=("b0", "b2", "b5"))
     p.add_argument("--device", default=None)
     p.add_argument("--publish-hz", type=float, default=PUBLISH_HZ_DEFAULT)
@@ -872,6 +1532,18 @@ def main() -> None:
                    help="Print one latency breakdown every N inference frames. "
                         "0 keeps profiling in state only.")
     p.add_argument("--ego-state-file", type=Path, default=EGO_STATE_FILE_DEFAULT)
+    p.add_argument("--constant-speed", action="store_true",
+                   help="Disable adaptive speed control (PI loop, launch ramp, "
+                        "stiction punch, brake). Hold a flat open-loop pedal pot "
+                        "at constant_gas_for_mph(--target-mph) the whole time.")
+    p.add_argument("--gps-state-file", type=Path, default=GPS_STATE_FILE_DEFAULT)
+    p.add_argument("--route-file", type=Path, default=NAV_ROUTE_FILE_DEFAULT)
+    p.add_argument("--gps-route-lookahead-m", type=float, default=GPS_ROUTE_LOOKAHEAD_M)
+    p.add_argument("--gps-route-gain", type=float, default=GPS_ROUTE_GAIN)
+    p.add_argument("--gps-route-max-bias-deg", type=float, default=GPS_ROUTE_MAX_BIAS_DEG)
+    p.add_argument("--no-protective-stop", action="store_true",
+                   help="Disable predicted-occupancy environment braking. "
+                        "Intended only for bench tests.")
     p.add_argument(
         "--target-mph",
         type=float,
@@ -883,10 +1555,33 @@ def main() -> None:
         help="Use the original scipy-heavy create_bev + lane_aware_centerline_path "
              "instead of the cached / cv2-accelerated versions in seg_fast.",
     )
+    p.add_argument(
+        "--no-clrnet", action="store_true",
+        help="Disable the CLRerNet lane override and use segmentation only.",
+    )
+    p.add_argument("--clrnet-config", default=None)
+    p.add_argument("--clrnet-ckpt", default=None)
+    p.add_argument("--clrnet-device", default=None)
     args = p.parse_args()
+    if args.segmentation_map_file is None:
+        args.segmentation_map_file = SEGMENTATION_MAP_FILE_DEFAULT
+        if "SEGMENTATION_MAP_FILE" not in os.environ:
+            args.segmentation_map_file = args.frames_dir / "segmentation_map.json"
     args.target_mph = max(0.0, float(args.target_mph))
+    args.gps_route_lookahead_m = float(np.clip(args.gps_route_lookahead_m, 2.0, 20.0))
+    args.gps_route_gain = float(np.clip(args.gps_route_gain, 0.0, 1.0))
+    # Ceiling is the steering-column travel limit, not 90°, so a strong route
+    # authority can actually pull the cart through a turn instead of saturating.
+    args.gps_route_max_bias_deg = float(np.clip(args.gps_route_max_bias_deg, 0.0, 270.0))
     target_gas_ff = constant_gas_for_mph(args.target_mph)
     speed_ctrl = SpeedController()
+    # Predicted future-occupancy obstacle tracker + brake smoother (replaces the
+    # old corridor protective-stop + UniAD merge). bev_geom is built once the BEV
+    # ranges are resolved from the calibration below.
+    occupancy_tracker = seg_occupancy.PredictedOccupancyTracker()
+    brake_smoother = seg_occupancy.PedalCommandSmoother()
+    bev_geom: seg_occupancy.BevGeometry | None = None
+    last_occ_update_s = time.monotonic()
     launch_start_t: float | None = None
     stuck_since: float | None = None
 
@@ -903,25 +1598,57 @@ def main() -> None:
     else:
         device = "cpu"
 
-    with (args.seg_repo / "camera_calibration.json").open() as f:
-        calib = json.load(f)
+    calib, e2e_slot = load_bev_calibration(args)
+    if e2e_slot is not None:
+        args.active_slug = str(e2e_slot.get("physical_position") or args.active_slug)
+        if args.camera_index is None:
+            args.camera_index = camera_index_from_source(e2e_slot.get("source"))
+        print(
+            f"[calib] E2E slot={e2e_slot.get('slot')} "
+            f"source={e2e_slot.get('source')} active={args.active_slug} "
+            f"height_m={calib['extrinsics']['height_m']:.3f}",
+            flush=True,
+        )
 
     bev_range = calib.get("bev_range", {})
     rt.RANGE_FWD = bev_range.get("forward_ft", 50) * rt.FT_TO_M
     rt.RANGE_SIDE = bev_range.get("side_ft", 25) * rt.FT_TO_M
     road_width_ft = float(calib.get("road_width_ft", 20.0))
-
-    proc, model = seg_live.load_segformer(args.model, device)
-    steer_est = rt.SteeringEstimator()
+    # Occupancy geometry matches the BEV the planner draws into, so the risk
+    # mask lines up 1:1 with the planned-trajectory polyline.
+    bev_geom = seg_occupancy.BevGeometry.from_ranges(
+        rt.BEV_SIZE, rt.RANGE_FWD, rt.RANGE_SIDE
+    )
 
     readers = make_sources(args)
     for r in readers:
         r.start()
 
-    slug_to_reader = {getattr(r, "slug", ACTIVE_SLUG): r for r in readers}
-    active_reader = slug_to_reader.get(ACTIVE_SLUG)
+    active_slug = args.active_slug
+    slug_to_reader = {getattr(r, "slug", active_slug): r for r in readers}
+    active_reader = slug_to_reader.get(active_slug)
     if active_reader is None:
-        raise RuntimeError(f"active camera {ACTIVE_SLUG} not available")
+        raise RuntimeError(f"active camera {active_slug} not available")
+
+    proc, model = seg_live.load_segformer(args.model, device)
+    steer_est = rt.SteeringEstimator()
+    clrnet = None
+    clrnet_runner = None
+    if not args.no_clrnet:
+        try:
+            clrnet = import_clrnet_stack()
+            clrnet_config = args.clrnet_config or clrnet.CLRNET_CONFIG
+            clrnet_ckpt = args.clrnet_ckpt or clrnet.CLRNET_CKPT
+            clrnet_device = args.clrnet_device or clrnet_device_from_seg_device(device)
+            clrnet_runner = clrnet.CLRerNetRunner(clrnet_config, clrnet_ckpt, device=clrnet_device)
+        except Exception as e:
+            print(
+                f"[clrnet] unavailable, continuing with segmentation only: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+            clrnet = None
+            clrnet_runner = None
 
     palette = np.array(colors, dtype=np.uint8)
     road_color = np.array(colors[0], dtype=np.uint8)
@@ -932,6 +1659,7 @@ def main() -> None:
     infer_period = 1.0 / args.infer_hz if args.infer_hz > 0 else 0.0
     next_publish_t = 0.0
     next_infer_t = 0.0
+    last_log_t = 0.0
     infer_times: list[float] = []
 
     bev_remap: seg_fast.BevRemap | None = None
@@ -939,6 +1667,7 @@ def main() -> None:
 
     latest_overlay_bgr: np.ndarray | None = None
     latest_bev_bgr: np.ndarray | None = None
+    latest_seg_map: np.ndarray | None = None
     latest_path: list[list[float]] = []
     latest_steer_raw = 0.0
     latest_steer_base = 0.0
@@ -946,12 +1675,41 @@ def main() -> None:
     latest_lookahead_m = 0.0
     latest_ego_speed_mph = 0.0
     latest_ego_speed_ok = False
+    latest_speed_setpoint_mph = args.target_mph
     latest_target_gas = target_gas_ff
     latest_gas_trim = 0.0
     latest_target_brake = 0.0
+    latest_steer_source = "segmentation"
+    latest_clrnet_lanes: list = []
+    latest_clrnet_steer_state: dict = {
+        "centerline": [],
+        "lookahead": None,
+        "lateral_err": 0.0,
+        "steering_deg": 0.0,
+    }
+    latest_clrnet_override = False
+    latest_clrnet_steer_raw = 0.0
+    latest_clrnet_steer_filtered = 0.0
+    latest_clrnet_fresh_count = 0
+    latest_clrnet_confidences: list[float] = []
+    latest_clrnet_overlay_bgr: np.ndarray | None = None
+    latest_gps_route: dict = {"active": False}
+    latest_env_brake_01 = 0.0
+    latest_occupancy: "seg_occupancy.PredictedOccupancy | None" = None
+    latest_brake_corridor: np.ndarray | None = None
+    latest_protective_stop: dict = build_environment_threat(
+        None, 0.0, 0.0, enabled=not args.no_protective_stop
+    )
     inference_ok = False
     latest_latency_ms: dict[str, float] = {}
     infer_count = 0
+    last_processed_frame_count = -1
+    latest_camera_frame_count = 0
+    latest_camera_last_ok_s = 0.0
+    last_camera_fps_sample_t = time.monotonic()
+    last_camera_fps_sample_count = 0
+    latest_camera_fps = 0.0
+    latest_infer_ok_s = 0.0
 
     try:
         while True:
@@ -972,18 +1730,29 @@ def main() -> None:
                     rs_pair = active_reader.latest_color_depth()
                     frame_bgr = rs_pair[0] if rs_pair is not None else None
                     depth_m = rs_pair[1] if rs_pair is not None else None
+                    latest_camera_frame_count = int(active_reader.frame_count)
+                    latest_camera_last_ok_s = float(active_reader.last_ok_s)
                 else:
-                    frame_bgr = active_reader.latest()
+                    frame_bgr, latest_camera_frame_count, latest_camera_last_ok_s = (
+                        active_reader.latest_with_meta()
+                    )
                     depth_m = None
                 mark("source_latest_ms")
-                if frame_bgr is not None:
+                have_new_camera_frame = (
+                    frame_bgr is not None
+                    and latest_camera_frame_count != last_processed_frame_count
+                )
+                if have_new_camera_frame:
+                    last_processed_frame_count = latest_camera_frame_count
                     t0 = time.perf_counter()
                     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                     mark("bgr_to_rgb_ms")
                     seg_map, seg_stage_ms = timed_segment_frame(frame_rgb, proc, model, device)
+                    latest_seg_map = seg_map
                     stage_ms.update(seg_stage_ms)
                     stage_last = time.perf_counter()
 
+                    bev_cls_map = None
                     if args.bev_mode == "depth":
                         if args.source != "realsense":
                             raise RuntimeError("--bev-mode depth requires --source realsense")
@@ -1015,8 +1784,12 @@ def main() -> None:
                                     flush=True,
                                 )
                             bev_rgb = seg_fast.create_bev_cached(seg_map, palette, bev_remap)
+                            bev_cls_map = bev_class_map_cached(seg_map, bev_remap)
                         else:
-                            bev_rgb = create_bev(seg_map, calib, rt.BEV_SIZE)
+                            bev_out = create_bev(
+                                seg_map, calib, rt.BEV_SIZE, return_class_map=True
+                            )
+                            bev_rgb, bev_cls_map = bev_out
                     mark("bev_ms")
                     road_mask = (
                         np.all(bev_rgb == road_color, axis=-1)
@@ -1061,59 +1834,244 @@ def main() -> None:
                         args.ego_state_file
                     )
                     latest_lookahead_m = adaptive_lookahead_m(latest_ego_speed_mph, latest_ego_speed_ok)
-                    if launch_start_t is None:
-                        launch_start_t = time.monotonic()
-                    ramp_age = time.monotonic() - launch_start_t
-                    # Always ramp toward at least stiction-break gas so low
-                    # mph targets (ff < stiction) still get the kart rolling.
-                    ramp_top = max(target_gas_ff, STICTION_GAS_BREAK)
-                    if LAUNCH_RAMP_S > 0.0 and ramp_age < LAUNCH_RAMP_S:
-                        frac = max(0.0, ramp_age / LAUNCH_RAMP_S)
-                        gas_ceiling = LAUNCH_GAS_MIN + frac * max(
-                            0.0, ramp_top - LAUNCH_GAS_MIN
+                    # Predicted future-occupancy obstacle tracking + environment
+                    # brake (ported from drive-by-segmentation unified-planner
+                    # live.py). Moving obstacles in the BEV class map are tracked
+                    # to estimate velocity and extrapolated into a future risk
+                    # mask; we brake on how much of the NEAR FORWARD CORRIDOR (not
+                    # the swerving steering centerline) conflicts with that risk
+                    # mask OR with currently-detected obstacle cells (so a
+                    # stationary / just-appeared person directly ahead also
+                    # stops the cart), plus a semantic VRU override.
+                    occ_conflict_frac = 0.0
+                    env_brake_target = 0.0
+                    latest_brake_corridor = None
+                    protective_enabled = not args.no_protective_stop
+                    if protective_enabled and bev_cls_map is not None and bev_geom is not None:
+                        occ_now = time.monotonic()
+                        occ_dt = float(np.clip(occ_now - last_occ_update_s, 0.02, 0.5))
+                        last_occ_update_s = occ_now
+                        ego_mps = (
+                            latest_ego_speed_mph * 0.44704 if latest_ego_speed_ok else 0.0
+                        )
+                        latest_occupancy = occupancy_tracker.update(
+                            bev_cls_map,
+                            bev_geom,
+                            dt_s=occ_dt,
+                            ego_speed_mps=ego_mps,
+                            use_segmentation_obstacles=True,
+                        )
+                        lat_px = max(
+                            3,
+                            int(round(ENV_BRAKE_CORRIDOR_HALF_M * bev_geom.px_per_meter_side)),
+                        )
+                        latest_brake_corridor = forward_stop_corridor_bev(
+                            bev_geom, ENV_BRAKE_NEAR_STOP_M
+                        )
+                        # Stop mask = predicted future occupancy (moving objects)
+                        # OR currently-detected obstacle cells (stationary / just
+                        # appeared). Either inside the near corridor brakes.
+                        stop_mask = (
+                            latest_occupancy.risk_mask | latest_occupancy.current_mask
+                        )
+                        occ_conflict_frac = seg_occupancy.trajectory_conflict_frac(
+                            latest_brake_corridor, stop_mask, lateral_half_width_px=lat_px
+                        )
+                        env_brake_target = seg_occupancy.environment_brake_target(
+                            occ_conflict_frac, latest_brake_corridor, bev_cls_map,
+                            lateral_half_width_px=lat_px,
                         )
                     else:
-                        gas_ceiling = 1.0
-                    latest_target_gas, latest_gas_trim, latest_target_brake = speed_ctrl.step(
-                        args.target_mph,
-                        latest_ego_speed_mph,
-                        latest_ego_speed_ok,
-                        target_gas_ff,
-                        gas_ceiling=gas_ceiling,
+                        latest_occupancy = None
+                        if not protective_enabled:
+                            occupancy_tracker.reset()
+                    brake_smoother.step(env_brake_target)
+                    _, latest_env_brake_01 = brake_smoother.snapshot()
+                    latest_protective_stop = build_environment_threat(
+                        latest_occupancy,
+                        occ_conflict_frac,
+                        latest_env_brake_01,
+                        enabled=protective_enabled,
                     )
-                    # Stuck-detector: if we're still essentially parked after
-                    # the launch ramp ends, override the controller with
-                    # stiction-break gas to get the wheels rolling. Once ego
-                    # > STICTION_EGO_MPH the PI takes over and pulls back.
-                    now_mono = time.monotonic()
-                    if (latest_ego_speed_ok
-                            and ramp_age > LAUNCH_RAMP_S
-                            and args.target_mph > STICTION_EGO_MPH
-                            and latest_ego_speed_mph < STICTION_EGO_MPH):
-                        if stuck_since is None:
-                            stuck_since = now_mono
-                        elif now_mono - stuck_since > STICTION_STUCK_S:
-                            latest_target_gas = max(latest_target_gas, STICTION_GAS_BREAK)
-                            latest_target_brake = 0.0
+                    mark("protective_stop_ms")
+                    if args.constant_speed:
+                        # Adaptive speed disabled: hold a fixed open-loop pedal
+                        # pot at the target-mph feed-forward gas. No launch ramp,
+                        # no PI trim, no stiction punch, no brake — whatever
+                        # constant_gas_for_mph(target) maps to, applied flat.
+                        latest_speed_setpoint_mph = args.target_mph
+                        latest_target_gas = target_gas_ff
+                        latest_gas_trim = 0.0
+                        latest_target_brake = 0.0
                     else:
-                        stuck_since = None
-                    if path_ok:
+                        if launch_start_t is None:
+                            launch_start_t = time.monotonic()
+                        ramp_age = time.monotonic() - launch_start_t
+                        if args.target_mph > 1e-3 and SPEED_SETPOINT_RAMP_MPH_S > 0.0:
+                            latest_speed_setpoint_mph = min(
+                                args.target_mph,
+                                ramp_age * SPEED_SETPOINT_RAMP_MPH_S,
+                            )
+                        else:
+                            latest_speed_setpoint_mph = args.target_mph
+                        speed_setpoint_gas_ff = constant_gas_for_mph(
+                            latest_speed_setpoint_mph
+                        )
+                        if LAUNCH_RAMP_S > 0.0 and ramp_age < LAUNCH_RAMP_S:
+                            frac = max(0.0, ramp_age / LAUNCH_RAMP_S)
+                            gas_ceiling = LAUNCH_GAS_MIN + frac * max(
+                                0.0, target_gas_ff - LAUNCH_GAS_MIN
+                            )
+                        else:
+                            gas_ceiling = 1.0
+                        latest_target_gas, latest_gas_trim, latest_target_brake = speed_ctrl.step(
+                            latest_speed_setpoint_mph,
+                            latest_ego_speed_mph,
+                            latest_ego_speed_ok,
+                            speed_setpoint_gas_ff,
+                            gas_ceiling=gas_ceiling,
+                        )
+                        # Stuck-detector: if we're still essentially parked after
+                        # the launch ramp ends, override the controller with
+                        # stiction-break gas to get the wheels rolling. Once ego
+                        # > STICTION_EGO_MPH the PI takes over and pulls back.
+                        now_mono = time.monotonic()
+                        if (latest_ego_speed_ok
+                                and ramp_age > LAUNCH_RAMP_S
+                                and args.target_mph > STICTION_EGO_MPH
+                                and latest_ego_speed_mph < STICTION_EGO_MPH):
+                            if stuck_since is None:
+                                stuck_since = now_mono
+                            elif now_mono - stuck_since > STICTION_STUCK_S:
+                                latest_target_gas = speed_ctrl.slew_gas(
+                                    max(latest_target_gas, STICTION_GAS_BREAK),
+                                    1.0 / max(1.0, args.publish_hz),
+                                )
+                                latest_target_brake = 0.0
+                        else:
+                            stuck_since = None
+                    # Environment brake overrides cruise: blend the smoothed
+                    # occupancy/VRU brake fraction into the pedal pot (max with
+                    # any overspeed brake) and cut gas once it's meaningfully
+                    # engaged (coast-then-brake).
+                    if latest_env_brake_01 > 1e-3:
+                        latest_target_brake = max(
+                            float(latest_target_brake),
+                            latest_env_brake_01 * float(BRAKE_POT_MAX),
+                        )
+                        if latest_env_brake_01 >= ENV_BRAKE_GAS_CUT_FRAC:
+                            latest_target_gas = 0.0
+                            latest_gas_trim = 0.0
+                            speed_ctrl.sync_gas(0.0)
+                    # Hard protective stop: hold the last steering command — don't
+                    # let the road-mask centerline swerve around the obstacle while
+                    # we brake to a stop.
+                    hold_steering = bool(
+                        ENV_BRAKE_FREEZE_STEER and latest_protective_stop.get("active")
+                    )
+                    latest_steer_source = "segmentation"
+                    latest_clrnet_override = False
+                    if hold_steering:
+                        latest_steer_source = "protective_hold"
+                        latest_gps_route = {"active": False}
+                    elif path_ok:
                         heading_steer = lookahead_heading_steering_deg(lane_local, latest_lookahead_m)
                         if heading_steer is not None:
-                            latest_steer_base = heading_steer * STEERING_SIGN
+                            seg_steer_base = heading_steer * STEERING_SIGN
                         else:
-                            latest_steer_base = float(steer_est.steering_deg) * STEERING_SIGN
+                            seg_steer_base = float(steer_est.steering_deg) * STEERING_SIGN
+                        route_bias, latest_gps_route = gps_route_bias_deg(
+                            seg_steer_base, args
+                        )
+                        latest_steer_base = float(np.clip(
+                            seg_steer_base + route_bias,
+                            -270.0,
+                            270.0,
+                        ))
+                        if latest_gps_route.get("gps_ok") and abs(route_bias) > 1e-3:
+                            latest_steer_source = "segmentation+gps"
                         latest_steer_filtered = (
                             STEERING_EMA * latest_steer_base
                             + (1.0 - STEERING_EMA) * latest_steer_filtered
                         )
                         latest_steer_raw = float(np.clip(latest_steer_filtered, -270.0, 270.0))
+                    else:
+                        latest_gps_route = {"active": False}
                     # else: no path — hold latest_steer_* at their previous values.
+
+                    if clrnet_runner is not None:
+                        try:
+                            lanes = clrnet_runner.infer(frame_bgr)
+                        except Exception as e:
+                            print(
+                                f"[clrnet] infer failed: {type(e).__name__}: {e}",
+                                flush=True,
+                            )
+                            lanes = []
+                        latest_clrnet_lanes = lanes
+                        latest_clrnet_confidences = sorted(
+                            [float(l.get("score", 0.0)) for l in lanes],
+                            reverse=True,
+                        )
+                        latest_clrnet_steer_state = {
+                            "centerline": [],
+                            "lookahead": None,
+                            "lateral_err": 0.0,
+                            "steering_deg": 0.0,
+                        }
+                        fresh_lanes = [
+                            l for l in lanes
+                            if float(l.get("score", 0.0)) >= CLRNET_CONF_THRESHOLD
+                        ]
+                        latest_clrnet_fresh_count = len(fresh_lanes)
+                        if fresh_lanes:
+                            chosen_left = clrnet.best_on_side(fresh_lanes, "left")
+                            chosen_right = clrnet.best_on_side(fresh_lanes, "right")
+                            if chosen_left is None and chosen_right is not None:
+                                chosen_left = clrnet._mirror_lane(chosen_right)
+                            if chosen_right is None and chosen_left is not None:
+                                chosen_right = clrnet._mirror_lane(chosen_left)
+                            steer_state = clrnet.compute_steering(chosen_left, chosen_right)
+                            if steer_state.get("centerline") and not hold_steering:
+                                latest_clrnet_steer_state = steer_state
+                                geom_deg = -float(steer_state.get("steering_deg", 0.0))
+                                latest_clrnet_steer_raw = float(np.clip(
+                                    geom_deg * clrnet.STEER_AMP,
+                                    -clrnet.STEER_CLAMP_DEG,
+                                    clrnet.STEER_CLAMP_DEG,
+                                ))
+                                latest_clrnet_steer_filtered = (
+                                    clrnet.STEER_ALPHA * latest_clrnet_steer_filtered
+                                    + (1.0 - clrnet.STEER_ALPHA) * latest_clrnet_steer_raw
+                                )
+                                latest_steer_raw = latest_clrnet_steer_filtered
+                                latest_steer_base = latest_clrnet_steer_filtered
+                                latest_steer_source = "clrnet"
+                                latest_clrnet_override = True
+                        mark("clrnet_ms")
                     mark("steer_ms")
                     overlay_rgb = create_overlay(frame_rgb, seg_map)
                     latest_overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
                     mark("overlay_ms")
-                    latest_bev_bgr = draw_bev_viz(bev_rgb, lane_traj, lane_local, rt)
+                    latest_bev_bgr = draw_bev_viz(
+                        bev_rgb, lane_traj, lane_local, rt,
+                        occ=latest_occupancy, bev_geom=bev_geom,
+                        brake_corridor=latest_brake_corridor,
+                        brake_01=latest_env_brake_01,
+                        stop_active=bool(latest_protective_stop.get("active")),
+                    )
+                    if clrnet is not None and latest_clrnet_lanes:
+                        latest_clrnet_overlay_bgr = clrnet.render_overlay(
+                            frame_bgr,
+                            latest_clrnet_lanes,
+                            latest_clrnet_steer_state,
+                            fresh=latest_clrnet_override,
+                            mph_target=args.target_mph,
+                            mph_actual=latest_ego_speed_mph if latest_ego_speed_ok else None,
+                            column_deg=latest_steer_raw,
+                        )
+                    elif clrnet is not None:
+                        latest_clrnet_overlay_bgr = frame_bgr.copy()
                     mark("bev_viz_ms")
 
                     infer_times.append(time.perf_counter() - t0)
@@ -1122,6 +2080,7 @@ def main() -> None:
                     infer_count += 1
                     stage_ms["infer_total_ms"] = (time.perf_counter() - stage_start) * 1000.0
                     latest_latency_ms = {k: round(float(v), 3) for k, v in stage_ms.items()}
+                    latest_infer_ok_s = time.monotonic()
                     if args.profile_every > 0 and infer_count % args.profile_every == 0:
                         ordered = " ".join(
                             f"{k}={latest_latency_ms[k]:.1f}"
@@ -1147,43 +2106,120 @@ def main() -> None:
                     t = time.perf_counter()
                     write_jpeg_atomic(args.frames_dir / "bev.jpg", latest_bev_bgr, quality=85)
                     jpeg_ms["jpeg_bev_ms"] = (time.perf_counter() - t) * 1000.0
+                if latest_clrnet_overlay_bgr is not None:
+                    t = time.perf_counter()
+                    write_jpeg_atomic(args.frames_dir / "lanes.jpg", latest_clrnet_overlay_bgr, quality=80)
+                    jpeg_ms["jpeg_lanes_ms"] = (time.perf_counter() - t) * 1000.0
+                if latest_seg_map is not None:
+                    t = time.perf_counter()
+                    write_json_atomic(
+                        args.segmentation_map_file,
+                        segmentation_map_payload(
+                            latest_seg_map,
+                            colors,
+                            active_slug,
+                            infer_count,
+                            f"drive-by-segmentation-segformer-{args.model}",
+                        ),
+                    )
+                    jpeg_ms["json_segmentation_map_ms"] = (time.perf_counter() - t) * 1000.0
                 publish_jpeg_total_ms = (time.perf_counter() - publish_start) * 1000.0
 
+                cam_now = time.monotonic()
+                cam_dt = cam_now - last_camera_fps_sample_t
+                if cam_dt >= 1.0:
+                    frame_delta = latest_camera_frame_count - last_camera_fps_sample_count
+                    latest_camera_fps = max(0.0, float(frame_delta) / max(cam_dt, 1e-6))
+                    last_camera_fps_sample_t = cam_now
+                    last_camera_fps_sample_count = latest_camera_frame_count
+                camera_age_s = (
+                    cam_now - latest_camera_last_ok_s
+                    if latest_camera_last_ok_s > 0.0 else float("inf")
+                )
+                camera_stale = camera_age_s > 0.5
+                inference_stale = (cam_now - latest_infer_ok_s) > 0.5 if latest_infer_ok_s else True
+
                 mean_dt = sum(infer_times) / len(infer_times) if infer_times else 0.0
-                fps = 1.0 / mean_dt if mean_dt > 0 else 0.0
+                fps = 0.0 if camera_stale or inference_stale else (1.0 / mean_dt if mean_dt > 0 else 0.0)
                 state = {
                     "steer_deg": latest_steer_raw,
                     "steer_deg_raw": latest_steer_raw,
-                    "active_cam": ACTIVE_SLUG,
-                    "inference": inference_ok,
-                    "viz": latest_overlay_bgr is not None or latest_bev_bgr is not None,
+                    "active_cam": active_slug,
+                    "inference": inference_ok and not camera_stale and not inference_stale,
+                    "viz": (
+                        latest_overlay_bgr is not None
+                        or latest_bev_bgr is not None
+                        or latest_clrnet_overlay_bgr is not None
+                    ),
                     "viz_streams": [
-                        slug for slug, img in (("seg", latest_overlay_bgr), ("bev", latest_bev_bgr))
+                        slug for slug, img in (
+                            ("seg", latest_overlay_bgr),
+                            ("bev", latest_bev_bgr),
+                            ("lanes", latest_clrnet_overlay_bgr),
+                        )
                         if img is not None
                     ],
-                    "object_count": 0,
+                    "object_count": int(latest_protective_stop.get("objects", 0)),
                     "fps": float(fps),
+                    "camera_fps": float(latest_camera_fps),
+                    "camera_frame_count": int(latest_camera_frame_count),
+                    "camera_age_s": (
+                        float(camera_age_s) if math.isfinite(camera_age_s) else None
+                    ),
+                    "camera_stale": bool(camera_stale),
                     "cams": [r.slug for r in readers],
                     "source": "video" if args.video else "camera",
                     "model": MODEL_NAME,
                     "model_full": f"drive-by-segmentation-segformer-{args.model}",
                     "target_speed_mph": args.target_mph if inference_ok else 0.0,
+                    "speed_setpoint_mph": latest_speed_setpoint_mph if inference_ok else 0.0,
                     "ego_speed_mph": latest_ego_speed_mph,
                     "ego_speed_ok": latest_ego_speed_ok,
                     "steer_deg_base": latest_steer_base,
+                    "steer_source": latest_steer_source,
                     "steer_lookahead_m": latest_lookahead_m,
                     "target_gas": latest_target_gas if inference_ok else 0.0,
                     "target_gas_ff": target_gas_ff,
                     "target_gas_trim": latest_gas_trim,
-                    "speed_mode": "arkit_pi" if latest_ego_speed_ok else "feedforward_pot",
+                    "speed_mode": (
+                        "protective_stop" if latest_protective_stop.get("active")
+                        else "constant" if args.constant_speed
+                        else ("arkit_pi" if latest_ego_speed_ok else "feedforward_pot")
+                    ),
                     "target_brake": latest_target_brake if inference_ok else 0.0,
-                    "predicted_path": latest_path if inference_ok else [],
+                    "predicted_path": (
+                        []
+                        if latest_clrnet_override
+                        else (latest_path if inference_ok else [])
+                    ),
                     "segmentation": {
                         "bev_mode": args.bev_mode,
                         "latency_ms": latest_latency_ms,
                         "jpeg_ms": {k: round(float(v), 3) for k, v in jpeg_ms.items()},
                         "publish_jpeg_total_ms": round(float(publish_jpeg_total_ms), 3),
                         "infer_count": int(infer_count),
+                        "camera_fps": round(float(latest_camera_fps), 3),
+                        "camera_frame_count": int(latest_camera_frame_count),
+                        "camera_age_s": (
+                            round(float(camera_age_s), 3)
+                            if math.isfinite(camera_age_s) else None
+                        ),
+                        "camera_stale": bool(camera_stale),
+                        "inference_stale": bool(inference_stale),
+                        "clrnet_enabled": bool(clrnet_runner is not None),
+                        "clrnet_override": bool(latest_clrnet_override),
+                        "clrnet_conf_threshold": float(CLRNET_CONF_THRESHOLD),
+                        "clrnet_lanes": len(latest_clrnet_lanes),
+                        "clrnet_lanes_above_threshold": int(latest_clrnet_fresh_count),
+                        "clrnet_confidences": [
+                            round(float(s), 3) for s in latest_clrnet_confidences
+                        ],
+                        "clrnet_steer_deg": float(latest_clrnet_steer_filtered),
+                        "clrnet_steer_deg_raw": float(latest_clrnet_steer_raw),
+                        "protective_stop": latest_protective_stop,
+                        "gps_route": latest_gps_route,
+                        "map_file": str(args.segmentation_map_file),
+                        "map_schema": "caddy.segmentation_map.v1",
                     },
                     "ts": time.time(),
                 }
@@ -1191,6 +2227,25 @@ def main() -> None:
                 write_json_atomic(args.state_file, state)
                 latest_latency_ms["json_state_ms"] = round((time.perf_counter() - t) * 1000.0, 3)
                 next_publish_t = now + publish_period
+
+            if now - last_log_t >= 1.0:
+                last_log_t = now
+                confs = " ".join(f"{s:.2f}" for s in latest_clrnet_confidences[:6])
+                if not confs:
+                    confs = "none"
+                print(
+                    f"[run] frame={infer_count} steer_source={latest_steer_source} "
+                    f"clrnet_override={'Y' if latest_clrnet_override else 'N'} "
+                    f"lanes={len(latest_clrnet_lanes)} "
+                    f"above_{CLRNET_CONF_THRESHOLD:.2f}={latest_clrnet_fresh_count} "
+                    f"conf=[{confs}] "
+                    f"protective_stop={'Y' if latest_protective_stop.get('active') else 'N'} "
+                    f"objects={int(latest_protective_stop.get('objects', 0))} "
+                    f"gps_bias={float(latest_gps_route.get('bias_deg', 0.0)):+5.1f} "
+                    f"turn={latest_gps_route.get('turn_text') or '-'} "
+                    f"steer={latest_steer_raw:+6.1f}",
+                    flush=True,
+                )
 
             time.sleep(0.005)
     finally:

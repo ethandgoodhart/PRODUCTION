@@ -236,6 +236,9 @@
       front: 0xf5d06f,
       front_left: 0x5aa9ff,
       front_right: 0xff6f8f,
+      back: 0xb084ff,
+      back_left: 0x6fe0c2,
+      back_right: 0xffa45a,
     };
     for (const [name, m] of Object.entries(data.manual_measurements_body_frame)) {
       addCameraRig(name, m, colors[name] || 0xffffff);

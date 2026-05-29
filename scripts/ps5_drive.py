@@ -1699,6 +1699,8 @@ def main() -> int:
             #     gas_cap on top of its own AUTO_GAS_MAX self-cap).
             #   • L2 above PEDAL_TRIGGER_DEADZONE  → operator brake wins.
             #   • L2 at rest + autoware driving    → model brake.
+            #   • Protective stop active           → model safety brake wins
+            #     over operator gas and model gas.
             #   • State stale / model not driving  → coast (gas=0, no
             #     auto-brake — the cart rolls to a natural stop and the
             #     operator can intervene with L2 if needed).
@@ -1708,6 +1710,7 @@ def main() -> int:
 
             model_gas_target = 0.0
             model_brake_target = 0.0
+            protective_stop_active = False
             if args.autosteer and autoware_driving and auto_state is not None:
                 # Clip the model's request to gas_cap (so global limits
                 # apply) and to BRAKE_POT_MAX so it can never exceed
@@ -1721,16 +1724,28 @@ def main() -> int:
                         float(auto_state.get("target_brake", 0.0)),
                         0.0, BRAKE_POT_MAX,
                     )
+                    seg_state = auto_state.get("segmentation", {})
+                    if isinstance(seg_state, dict):
+                        protective = seg_state.get("protective_stop", {})
+                        protective_stop_active = (
+                            isinstance(protective, dict)
+                            and bool(protective.get("active", False))
+                        )
                 except (TypeError, ValueError):
                     model_gas_target = 0.0
                     model_brake_target = 0.0
+                    protective_stop_active = False
 
-            if r2 > PEDAL_TRIGGER_DEADZONE:
+            if protective_stop_active:
+                gas = 0.0
+            elif r2 > PEDAL_TRIGGER_DEADZONE:
                 gas = operator_gas
             else:
                 gas = model_gas_target
 
-            if l2 > PEDAL_TRIGGER_DEADZONE:
+            if protective_stop_active:
+                brake = BRAKE_POT_MAX
+            elif l2 > PEDAL_TRIGGER_DEADZONE:
                 brake = operator_brake
             else:
                 brake = model_brake_target

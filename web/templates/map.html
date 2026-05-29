@@ -9,6 +9,9 @@
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; }
     #map { position: absolute; inset: 0; }
+    /* Black & white basemap. Filtering only the tile pane leaves the ego
+       dot, destination marker, and route line in full color on top. */
+    .leaflet-tile-pane { filter: grayscale(1) contrast(1.05); }
     #hud {
       position: absolute; top: 10px; left: 10px; z-index: 1000;
       background: rgba(0,0,0,0.65); color: #fff;
@@ -19,60 +22,99 @@
                 border-radius: 50%; margin-right: 6px; vertical-align: middle; }
     #hud .ok { background: #4ade80; }
     #hud .bad { background: #ef4444; }
-    .ego-marker {
-      width: 18px; height: 18px; border-radius: 50%;
-      background: #2563eb; border: 3px solid #fff;
-      box-shadow: 0 0 0 2px rgba(37,99,235,0.4), 0 0 12px rgba(0,0,0,0.6);
-    }
-    .dest-marker {
-      width: 16px; height: 16px; border-radius: 50%;
-      background: #f59e0b; border: 3px solid #fff;
-      box-shadow: 0 0 0 2px rgba(245,158,11,0.4), 0 0 12px rgba(0,0,0,0.6);
-    }
+	    .ego-marker {
+	      width: 18px; height: 18px; border-radius: 50%;
+	      background: #2563eb; border: 3px solid #fff;
+	      box-shadow: 0 0 0 2px rgba(37,99,235,0.4), 0 0 12px rgba(0,0,0,0.6);
+	    }
+	    .start-marker {
+	      width: 16px; height: 16px; border-radius: 50%;
+	      background: #22c55e; border: 3px solid #fff;
+	      box-shadow: 0 0 0 2px rgba(34,197,94,0.4), 0 0 12px rgba(0,0,0,0.6);
+	    }
+		    .dest-marker {
+		      width: 16px; height: 16px; border-radius: 50%;
+		      background: #f59e0b; border: 3px solid #fff;
+		      box-shadow: 0 0 0 2px rgba(245,158,11,0.4), 0 0 12px rgba(0,0,0,0.6);
+		    }
+	    .waypoint-marker {
+	      width: 12px; height: 12px; border-radius: 50%;
+	      background: #a855f7; border: 2px solid #fff;
+	      box-shadow: 0 0 0 2px rgba(168,85,247,0.35), 0 0 10px rgba(0,0,0,0.55);
+	    }
     #route-hud {
       position: absolute; top: 10px; right: 10px; z-index: 1000;
-      background: rgba(0,0,0,0.65); color: #fff;
-      font: 13px/1.3 -apple-system, BlinkMacSystemFont, sans-serif;
-      padding: 8px 10px; border-radius: 6px; min-width: 180px;
-      display: none;
-    }
-    #route-hud button {
-      margin-top: 6px; background: #374151; color: #fff;
-      border: 0; padding: 4px 10px; border-radius: 4px; cursor: pointer;
-      font: inherit;
-    }
-    #route-hud button:hover { background: #4b5563; }
+	      background: rgba(0,0,0,0.65); color: #fff;
+	      font: 13px/1.3 -apple-system, BlinkMacSystemFont, sans-serif;
+	      padding: 8px 10px; border-radius: 6px; min-width: 180px;
+	    }
+	    #route-hud button {
+	      margin-top: 6px; background: #374151; color: #fff;
+	      border: 0; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+	      font: inherit;
+	    }
+	    #route-hud button:hover { background: #4b5563; }
+	    #route-hud button.active { background: #2563eb; }
+		    .route-mode {
+	      display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px;
+	    }
+		    .route-mode button { width: 100%; }
+	    .route-tools {
+	      display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px;
+	    }
+	    .route-tools button { width: 100%; }
     #hint {
       position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
       z-index: 1000; background: rgba(0,0,0,0.55); color: #fff;
       font: 12px/1.3 -apple-system, BlinkMacSystemFont, sans-serif;
       padding: 6px 10px; border-radius: 4px; pointer-events: none;
     }
+    #turn-banner {
+      position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+      z-index: 1200; display: none; align-items: center; gap: 12px;
+      background: rgba(20,20,20,0.85); color: #fff; padding: 12px 22px;
+      border-radius: 12px; pointer-events: none;
+      font: 600 22px/1 -apple-system, BlinkMacSystemFont, sans-serif;
+      box-shadow: 0 2px 14px rgba(0,0,0,0.45);
+    }
+    #turn-banner.now { background: rgba(220,38,38,0.93); }
+    #turn-banner .arrow { font-size: 30px; line-height: 1; }
   </style>
 </head>
 <body>
   <div id="map"></div>
+  <div id="turn-banner"><span class="arrow"></span><span class="txt"></span></div>
   <div id="hud">
     <div><span id="status-dot" class="dot bad"></span><span id="status-text">disconnected</span></div>
     <div id="coords">— , —</div>
     <div id="speed">— m/s</div>
     <div id="heading">course —</div>
     <div id="accuracy">±— m</div>
-  </div>
-  <div id="route-hud">
-    <div id="route-info">routing…</div>
-    <button id="route-clear">Clear route</button>
-  </div>
-  <div id="hint">Click anywhere to route from current position</div>
+	  </div>
+	  <div id="route-hud">
+	    <div id="route-info">draw route</div>
+	    <div id="route-state">not sent to cart</div>
+	    <div class="route-tools">
+	      <button id="route-draw-mode" class="active" type="button">Draw Route</button>
+	      <button id="route-save" type="button">Save Route</button>
+	    </div>
+	    <button id="route-clear">Clear route</button>
+	  </div>
+	  <div id="hint">Click start, then click 5 endpoints</div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script>
     const STANFORD = [37.4275, -122.1697];
     const map = L.map('map', { zoomControl: true }).setView(STANFORD, 17);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '&copy; OpenStreetMap'
+    // Mapbox raster tiles, proxied through Flask (/mbtile) because the kiosk
+    // browser can't reach api.mapbox.com directly. 512px @2x tiles →
+    // tileSize 512 + zoomOffset -1 so Leaflet's zoom lines up with Mapbox.
+    L.tileLayer('/mbtile/{z}/{x}/{y}', {
+      maxZoom: 20,
+      tileSize: 512,
+      zoomOffset: -1,
+      attribution: '&copy; Mapbox &copy; OpenStreetMap',
     }).addTo(map);
 
     const icon = L.divIcon({ className: 'ego-marker', iconSize: [18, 18] });
@@ -84,17 +126,35 @@
     const speedEl = document.getElementById('speed');
     const headingEl = document.getElementById('heading');
     const accEl = document.getElementById('accuracy');
+    const turnBanner = document.getElementById('turn-banner');
+    const turnArrow = turnBanner.querySelector('.arrow');
+    const turnTxt = turnBanner.querySelector('.txt');
+
+    function updateTurnBanner(d) {
+      if (d && d.turn_text) {
+        turnArrow.textContent =
+          d.turn_dir === 'right' ? '➡' : (d.turn_dir === 'left' ? '⬅' : '');
+        turnTxt.textContent = d.turn_text;
+        turnBanner.classList.toggle('now', /NOW/.test(d.turn_text));
+        turnBanner.style.display = 'flex';
+      } else {
+        turnBanner.style.display = 'none';
+      }
+    }
 
     let firstFix = true;
+    let gpsReady = false;
 
     async function tick() {
       try {
         const r = await fetch('/gps', { cache: 'no-store' });
         const d = await r.json();
         const ok = d.has_fix && !d.stale;
+        gpsReady = ok;
         statusDot.className = 'dot ' + (ok ? 'ok' : 'bad');
         statusText.textContent = ok ? 'connected'
           : (d.tcp_connected ? 'no fix' : 'disconnected');
+        updateTurnBanner(d);
         if (d.has_fix && d.lat != null && d.lon != null) {
           const ll = [d.lat, d.lon];
           marker.setLatLng(ll);
@@ -110,127 +170,232 @@
             ? '±' + d.h_acc_m.toFixed(1) + ' m' : '±— m';
         }
       } catch (e) {
+        gpsReady = false;
         statusDot.className = 'dot bad';
         statusText.textContent = 'server error';
+        updateTurnBanner(null);
       }
     }
     tick();
     setInterval(tick, 200);
 
-    // --- Click-to-route -------------------------------------------------
-    // Uses the public OSRM demo router. Foot profile is closest to a
-    // golf-cart's reach (cuts through paths, no highway snapping).
+    // --- Draw-to-route --------------------------------------------------
+    const startIcon = L.divIcon({ className: 'start-marker', iconSize: [16, 16] });
     const destIcon = L.divIcon({ className: 'dest-marker', iconSize: [16, 16] });
+    let startMarker = null;
     let destMarker = null;
     let routeLine = null;
+    let routeStart = null;
     let lastDest = null;
-    // Seed with the Stanford default so the map + routing work before
-    // the first GPS fix lands. The /gps tick overwrites this with the
-    // real position as soon as one arrives.
-    let lastPos = STANFORD.slice();
+    let routeCoords = [];
+    let previewCoords = [];
+    let drawMode = true;
     let havePosFix = false;
-    let routeReqId = 0;
-    let inflightCtrl = null;
+    let lastRouteDistanceM = 0.0;
+    const MAX_SEGMENTS = 5;
 
     const routeHud = document.getElementById('route-hud');
     const routeInfo = document.getElementById('route-info');
+    const routeState = document.getElementById('route-state');
     const hintEl = document.getElementById('hint');
+    const drawModeBtn = document.getElementById('route-draw-mode');
+    const saveBtn = document.getElementById('route-save');
 
     function fmtDist(m) {
       return m >= 1000 ? (m / 1000).toFixed(2) + ' km' : m.toFixed(0) + ' m';
     }
-    function fmtDur(s) {
-      const m = Math.round(s / 60);
-      if (m < 1) return Math.round(s) + ' s';
-      if (m < 60) return m + ' min';
-      return Math.floor(m / 60) + ' h ' + (m % 60) + ' min';
+
+    function routeDistance(coords) {
+      let total = 0.0;
+      for (let i = 1; i < coords.length; i++) {
+        total += L.latLng(coords[i - 1]).distanceTo(L.latLng(coords[i]));
+      }
+      return total;
     }
 
-    async function recomputeRoute() {
-      if (!lastDest || !lastPos) return;
-      // Cancel any in-flight request immediately — we want the freshest
-      // origin in flight, not a queue of stale ones.
-      if (inflightCtrl) inflightCtrl.abort();
-      const ctrl = new AbortController();
-      inflightCtrl = ctrl;
-      const id = ++routeReqId;
-      const url = `/route?from_lat=${lastPos[0]}&from_lon=${lastPos[1]}`
-        + `&to_lat=${lastDest[0]}&to_lon=${lastDest[1]}&profile=foot`;
-      routeHud.style.display = 'block';
-      const prevText = routeInfo.textContent;
-      routeInfo.textContent = routeLine ? (prevText + ' · updating…') : 'routing…';
-      try {
-        const r = await fetch(url, { signal: ctrl.signal });
-        const d = await r.json();
-        if (id !== routeReqId) return;  // a newer recompute superseded us
-        const route = d.routes && d.routes[0];
-        if (!route) { routeInfo.textContent = 'no route found'; return; }
-        const coords = route.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
+    function setDrawMode(enabled) {
+      drawMode = enabled;
+      drawModeBtn.classList.toggle('active', enabled);
+      map.getContainer().style.cursor = enabled ? 'crosshair' : '';
+      if (enabled) {
+        map.dragging.disable();
+        hintEl.style.display = 'block';
+        hintEl.textContent = 'Click start, then click 5 endpoints';
+      } else {
+        map.dragging.enable();
+        if (!routeLine) hintEl.textContent = 'Enable draw, then click a route';
+      }
+    }
+
+    function setEndpointMarkers(coords) {
+      if (!coords || coords.length < 1) return;
+      routeStart = coords[0];
+      lastDest = coords[coords.length - 1];
+      if (startMarker) startMarker.setLatLng(routeStart);
+      else startMarker = L.marker(routeStart, { icon: startIcon }).addTo(map);
+      if (coords.length >= 2) {
+        if (destMarker) destMarker.setLatLng(lastDest);
+        else destMarker = L.marker(lastDest, { icon: destIcon }).addTo(map);
+      } else if (destMarker) {
+        destMarker.remove();
+        destMarker = null;
+      }
+    }
+
+    function renderRoute(coords, commit) {
+      if (commit) {
+        routeCoords = coords.slice();
+        previewCoords = [];
+      } else {
+        previewCoords = coords.slice();
+      }
+      if (coords.length >= 2) {
         if (routeLine) routeLine.setLatLngs(coords);
         else routeLine = L.polyline(coords, {
           color: '#2563eb', weight: 5, opacity: 0.85,
         }).addTo(map);
-        routeInfo.textContent =
-          fmtDist(route.distance) + ' · ' + fmtDur(route.duration);
+      } else if (routeLine) {
+        routeLine.remove();
+        routeLine = null;
+      }
+      lastRouteDistanceM = routeDistance(coords);
+      const segments = Math.max(0, routeCoords.length - 1);
+      routeInfo.textContent = segments + '/' + MAX_SEGMENTS + ' segments'
+        + (coords.length >= 2 ? ' · ' + fmtDist(lastRouteDistanceM) : '');
+      setEndpointMarkers(coords);
+    }
+
+    function resetLocalRoute() {
+      routeCoords = [];
+      previewCoords = [];
+      routeStart = null;
+      lastDest = null;
+      lastRouteDistanceM = 0.0;
+      if (routeLine) { routeLine.remove(); routeLine = null; }
+      if (startMarker) { startMarker.remove(); startMarker = null; }
+      if (destMarker) { destMarker.remove(); destMarker = null; }
+    }
+
+    function latLngArray(latlng) {
+      return [latlng.lat, latlng.lng];
+    }
+
+    function stopDrawEvent(e) {
+      if (e.originalEvent) L.DomEvent.stop(e.originalEvent);
+    }
+
+    function freeEndpoint(latlng) {
+      return [latlng.lat, latlng.lng];
+    }
+
+    function updateRoutePreview(latlng) {
+      if (!drawMode || routeCoords.length < 1 || routeCoords.length > MAX_SEGMENTS) return;
+      const endpoint = freeEndpoint(latlng);
+      renderRoute(routeCoords.concat([endpoint]), false);
+    }
+
+    async function saveRoute(coords) {
+      if (!coords || coords.length < 2) {
+        routeInfo.textContent = 'draw at least two points';
+        return;
+      }
+      setEndpointMarkers(coords);
+      routeState.textContent = 'sending route…';
+      try {
+        const r = await fetch('/nav_route', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            geometry: coords,
+            start: routeStart,
+            waypoints: [],
+            destination: lastDest,
+            distance_m: routeDistance(coords),
+            duration_s: 0.0,
+          }),
+        });
+        const d = await r.json();
+        routeState.textContent = d.ok
+          ? (gpsReady ? 'active on cart' : 'route saved; waiting for GPS')
+          : ('route rejected: ' + (d.error || 'unknown'));
       } catch (e) {
-        if (e.name === 'AbortError') return;
-        if (id !== routeReqId) return;
-        routeInfo.textContent = 'router error: ' + (e.message || e);
-        console.error('route failed', e);
-      } finally {
-        if (inflightCtrl === ctrl) inflightCtrl = null;
+        routeState.textContent = 'route send failed';
       }
     }
 
-    function clearRoute() {
-      lastDest = null;
-      routeReqId++;
-      if (routeLine) { routeLine.remove(); routeLine = null; }
-      if (destMarker) { destMarker.remove(); destMarker = null; }
-      routeHud.style.display = 'none';
+    async function clearRoute() {
+      resetLocalRoute();
+      routeInfo.textContent = 'draw route';
+      routeState.textContent = 'not sent to cart';
+      hintEl.style.display = 'block';
+      hintEl.textContent = drawMode
+        ? 'Click start, then click 5 endpoints'
+        : 'Enable draw, then click a route';
+      try { await fetch('/nav_route', { method: 'DELETE' }); } catch (e) {}
     }
 
-    map.on('click', (e) => {
-      lastDest = [e.latlng.lat, e.latlng.lng];
-      if (destMarker) destMarker.setLatLng(lastDest);
-      else destMarker = L.marker(lastDest, { icon: destIcon }).addTo(map);
-      hintEl.style.display = 'none';
-      recomputeRoute();
-    });
+    async function placeEndpoint(e) {
+      if (!drawMode) return;
+      if (!e.latlng) return;
+      stopDrawEvent(e);
+      const segments = Math.max(0, routeCoords.length - 1);
+      if (routeCoords.length === 0 || segments >= MAX_SEGMENTS) {
+        resetLocalRoute();
+        routeCoords = [latLngArray(e.latlng)];
+        renderRoute(routeCoords, true);
+        routeState.textContent = 'placing endpoints…';
+        hintEl.textContent = 'Stretch segment 1, then click endpoint';
+        return;
+      }
+      const last = routeCoords[routeCoords.length - 1];
+      const endpoint = freeEndpoint(e.latlng);
+      if (L.latLng(last).distanceTo(L.latLng(endpoint)) < 0.5) return;
+      renderRoute(routeCoords.concat([endpoint]), true);
+      const nextSegments = routeCoords.length - 1;
+      if (nextSegments >= MAX_SEGMENTS) {
+        routeState.textContent = '5 segments placed; saving…';
+        hintEl.textContent = 'Saved 5-segment route; click again to start over';
+        await saveRoute(routeCoords);
+      } else {
+        routeState.textContent = 'placing endpoints…';
+        hintEl.textContent = 'Stretch segment ' + (nextSegments + 1) + ', then click endpoint';
+      }
+    }
+
+    function continueDraw(e) {
+      if (!drawMode || !e.latlng) return;
+      if (routeCoords.length < 1 || routeCoords.length > MAX_SEGMENTS) return;
+      stopDrawEvent(e);
+      updateRoutePreview(e.latlng);
+    }
+
+    map.on('click', placeEndpoint);
+    map.on('mousemove', continueDraw);
 
     document.getElementById('route-clear').addEventListener('click', clearRoute);
+    drawModeBtn.addEventListener('click', () => setDrawMode(!drawMode));
+    saveBtn.addEventListener('click', () => saveRoute(routeCoords));
 
-    // Recompute the route whenever the cart has moved more than ~10 m, so
-    // the blue line stays anchored to the current position as we drive.
-    function distM(a, b) {
-      const R = 6371000;
-      const dLat = (b[0] - a[0]) * Math.PI / 180;
-      const dLon = (b[1] - a[1]) * Math.PI / 180;
-      const la1 = a[0] * Math.PI / 180, la2 = b[0] * Math.PI / 180;
-      const x = Math.sin(dLat/2)**2 + Math.cos(la1)*Math.cos(la2)*Math.sin(dLon/2)**2;
-      return 2 * R * Math.asin(Math.sqrt(x));
+    async function loadSavedRoute() {
+      try {
+        const r = await fetch('/nav_route', { cache: 'no-store' });
+        const d = await r.json();
+        if (!d.active || !Array.isArray(d.geometry) || d.geometry.length < 2) return;
+        renderRoute(d.geometry);
+        routeState.textContent = gpsReady ? 'active on cart' : 'route saved; waiting for GPS';
+        hintEl.style.display = 'none';
+      } catch (e) {}
     }
-    let lastReroutePos = null;
-    setInterval(() => {
-      if (!lastDest || !lastPos) return;
-      if (!lastReroutePos || distM(lastReroutePos, lastPos) > 3) {
-        lastReroutePos = lastPos;
-        recomputeRoute();
-      }
-    }, 1000);
+    loadSavedRoute();
 
-    // Mirror /gps tick output (window.__lastPos) into our routing state.
-    // First real fix triggers an immediate reroute so the seeded
-    // Stanford-default route snaps to the actual position.
-    setInterval(() => {
-      const ll = window.__lastPos;
-      if (!ll) return;
-      lastPos = ll;
-      if (!havePosFix) {
-        havePosFix = true;
-        if (lastDest) recomputeRoute();
-      }
-    }, 250);
+	    setInterval(() => {
+	      const ll = window.__lastPos;
+	      if (!ll) return;
+	      if (!havePosFix) {
+	        havePosFix = true;
+	      }
+	    }, 250);
+	    setDrawMode(drawMode);
   </script>
 </body>
 </html>

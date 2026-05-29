@@ -162,12 +162,25 @@
         <span id="aw-status-text">IDLE</span>
         <span class="aw-angle" id="aw-angle">—</span>
         <span id="aw-fps">—</span>
+        <span class="lane-confidence" id="lane-confidence" hidden>
+            <span class="lc-label">LANE CONF</span>
+            <span class="lc-value" id="lc-value">—</span>
+            <span class="lc-bar"><span class="lc-fill" id="lc-fill"></span></span>
+            <span class="lc-detail" id="lc-detail">min 0.40</span>
+        </span>
+        <span class="protective-stop" id="protective-stop" hidden>STOP</span>
+    </div>
+
+    <!-- GPS route turn announcement (driven by autoware.segmentation.gps_route) -->
+    <div class="turn-banner" id="turn-banner">
+        <span class="turn-arrow" id="turn-arrow"></span>
+        <span class="turn-text" id="turn-text"></span>
     </div>
 
 
-    <!-- 4x2 stream grid.
-         Row 1: raw cameras (slugs match scripts/autoware_infer.py::SLUGS).
-         Row 2: Autoware model outputs — lanes / depth / objects / seg —
+    <!-- Stream grid.
+         Raw cameras use live_1..live_6, served directly from V4L2 by app.py.
+         Model outputs — lanes / depth / objects / seg —
                 shown only while Autoware viz is publishing.
          Each <img> is fed by snapshot polling (see refreshTiles below):
          short-lived /cam/<slug>.jpg requests with a cache-busting param.
@@ -176,27 +189,42 @@
          polling would push some tiles into a queued state that freezes
          them once the persistent socket eventually drops. -->
     <div class="cam-grid" id="cam-grid">
-        <!-- Row 1: cameras. The badge text is overwritten in JS from
+        <!-- Raw cameras. The badge text is overwritten in JS from
              aw.model so the same HTML works for both autoware (AUTOWARE)
              and alpamayo (ALPAMAYO) backends. -->
-        <div class="cam-tile" data-cam="front_wide">
+        <div class="cam-tile" data-cam="live_1">
             <img alt="" />
-            <div class="cam-label">Front Wide</div>
+            <div class="cam-label">Camera 1</div>
             <div class="cam-badge">—</div>
         </div>
-        <div class="cam-tile" data-cam="front_narrow">
+        <div class="cam-tile" data-cam="live_2">
             <img alt="" />
-            <div class="cam-label">Front Narrow</div>
+            <div class="cam-label">Camera 2</div>
             <div class="cam-badge">—</div>
         </div>
-        <div class="cam-tile" data-cam="left">
+        <div class="cam-tile" data-cam="live_3">
             <img alt="" />
-            <div class="cam-label">Left</div>
+            <div class="cam-label">Camera 3</div>
             <div class="cam-badge">—</div>
         </div>
-        <div class="cam-tile" data-cam="right">
+        <div class="cam-tile" data-cam="live_4">
             <img alt="" />
-            <div class="cam-label">Right</div>
+            <div class="cam-label">Camera 4</div>
+            <div class="cam-badge">—</div>
+        </div>
+        <div class="cam-tile" data-cam="live_5">
+            <img alt="" />
+            <div class="cam-label">Camera 5</div>
+            <div class="cam-badge">—</div>
+        </div>
+        <div class="cam-tile" data-cam="live_6">
+            <img alt="" />
+            <div class="cam-label">Camera 6</div>
+            <div class="cam-badge">—</div>
+        </div>
+        <div class="cam-tile model-raw-tile" data-cam="front" style="display:none">
+            <img alt="" />
+            <div class="cam-label">Front Center</div>
             <div class="cam-badge">—</div>
         </div>
 
@@ -314,7 +342,15 @@
         const awHud = document.getElementById('autoware-hud');
         const awStatus = document.getElementById('aw-status-text');
         const awAngle = document.getElementById('aw-angle');
+        const turnBanner = document.getElementById('turn-banner');
+        const turnArrow = document.getElementById('turn-arrow');
+        const turnText = document.getElementById('turn-text');
         const awFps = document.getElementById('aw-fps');
+        const laneConfidence = document.getElementById('lane-confidence');
+        const lcValue = document.getElementById('lc-value');
+        const lcFill = document.getElementById('lc-fill');
+        const lcDetail = document.getElementById('lc-detail');
+        const protectiveStop = document.getElementById('protective-stop');
         // Top-of-screen alpamayo stats strip (latency + bandwidth).
         const alpStats = document.getElementById('alpamayo-stats');
         const statGpu = document.getElementById('stat-gpu');
@@ -347,13 +383,94 @@
         // sockets, so Firefox's per-host connection cap (6) doesn't choke
         // us with 8 simultaneous streams. The cache-buster on `t` keeps the
         // browser from serving a stale image from disk cache.
-        // Refresh rate matches autoware_infer's JPEG publish cadence (~15
-        // Hz) so we don't poll faster than new frames are produced.
-        const FRAME_REFRESH_MS = 80;
+        // Refresh rate matches the model sidecar's JPEG publish cadence
+        // (~15 Hz) so the browser shows every useful frame without polling
+        // far faster than new images are produced.
+        const FRAME_REFRESH_MS = Math.round(1000 / 15);
+        const renderedFrameLoaded = {};
+        const renderedFrameChanged = {};
+        const renderedFrameLastSrc = {};
+        const renderedFrameLastHash = {};
+        const frameHashCanvas = document.createElement('canvas');
+        const frameHashCtx = frameHashCanvas.getContext('2d', { willReadFrequently: true });
+        frameHashCanvas.width = 32;
+        frameHashCanvas.height = 18;
+        function renderedImageHash(img) {
+            if (!frameHashCtx || !img.naturalWidth || !img.naturalHeight) return null;
+            frameHashCtx.drawImage(img, 0, 0, frameHashCanvas.width, frameHashCanvas.height);
+            const data = frameHashCtx.getImageData(0, 0, frameHashCanvas.width, frameHashCanvas.height).data;
+            let h = 2166136261;
+            for (let i = 0; i < data.length; i += 4) {
+                h ^= data[i];
+                h = Math.imul(h, 16777619);
+                h ^= data[i + 1];
+                h = Math.imul(h, 16777619);
+                h ^= data[i + 2];
+                h = Math.imul(h, 16777619);
+            }
+            return h >>> 0;
+        }
+        for (const [slug, el] of Object.entries(camTiles)) {
+            const img = el.querySelector('img');
+            if (!img) continue;
+            renderedFrameLoaded[slug] = 0;
+            renderedFrameChanged[slug] = 0;
+            img.addEventListener('load', () => {
+                const src = img.currentSrc || img.src || '';
+                if (src && renderedFrameLastSrc[slug] !== src) {
+                    renderedFrameLastSrc[slug] = src;
+                    renderedFrameLoaded[slug] = (renderedFrameLoaded[slug] || 0) + 1;
+                }
+                try {
+                    const hash = renderedImageHash(img);
+                    if (hash != null && renderedFrameLastHash[slug] !== hash) {
+                        renderedFrameLastHash[slug] = hash;
+                        renderedFrameChanged[slug] = (renderedFrameChanged[slug] || 0) + 1;
+                    }
+                } catch (err) {
+                    console.warn('[frames] hash failed', slug, err);
+                }
+            });
+        }
+        setInterval(() => {
+            const visibleSlugs = Object.keys(camTiles)
+                .filter(slug => {
+                    const el = camTiles[slug];
+                    return el && el.style.display !== 'none';
+                });
+            const loaded = {};
+            const changed = {};
+            for (const slug of visibleSlugs) {
+                loaded[slug] = renderedFrameLoaded[slug] || 0;
+                changed[slug] = renderedFrameChanged[slug] || 0;
+            }
+            const loadedTotal = Object.values(loaded).reduce((sum, count) => sum + count, 0);
+            const changedTotal = Object.values(changed).reduce((sum, count) => sum + count, 0);
+            console.log(
+                `[frames] rendered_last_1s loaded_total=${loadedTotal} ` +
+                `changed_total=${changedTotal} loaded=${JSON.stringify(loaded)} ` +
+                `changed=${JSON.stringify(changed)}`
+            );
+            fetch('/browser-log', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    event: 'frames_last_1s',
+                    visible: visibleSlugs,
+                    loaded,
+                    changed,
+                }),
+            }).catch(() => {});
+            for (const slug in renderedFrameLoaded) renderedFrameLoaded[slug] = 0;
+            for (const slug in renderedFrameChanged) renderedFrameChanged[slug] = 0;
+        }, 1000);
         function refreshTiles() {
             const t = Date.now();
             for (const slug in camTiles) {
                 const el = camTiles[slug];
+                if (el.style.display === 'none') {
+                    continue;
+                }
                 // Skip viz tiles that haven't been declared ready —
                 // requesting a non-existent /cam/lanes.jpg returns 404 and
                 // would just fill the console with noise.
@@ -400,9 +517,17 @@
             // Update the cam-badge text on each camera tile to match the
             // running model. Hidden ('—') when nothing is running.
             const badgeText = running ? modelUpper : '—';
-            for (const slug of ['front_wide', 'front_narrow', 'left', 'right']) {
+            for (const slug of ['live_1', 'live_2', 'live_3', 'live_4', 'live_5', 'live_6', 'front']) {
                 const b = camBadgeEls[slug];
                 if (b) b.textContent = badgeText;
+            }
+            const segmentationMode = model === 'segmentation';
+            for (const slug of ['live_1', 'live_2', 'live_3', 'live_4', 'live_5', 'live_6']) {
+                const el = camTiles[slug];
+                if (el) el.style.display = segmentationMode ? 'none' : '';
+            }
+            if (camTiles.front) {
+                camTiles.front.style.display = segmentationMode ? '' : 'none';
             }
 
             // Camera tile sizing follows drive mode: full-size only while
@@ -417,6 +542,40 @@
                 awAngle.textContent = '—';
             }
             awFps.textContent = aw.fps ? `${aw.fps.toFixed(0)} FPS` : '';
+
+            // CLRNet confidence meter. segmentation_infer.py publishes
+            // confidences sorted descending; show the strongest current lane
+            // score against the override threshold.
+            const seg = aw.segmentation || {};
+            const confs = Array.isArray(seg.clrnet_confidences)
+                ? seg.clrnet_confidences.map(Number).filter(Number.isFinite)
+                : [];
+            const confThreshold = Number.isFinite(Number(seg.clrnet_conf_threshold))
+                ? Number(seg.clrnet_conf_threshold) : 0.40;
+            const bestConf = confs.length ? Math.max(...confs) : null;
+            const lanesAbove = Number(seg.clrnet_lanes_above_threshold) || 0;
+            const showLaneConfidence = running
+                && model === 'segmentation'
+                && !!seg.clrnet_enabled;
+            laneConfidence.hidden = !showLaneConfidence;
+            if (showLaneConfidence) {
+                const ok = bestConf != null && bestConf >= confThreshold && lanesAbove > 0;
+                laneConfidence.classList.toggle('ok', ok);
+                laneConfidence.classList.toggle('low', !ok);
+                lcValue.textContent = bestConf == null ? '—' : bestConf.toFixed(2);
+                lcFill.style.width = `${Math.max(0, Math.min(1, bestConf || 0)) * 100}%`;
+                lcDetail.textContent = `min ${confThreshold.toFixed(2)} · ${lanesAbove} lanes`;
+            }
+            const protective = seg.protective_stop || {};
+            const protectiveActive = running && !!protective.active;
+            protectiveStop.hidden = !protectiveActive;
+            if (protectiveActive) {
+                const threat = protective.threat || {};
+                const label = threat.label ? String(threat.label).toUpperCase() : 'OBJECT';
+                const dist = Number.isFinite(Number(threat.x_m))
+                    ? `${Number(threat.x_m).toFixed(1)}m` : '';
+                protectiveStop.textContent = `STOP ${label} ${dist}`.trim();
+            }
 
             // Highlight the active camera tile.
             const active = running && aw.inference ? aw.active_cam : null;
@@ -531,6 +690,20 @@
                     window.__steerDeg = Number(aw0.steer_deg_raw) || 0;
                 } else {
                     window.__steerDeg = steerDeg;
+                }
+
+                // GPS route turn banner: show the next-turn announcement the
+                // segmentation brain publishes against the active route.
+                const gpsRoute = (aw0.segmentation && aw0.segmentation.gps_route) || {};
+                const turnMsg = aw0.running ? (gpsRoute.turn_text || '') : '';
+                if (turnMsg) {
+                    turnArrow.textContent = gpsRoute.turn_dir === 'right' ? '➡'
+                        : (gpsRoute.turn_dir === 'left' ? '⬅' : '');
+                    turnText.textContent = turnMsg;
+                    turnBanner.classList.toggle('now', /NOW/.test(turnMsg));
+                    turnBanner.style.display = 'flex';
+                } else {
+                    turnBanner.style.display = 'none';
                 }
                 if (aw0.running && aw0.inference
                         && (aw0.model || '').toLowerCase() === 'segmentation') {

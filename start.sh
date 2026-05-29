@@ -6,6 +6,7 @@ PROFILE="$(mktemp -d)"
 STATE_FILE="/tmp/cart_state.json"
 AUTOWARE_STATE_FILE="/tmp/autoware_state.json"
 EGO_STATE_FILE="/tmp/ego_state.json"
+GPS_STATE_FILE="/tmp/gps_state.json"
 FRAMES_DIR="/tmp/cart_frames"
 
 # --mockspeed=N (or --mockspeed N) short-circuits the real PS5/Arduino/ODrive
@@ -38,6 +39,9 @@ NARROW_SOURCE_FOV_DEG=""
 MODEL="autoware"
 ALPAMAYO_APP_NAME="${ALPAMAYO_APP_NAME:-alpamayo-live-demo}"
 SEGMENTATION_MPH="8"
+SEGMENTATION_CAMERA_SLOT="${SEGMENTATION_CAMERA_SLOT:-CAM_FRONT}"
+SEGMENTATION_CAMERA_INDEX="${SEGMENTATION_CAMERA_INDEX:-}"
+SEGMENTATION_WITH_CLRNET=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mockspeed=*)             MOCK_SPEED="${1#*=}"; shift ;;
@@ -57,6 +61,11 @@ while [[ $# -gt 0 ]]; do
         --app-name)                ALPAMAYO_APP_NAME="$2"; shift 2 ;;
         --mph=*)                   SEGMENTATION_MPH="${1#*=}"; shift ;;
         --mph)                     SEGMENTATION_MPH="$2"; shift 2 ;;
+        --with-clrnet)             SEGMENTATION_WITH_CLRNET=1; shift ;;
+        --seg-camera-slot=*)       SEGMENTATION_CAMERA_SLOT="${1#*=}"; shift ;;
+        --seg-camera-slot)         SEGMENTATION_CAMERA_SLOT="$2"; shift 2 ;;
+        --seg-camera-index=*)      SEGMENTATION_CAMERA_INDEX="${1#*=}"; shift ;;
+        --seg-camera-index)        SEGMENTATION_CAMERA_INDEX="$2"; shift 2 ;;
         *) echo "start.sh: unknown arg $1" >&2; exit 2 ;;
     esac
 done
@@ -90,8 +99,10 @@ cleanup() {
     kill "$AUTOWARE_PID" 2>/dev/null || true
     kill "$EGO_PID" 2>/dev/null || true
     kill "$EGO_LINK_PID" 2>/dev/null || true
+    kill "$GPS_LINK_PID" 2>/dev/null || true
     pkill -P "$DRIVE_LOOP" 2>/dev/null || true
     pkill -P "$EGO_LINK_PID" 2>/dev/null || true
+    pkill -P "$GPS_LINK_PID" 2>/dev/null || true
     pkill -f "scripts/ps5_drive.py" 2>/dev/null || true
     pkill -f "scripts/mock_state.py" 2>/dev/null || true
     pkill -f "scripts/autoware_infer.py" 2>/dev/null || true
@@ -102,10 +113,12 @@ cleanup() {
     pkill -f "ego_sensor/ego_link.sh" 2>/dev/null || true
     # Any iproxy spawned by ego_link.sh.
     pkill -f "iproxy 5005 5005" 2>/dev/null || true
+    pkill -f "iproxy 5006 5006" 2>/dev/null || true
     rm -rf "$PROFILE"
     rm -f "$STATE_FILE" "$STATE_FILE.tmp"
     rm -f "$AUTOWARE_STATE_FILE" "$AUTOWARE_STATE_FILE.tmp"
     rm -f "$EGO_STATE_FILE" "$EGO_STATE_FILE.tmp"
+    rm -f "$GPS_STATE_FILE" "$GPS_STATE_FILE.tmp"
     rm -f /tmp/teleop_cmd.json /tmp/teleop_cmd.json.tmp
     rm -rf "$FRAMES_DIR"
 }
@@ -114,6 +127,7 @@ trap cleanup EXIT
 export CART_STATE_FILE="$STATE_FILE"
 export AUTOWARE_STATE_FILE
 export EGO_STATE_FILE
+export GPS_STATE_FILE
 export CART_FRAMES_DIR="$FRAMES_DIR"
 mkdir -p "$FRAMES_DIR"
 
@@ -133,6 +147,14 @@ echo "[start] ego_link pid=$EGO_LINK_PID (USB iproxy supervisor)" \
 EGO_PID=$!
 echo "[start] ego_state_writer pid=$EGO_PID -> $EGO_STATE_FILE" \
     >>/tmp/ego_state_writer.log
+
+# iPhone CoreLocation GPS publisher. The iOS app exposes this as a separate
+# JSONL stream on port 5006; web/app.py connects to it and mirrors the latest
+# fix into $GPS_STATE_FILE for segmentation route bias.
+~/ego_sensor/ego_link.sh 5006 >>/tmp/gps_link.log 2>&1 &
+GPS_LINK_PID=$!
+echo "[start] gps_link pid=$GPS_LINK_PID (USB iproxy supervisor)" \
+    >>/tmp/gps_link.log
 
 # Inference sidecar — picked by --model. Both write to
 # $AUTOWARE_STATE_FILE so ps5_drive.py --autosteer reads from one place
@@ -185,12 +207,29 @@ elif [[ "$MODEL" == "clrnet" ]]; then
 elif [[ "$MODEL" == "segmentation" ]]; then
     # drive-by-segmentation: ON-DEVICE SegFormer semantic segmentation,
     # BEV path planner, and steering estimator from
-    # /home/caddy/drive-by-segmentation/live.py. Uses front_wide and
-    # publishes seg + bev viz tiles. Pedals hold a constant target
-    # speed; default is 8 mph unless --mph overrides it.
+    # /home/caddy/drive-by-segmentation/live.py. Uses the center-front
+    # E2E-calibrated PVC camera only and publishes seg + bev viz tiles.
+    # Pedals target the requested speed; when iPhone ARKit ego-speed is fresh,
+    # segmentation_infer closes the loop on actual MPH. If the phone stream is
+    # unavailable, it falls back to the calibrated feed-forward pedal pot.
     INFER_ARGS=(--frames-dir "$FRAMES_DIR" --state-file "$AUTOWARE_STATE_FILE"
                 --target-mph "$SEGMENTATION_MPH"
-                --source realsense --no-depth)
+                --source uvc
+                --calib calibration/cameras/sparsedrive_REAL_pvc_calibration.json
+                --camera-slot "$SEGMENTATION_CAMERA_SLOT"
+                --gps-route-gain 0.6
+                --gps-route-max-bias-deg 150
+                --gps-route-lookahead-m 5)
+    if [[ -z "$SEGMENTATION_WITH_CLRNET" ]]; then
+        INFER_ARGS+=(--no-clrnet)
+    fi
+    if [[ -n "$SEGMENTATION_CAMERA_INDEX" ]]; then
+        INFER_ARGS+=(--camera-index "$SEGMENTATION_CAMERA_INDEX")
+    fi
+    # In segmentation mode the model sidecar owns the center-front camera and
+    # publishes /tmp/cart_frames/front.jpg. Do not let Flask's raw live-camera
+    # probe race it for /dev/video4.
+    export LIVE_CAMERA_COUNT=0
     if [[ -n "$VIDEO" ]]; then
         INFER_ARGS+=(--video "$VIDEO")
         [[ -n "$NO_LOOP" ]] && INFER_ARGS+=(--no-loop)
@@ -200,7 +239,7 @@ elif [[ "$MODEL" == "segmentation" ]]; then
     /usr/bin/python3 scripts/segmentation_infer.py "${INFER_ARGS[@]}" \
         >>/tmp/autoware_infer.log 2>&1 &
     AUTOWARE_PID=$!
-    echo "[start] model=segmentation (drive-by-segmentation, target ${SEGMENTATION_MPH} mph)" \
+    echo "[start] model=segmentation (drive-by-segmentation, target ${SEGMENTATION_MPH} mph, iPhone closed-loop when available)" \
         >>/tmp/autoware_infer.log
 else
     # Alpamayo: remote Modal-hosted Alpamayo-R1 reached over a Modal
@@ -243,9 +282,15 @@ else
         "(modal tunnel transport)" >>/tmp/autoware_infer.log
 fi
 
-# Web UI (Flask) — reads $CART_STATE_FILE for the MPH readout.
+# Web UI (Flask) — reads $CART_STATE_FILE for controls/status, but the
+# dashboard MPH readout is overridden with fresh iPhone ARKit ego-motion
+# speed from $EGO_STATE_FILE, falling back to iPhone CoreLocation GPS speed
+# from port 5006 when ARKit speed is unavailable. The old gas/brake-derived
+# estimate remains in /state as drive_mph_estimate.
 (cd web && exec python3 app.py) >/tmp/flask.log 2>&1 &
 SRV=$!
+echo "[start] web ui pid=$SRV; MPH source=iPhone ARKit ego speed, GPS fallback" \
+    >>/tmp/flask.log
 
 if [[ -n "$MOCK_SPEED" ]]; then
     echo "[start] MOCK mode — mph=$MOCK_SPEED (skipping PS5/Arduino/ODrive)" >>/tmp/ps5_drive.log

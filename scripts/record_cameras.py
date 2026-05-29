@@ -92,11 +92,14 @@ CAM_OPEN_ORDER = list(CAM_NAMES)
 CAMERA_FLIP: dict[str, int] = {}
 
 # Per-cam v4l2 control overrides applied after _open(). Each entry is
-# (control_name, value). back-right (/dev/video6 here) ships from the
-# factory in Manual exposure at a very low value, so the image is dark;
-# switching auto_exposure=3 (Aperture Priority) hands exposure back to
-# the cam's firmware so it auto-brightens.
+# (control_name, value). auto_exposure=3 (Aperture Priority) hands exposure
+# back to the cam's firmware; brightness=32 lifts the front view without
+# pushing it to the top of the UVC [-64, 64] range.
 CAMERA_CONTROLS: dict[str, tuple[tuple[str, int], ...]] = {
+    "front": (
+        ("auto_exposure", 3),
+        ("brightness", 32),
+    ),
     "back-right": (
         ("auto_exposure", 3),
         ("brightness", 32),

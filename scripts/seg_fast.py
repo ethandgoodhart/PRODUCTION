@@ -76,18 +76,25 @@ def build_bev_remap(calib: dict, img_h: int, img_w: int,
     range_forward = range_forward_ft * FT_TO_M
     range_side = range_side_ft * FT_TO_M
 
-    pitch = math.radians(calib["extrinsics"]["pitch_deg"])
-    roll = math.radians(calib["extrinsics"]["roll_deg"])
-    yaw = math.radians(calib["extrinsics"]["yaw_deg"])
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cr, sr = math.cos(roll), math.sin(roll)
-    cyw, syw = math.cos(yaw), math.sin(yaw)
+    ego_to_camera = calib["extrinsics"].get("ego_to_camera")
+    if ego_to_camera is None:
+        pitch = math.radians(calib["extrinsics"]["pitch_deg"])
+        roll = math.radians(calib["extrinsics"]["roll_deg"])
+        yaw = math.radians(calib["extrinsics"]["yaw_deg"])
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cr, sr = math.cos(roll), math.sin(roll)
+        cyw, syw = math.cos(yaw), math.sin(yaw)
 
-    Ryaw = np.array([[cyw, -syw, 0], [syw, cyw, 0], [0, 0, 1]])
-    Rbase = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-    Rpitch = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
-    Rroll = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
-    R = Rroll @ Rpitch @ Rbase @ Ryaw
+        Ryaw = np.array([[cyw, -syw, 0], [syw, cyw, 0], [0, 0, 1]])
+        Rbase = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+        Rpitch = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+        Rroll = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
+        R = Rroll @ Rpitch @ Rbase @ Ryaw
+    else:
+        T_ego_to_camera = np.asarray(ego_to_camera, dtype=np.float64)
+        if T_ego_to_camera.shape != (4, 4):
+            raise ValueError("extrinsics.ego_to_camera must be a 4x4 matrix")
+        R = None
 
     by_arr, bx_arr = np.mgrid[0:bev_size, 0:bev_size]
     by_flat = by_arr.ravel()
@@ -101,9 +108,18 @@ def build_bev_remap(calib: dict, img_h: int, img_w: int,
     by_v, bx_v = by_flat[mask], bx_flat[mask]
     dz = np.full_like(wx_v, -h)
 
-    cam_x = R[0, 0] * wx_v + R[0, 1] * wy_v + R[0, 2] * dz
-    cam_y = R[1, 0] * wx_v + R[1, 1] * wy_v + R[1, 2] * dz
-    cam_z = R[2, 0] * wx_v + R[2, 1] * wy_v + R[2, 2] * dz
+    if ego_to_camera is None:
+        cam_x = R[0, 0] * wx_v + R[0, 1] * wy_v + R[0, 2] * dz
+        cam_y = R[1, 0] * wx_v + R[1, 1] * wy_v + R[1, 2] * dz
+        cam_z = R[2, 0] * wx_v + R[2, 1] * wy_v + R[2, 2] * dz
+    else:
+        # BEV wx is positive to the right; E2E ego y is positive left.
+        ego_pts = np.stack(
+            [wy_v, -wx_v, dz, np.ones_like(wx_v)],
+            axis=0,
+        )
+        cam_pts = T_ego_to_camera @ ego_pts
+        cam_x, cam_y, cam_z = cam_pts[0], cam_pts[1], cam_pts[2]
 
     m2 = cam_z > 0.01
     cam_x = cam_x[m2]; cam_y = cam_y[m2]; cam_z = cam_z[m2]

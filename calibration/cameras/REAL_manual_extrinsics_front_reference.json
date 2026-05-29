@@ -1,7 +1,7 @@
 {
   "type": "manual_first_pass_extrinsics",
   "reference_camera": "front",
-  "date": "2026-05-20",
+  "date": "2026-05-28",
   "assumptions": [
     "front camera is the temporary rig reference",
     "front camera is centered on the PVC camera pipe",
@@ -11,7 +11,9 @@
     "front_left yaw is +55 degrees relative to front",
     "front_right yaw is -55 degrees relative to front",
     "all pitch and roll offsets are zero",
-    "all x and z position offsets are zero"
+    "all x and z position offsets are zero",
+    "back, back_left, back_right are 3 ft (0.9144 m) behind front along -x",
+    "back yaw is 180; back_left yaw is +125; back_right yaw is -125"
   ],
   "units": {
     "translation": "meters",
@@ -19,22 +21,87 @@
   },
   "manual_measurements_body_frame": {
     "front": {
-      "position_m": [0.0, 0.0, 0.0],
+      "position_m": [
+        0.0,
+        0.0,
+        0.0
+      ],
       "yaw_deg": 0.0,
       "pitch_deg": 0.0,
       "roll_deg": 0.0
     },
     "front_left": {
-      "position_m": [0.0, 0.403225, 0.0],
-      "position_in": [0.0, 15.875, 0.0],
+      "position_m": [
+        0.0,
+        0.403225,
+        0.0
+      ],
+      "position_in": [
+        0.0,
+        15.875,
+        0.0
+      ],
       "yaw_deg": 55.0,
       "pitch_deg": 0.0,
       "roll_deg": 0.0
     },
     "front_right": {
-      "position_m": [0.0, -0.403225, 0.0],
-      "position_in": [0.0, -15.875, 0.0],
+      "position_m": [
+        0.0,
+        -0.403225,
+        0.0
+      ],
+      "position_in": [
+        0.0,
+        -15.875,
+        0.0
+      ],
       "yaw_deg": -55.0,
+      "pitch_deg": 0.0,
+      "roll_deg": 0.0
+    },
+    "back": {
+      "position_m": [
+        -0.9144,
+        0.0,
+        0.0
+      ],
+      "position_in": [
+        -36.0,
+        0.0,
+        0.0
+      ],
+      "yaw_deg": 180.0,
+      "pitch_deg": 0.0,
+      "roll_deg": 0.0
+    },
+    "back_left": {
+      "position_m": [
+        -0.9144,
+        0.403225,
+        0.0
+      ],
+      "position_in": [
+        -36.0,
+        15.875,
+        0.0
+      ],
+      "yaw_deg": 125.0,
+      "pitch_deg": 0.0,
+      "roll_deg": 0.0
+    },
+    "back_right": {
+      "position_m": [
+        -0.9144,
+        -0.403225,
+        0.0
+      ],
+      "position_in": [
+        -36.0,
+        -15.875,
+        0.0
+      ],
+      "yaw_deg": -125.0,
       "pitch_deg": 0.0,
       "roll_deg": 0.0
     }
@@ -43,26 +110,86 @@
   "cameras": {
     "front": {
       "T_camera_front": [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0]
+        [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
       ]
     },
     "front_left": {
       "T_camera_front": [
-        [0.573576436, 0.0, 0.819152044, 0.231280359],
-        [0.0, 1.0, 0.0, 0.0],
-        [-0.819152044, 0.0, 0.573576436, -0.330302583],
-        [0.0, 0.0, 0.0, 1.0]
+        [
+          0.573576436,
+          0.0,
+          0.819152044,
+          0.231280359
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          -0.819152044,
+          0.0,
+          0.573576436,
+          -0.330302583
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
       ]
     },
     "front_right": {
       "T_camera_front": [
-        [0.573576436, 0.0, -0.819152044, -0.231280359],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.819152044, 0.0, 0.573576436, -0.330302583],
-        [0.0, 0.0, 0.0, 1.0]
+        [
+          0.573576436,
+          0.0,
+          -0.819152044,
+          -0.231280359
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.819152044,
+          0.0,
+          0.573576436,
+          -0.330302583
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
       ]
     }
   }
