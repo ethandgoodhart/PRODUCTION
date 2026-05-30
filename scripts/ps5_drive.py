@@ -228,7 +228,7 @@ AUTOSTEER_FRESH_S = 0.30          # must match autoware_infer AUTOWARE_STATE_FRE
 # this window alpamayo doesn't drive either the wheel or the pedals —
 # the cart just coasts with whatever the operator left it at. Keeps
 # manual takeovers from feeling like a constant tug-of-war.
-AUTOSTEER_HANDBACK_S = 3.0
+AUTOSTEER_HANDBACK_S = 0.5
 # L2 deadzone — used both for "operator brake wins" arbitration AND for
 # resetting the autosteer handback timer. Mirrors PEDAL_TRIGGER_DEADZONE
 # defined inline near the gas/brake arbitration; kept module-level here
@@ -1506,7 +1506,7 @@ def main() -> int:
                 elif auto_steer_deg is None:
                     autosteer_status = "stale"
                 else:
-                    # Fresh prediction but still inside the 3s handback
+                    # Fresh prediction but still inside the handback
                     # window after a steer/brake takeover. Hold the
                     # current target until the window expires — keeps
                     # the trap_traj planner from jerking back.

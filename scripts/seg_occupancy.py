@@ -115,12 +115,26 @@ class TrackPrediction:
 
 
 @dataclass(frozen=True)
+class TrackState:
+    """A tracked obstacle (moving OR stationary) for space-time collision tests.
+
+    ``pos_m`` / ``vel_mps`` are ego-local ``(forward, lateral)`` metres and m/s."""
+    track_id: int
+    pos_m: tuple[float, float]
+    vel_mps: tuple[float, float]
+    speed_mps: float
+    hits: int
+    confidence: float
+
+
+@dataclass(frozen=True)
 class PredictedOccupancy:
     probabilities: np.ndarray
     risk_mask: np.ndarray
     current_mask: np.ndarray
     track_count: int
     tracks: tuple[TrackPrediction, ...] = ()
+    all_tracks: tuple[TrackState, ...] = ()
 
 
 class PredictedOccupancyTracker:
@@ -202,7 +216,30 @@ class PredictedOccupancyTracker:
             current_mask=current_mask,
             track_count=len(self._tracks),
             tracks=self._track_predictions(geom),
+            all_tracks=self._all_track_states(),
         )
+
+    def _all_track_states(self) -> tuple[TrackState, ...]:
+        """Every currently-matched track (moving or stationary) with >=2 hits.
+
+        Unlike ``_track_predictions`` (which gates on motion for the risk mask),
+        this exposes stationary obstacles too, so the space-time collision check
+        can brake for a person standing in the path."""
+        out: list[TrackState] = []
+        for t in self._tracks:
+            if t.missed != 0 or t.hits < 2:
+                continue
+            out.append(
+                TrackState(
+                    track_id=t.track_id,
+                    pos_m=(float(t.pos_m[0]), float(t.pos_m[1])),
+                    vel_mps=(float(t.vel_mps[0]), float(t.vel_mps[1])),
+                    speed_mps=float(np.linalg.norm(t.vel_mps)),
+                    hits=int(t.hits),
+                    confidence=float(t.confidence),
+                )
+            )
+        return tuple(out)
 
     def _components_to_detections(self, class_map: np.ndarray, geom: BevGeometry) -> list[np.ndarray]:
         obstacle_mask = np.isin(class_map, OBSTACLE_CLASS_IDS).astype(np.uint8)
@@ -212,11 +249,21 @@ class PredictedOccupancyTracker:
             area = int(stats[label, cv2.CC_STAT_AREA])
             if area < self.min_area_px:
                 continue
-            cx, cy = centroids[label]
-            fwd, left = geom.bev_to_local(cx, cy)
-            if float(fwd) <= 0.0:
+            ys, xs = np.nonzero(labels == label)
+            if xs.size == 0:
                 continue
-            detections.append(np.array([float(fwd), float(left)], dtype=np.float32))
+            # With a mono camera and no depth, a standing object's mask smears UP
+            # its image column, so its centroid sits too far forward. The NEAREST
+            # forward point is the ground-contact (feet) — the most accurate metric
+            # forward distance under the flat-ground homography. Lateral uses the
+            # median column. This makes the time-to-collision math meaningful.
+            fwd, left = geom.bev_to_local(xs, ys)
+            nearest_i = int(np.argmin(fwd))
+            f = float(fwd[nearest_i])
+            l = float(np.median(left))
+            if f <= 0.0:
+                continue
+            detections.append(np.array([f, l], dtype=np.float32))
         return detections
 
     def _update_tracks(self, detections: list[np.ndarray], detection_confidences: list[float], dt_s: float) -> None:
@@ -470,6 +517,143 @@ def environment_brake_target(
     if signage >= 0.10:
         brake = max(brake, 0.92)
     return float(min(1.0, brake))
+
+
+def evaluate_collision_brake(
+    tracks: "tuple[TrackState, ...] | list[TrackState]",
+    ego_speed_mps: float,
+    *,
+    horizon_s: float = 4.0,
+    hard_ttc_s: float = 2.0,
+    near_stop_m: float = 3.0,
+    corridor_half_m: float = 0.9,
+    object_radius_m: float = 0.3,
+    front_standoff_m: float = 0.5,
+    min_hits: int = 3,
+    min_confidence: float = 0.45,
+    near_min_hits: int = 2,
+    min_ego_mps: float = 0.3,
+) -> dict:
+    """Space-time collision braking from tracked obstacles' position + velocity.
+
+    For each track we ask whether the cart and the object will occupy the same
+    place at the same TIME — not merely whether the object is near the path now.
+    The cart front advances at ``ego_speed_mps``; the object follows its constant
+    velocity. We brake only if, at the moment the cart reaches the object's
+    forward line, the object is still within the lateral corridor:
+
+      * a person standing off to the side   -> never enters the corridor -> no brake
+      * a person crossing fast in front      -> has cleared the corridor by the
+                                                time the cart arrives -> no brake
+      * a person stopped / stepping into path -> still in the corridor -> brake
+
+    Braking is graded by time-to-collision (sooner -> harder), with a hard-stop
+    floor for anything close and currently dead-ahead. Returns a dict with
+    ``brake_01`` (0..1), ``ttc_s``, ``reason``, ``objects`` and a ``threat``
+    summary for the nearest collision."""
+    ego_v = max(float(ego_speed_mps), float(min_ego_mps))
+    corr = float(corridor_half_m) + float(object_radius_m)
+    best: dict | None = None
+
+    def _consider(brake: float, ttc: float, reason: str, tk: "TrackState") -> None:
+        nonlocal best
+        if best is None or brake > best["brake"] or (
+            brake == best["brake"] and ttc < best["ttc"]
+        ):
+            best = {"brake": float(brake), "ttc": float(ttc), "reason": reason, "track": tk}
+
+    for tk in tracks:
+        x0, y0 = float(tk.pos_m[0]), float(tk.pos_m[1])
+        vx, vy = float(tk.vel_mps[0]), float(tk.vel_mps[1])
+        if x0 <= 0.0:
+            continue
+        # Hard-stop floor: obstacle close and currently in the lateral corridor.
+        if tk.hits >= near_min_hits and x0 <= near_stop_m and abs(y0) <= corr:
+            _consider(1.0, max(0.0, (x0 - front_standoff_m) / ego_v),
+                      "near obstacle in path", tk)
+            continue
+        if tk.hits < min_hits or tk.confidence < min_confidence:
+            continue
+        # Longitudinal closing speed (cart advances; object may move in x too).
+        v_close = ego_v - vx
+        if v_close <= 1e-3:
+            continue  # object recedes at least as fast as the cart closes
+        t_reach = (x0 - front_standoff_m) / v_close
+        if t_reach < 0.0:
+            t_reach = 0.0
+        if t_reach > horizon_s:
+            continue  # too far / too slow to matter within the horizon
+        y_at = y0 + vy * t_reach            # object's lateral position on arrival
+        if abs(y_at) > corr:
+            continue  # object has crossed clear of the corridor by then
+        if t_reach <= hard_ttc_s:
+            brake = 1.0
+        else:
+            brake = float(np.clip(
+                (horizon_s - t_reach) / max(horizon_s - hard_ttc_s, 1e-6), 0.0, 1.0
+            ))
+        _consider(brake, t_reach, "predicted collision on path", tk)
+
+    objects = len(tracks)
+    if best is None:
+        return {"brake_01": 0.0, "ttc_s": None, "reason": "", "objects": objects, "threat": None}
+    tk = best["track"]
+    return {
+        "brake_01": float(best["brake"]),
+        "ttc_s": round(float(best["ttc"]), 3),
+        "reason": best["reason"],
+        "objects": objects,
+        "threat": {
+            "label": "obstacle",
+            "x_m": round(float(tk.pos_m[0]), 3),
+            "y_m": round(float(tk.pos_m[1]), 3),
+            "vx_mps": round(float(tk.vel_mps[0]), 3),
+            "vy_mps": round(float(tk.vel_mps[1]), 3),
+            "speed_mps": round(float(tk.speed_mps), 3),
+            "ttc_s": round(float(best["ttc"]), 3),
+            "confidence": round(float(tk.confidence), 3),
+        },
+    }
+
+
+def imminent_obstacle_brake(
+    seg_map: np.ndarray,
+    *,
+    bottom_frac: float = 0.45,
+    center_lo: float = 0.28,
+    center_hi: float = 0.72,
+    cover_lo: float = 0.12,
+    cover_hi: float = 0.35,
+    classes: tuple[int, ...] = OBSTACLE_CLASS_IDS,
+) -> dict:
+    """Caution brake for an obstacle the cart cannot get around.
+
+    Works in IMAGE space on the raw segmentation map, so it stays reliable at
+    close range where the no-depth BEV ground projection breaks down (a very
+    close person's feet leave the lower FOV and their blob projects far away).
+    When obstacle-class pixels fill a large fraction of the lower-centre of the
+    view — i.e. something is close and directly ahead, with little room to pass —
+    brake in proportion to that coverage. A small/off-to-the-side obstacle keeps
+    coverage low, leaving room for the planner to steer around it.
+
+    Returns ``{"brake_01", "coverage"}``."""
+    if seg_map is None or seg_map.ndim < 2:
+        return {"brake_01": 0.0, "coverage": 0.0}
+    h, w = seg_map.shape[:2]
+    y0 = int(h * (1.0 - float(bottom_frac)))
+    x0 = int(w * float(center_lo))
+    x1 = int(w * float(center_hi))
+    region = seg_map[y0:h, x0:x1]
+    if region.size == 0:
+        return {"brake_01": 0.0, "coverage": 0.0}
+    coverage = float(np.isin(region, classes).mean())
+    if coverage <= cover_lo:
+        brake = 0.0
+    else:
+        brake = float(np.clip(
+            (coverage - cover_lo) / max(cover_hi - cover_lo, 1e-6), 0.0, 1.0
+        ))
+    return {"brake_01": brake, "coverage": round(coverage, 3)}
 
 
 class PedalCommandSmoother:

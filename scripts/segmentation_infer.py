@@ -177,16 +177,29 @@ TURN_ANNOUNCE_MAX_M = 40.0   # don't announce turns farther out than this
 #   * the UI "protective stop" state / STOP badge trips at ENV_BRAKE_STOP_FRAC.
 ENV_BRAKE_GAS_CUT_FRAC = 0.15
 ENV_BRAKE_STOP_FRAC = 0.5
-# Braking is judged against a fixed NEAR FORWARD CORRIDOR — the strip of ground
-# the cart will physically roll over next — not the steering centerline. The
-# centerline is derived from the road mask and bends *around* an obstacle (a
-# person is "not road"), so keying the brake off it makes the cart dodge instead
-# of stop. With a mono camera and no depth, an obstacle's BEV blob smears up its
-# image column but its *feet* land at the right near distance, so limiting the
-# corridor to ENV_BRAKE_NEAR_STOP_M keeps far objects from false-braking while
-# still catching anything directly ahead.
-ENV_BRAKE_CORRIDOR_HALF_M = 0.9   # half-width of the forward stop corridor
-ENV_BRAKE_NEAR_STOP_M = 6.0       # only obstacles within this forward range brake
+# Braking is a per-object SPACE-TIME (time-to-collision) test, not a space-only
+# corridor overlap: for each tracked obstacle we ask whether the cart and the
+# object will be at the same place at the same TIME (seg_occupancy.
+# evaluate_collision_brake). A person standing off to the side never enters the
+# corridor; a person crossing fast clears it before the cart arrives; a person
+# stopped or stepping into the path does not -> brake. Brake is graded by TTC,
+# with a hard-stop floor for anything close and currently dead-ahead. Object
+# forward distance comes from the blob's nearest (feet) point so the no-depth
+# BEV smear doesn't push obstacles artificially far away.
+ENV_BRAKE_CORRIDOR_HALF_M = 0.9   # lateral half-corridor the cart sweeps (m)
+ENV_BRAKE_OBJECT_RADIUS_M = 0.3   # added body radius of the obstacle (m)
+ENV_BRAKE_NEAR_STOP_M = 3.0       # hard-stop floor: dead-ahead obstacle within this (m)
+ENV_BRAKE_HORIZON_S = 4.0         # ignore collisions predicted beyond this TTC (s)
+ENV_BRAKE_HARD_TTC_S = 2.0        # TTC at/below this -> full brake; ramps to 0 by horizon
+# Extra caution for an obstacle the cart cannot get around (person too close, or
+# no room to pass). Image-space backstop: when obstacle pixels fill a large
+# fraction of the lower-centre of the camera view, slow hard / brake graded by
+# coverage. Robust at close range where the BEV ground projection breaks down.
+ENV_BRAKE_IMG_BOTTOM_FRAC = 0.45  # lower portion of the image treated as "near"
+ENV_BRAKE_IMG_CENTER_LO = 0.28    # central horizontal band = directly ahead
+ENV_BRAKE_IMG_CENTER_HI = 0.72
+ENV_BRAKE_IMG_COVER_LO = 0.12     # coverage below this -> no extra brake
+ENV_BRAKE_IMG_COVER_HI = 0.35     # coverage at/above this -> full brake
 # When a hard protective stop is active, freeze steering (hold the last command)
 # instead of letting the road-mask centerline swerve around the obstacle.
 ENV_BRAKE_FREEZE_STEER = True
@@ -661,48 +674,43 @@ def bev_class_map_cached(seg_map: np.ndarray, remap: seg_fast.BevRemap) -> np.nd
 
 
 def build_environment_threat(
-    occ: "seg_occupancy.PredictedOccupancy | None",
-    conflict_frac: float,
+    collision: dict | None,
+    image: dict | None,
     brake_01: float,
     enabled: bool,
 ) -> dict:
-    """Summarize the predicted-occupancy brake decision for state/UI.
+    """Summarize the brake decision (space-time collision + image proximity) for state/UI.
 
     Mirrors the shape the web UI expects from the old protective-stop block
     (``active`` / ``objects`` / ``threat.{label,x_m}``) and adds the graded
-    fields (``brake_target`` / ``conflict_frac`` / ``track_count``). The threat
-    label/distance come from the nearest predictable moving track."""
+    fields (``brake_target`` / ``ttc_s`` / ``image_coverage``). The threat
+    label/distance/TTC come from ``evaluate_collision_brake``'s nearest
+    collision; when the image-proximity backstop is the dominant brake the
+    reason reflects an un-navigable obstacle directly ahead."""
+    collision = collision or {}
+    image = image or {}
     active = bool(enabled and brake_01 >= ENV_BRAKE_STOP_FRAC)
-    tracks = occ.tracks if occ is not None else ()
-    threat = {
+    coll_brake = float(collision.get("brake_01", 0.0))
+    img_brake = float(image.get("brake_01", 0.0))
+    if active:
+        reason = (
+            "obstacle blocking path ahead (no room to pass)"
+            if img_brake > coll_brake
+            else str(collision.get("reason", ""))
+        )
+    else:
+        reason = ""
+    return {
         "enabled": bool(enabled),
         "active": active,
-        "source": "occupancy",
-        "reason": "",
+        "source": "collision" if enabled else None,
+        "reason": reason,
         "brake_target": round(float(brake_01), 3),
-        "conflict_frac": round(float(conflict_frac), 3),
-        "objects": int(occ.track_count) if occ is not None else 0,
-        "track_count": int(len(tracks)),
-        "threat": None,
+        "ttc_s": collision.get("ttc_s"),
+        "image_coverage": image.get("coverage", 0.0),
+        "objects": int(collision.get("objects", 0)),
+        "threat": collision.get("threat"),
     }
-    if not enabled:
-        threat["source"] = None
-        return threat
-    if tracks:
-        nearest = min(tracks, key=lambda t: t.pos_m[0])
-        threat["threat"] = {
-            "label": "obstacle",
-            "x_m": round(float(nearest.pos_m[0]), 3),
-            "y_m": round(float(nearest.pos_m[1]), 3),
-            "vx_mps": round(float(nearest.vel_mps[0]), 3),
-            "vy_mps": round(float(nearest.vel_mps[1]), 3),
-            "confidence": round(float(nearest.confidence), 3),
-        }
-        if active:
-            threat["reason"] = "predicted obstacle occupancy on planned path"
-    elif active:
-        threat["reason"] = "vulnerable road user on planned path"
-    return threat
 
 
 def forward_stop_corridor_bev(
@@ -1696,9 +1704,11 @@ def main() -> None:
     latest_gps_route: dict = {"active": False}
     latest_env_brake_01 = 0.0
     latest_occupancy: "seg_occupancy.PredictedOccupancy | None" = None
+    latest_collision: dict | None = None
+    latest_image_brake: dict | None = None
     latest_brake_corridor: np.ndarray | None = None
     latest_protective_stop: dict = build_environment_threat(
-        None, 0.0, 0.0, enabled=not args.no_protective_stop
+        None, None, 0.0, enabled=not args.no_protective_stop
     )
     inference_ok = False
     latest_latency_ms: dict[str, float] = {}
@@ -1834,17 +1844,16 @@ def main() -> None:
                         args.ego_state_file
                     )
                     latest_lookahead_m = adaptive_lookahead_m(latest_ego_speed_mph, latest_ego_speed_ok)
-                    # Predicted future-occupancy obstacle tracking + environment
-                    # brake (ported from drive-by-segmentation unified-planner
-                    # live.py). Moving obstacles in the BEV class map are tracked
-                    # to estimate velocity and extrapolated into a future risk
-                    # mask; we brake on how much of the NEAR FORWARD CORRIDOR (not
-                    # the swerving steering centerline) conflicts with that risk
-                    # mask OR with currently-detected obstacle cells (so a
-                    # stationary / just-appeared person directly ahead also
-                    # stops the cart), plus a semantic VRU override.
-                    occ_conflict_frac = 0.0
+                    # Per-object SPACE-TIME collision braking. Obstacles in the
+                    # BEV class map are tracked (position + velocity); we brake
+                    # only if the cart and an object are predicted to occupy the
+                    # same place at the same time — a person off to the side or a
+                    # fast crosser that clears the path does NOT stop the cart.
+                    # Graded by time-to-collision, with a hard-stop floor for
+                    # anything close and dead-ahead. (seg_occupancy.py, ported
+                    # from drive-by-segmentation's unified-planner live.py.)
                     env_brake_target = 0.0
+                    latest_collision = None
                     latest_brake_corridor = None
                     protective_enabled = not args.no_protective_stop
                     if protective_enabled and bev_cls_map is not None and bev_geom is not None:
@@ -1861,35 +1870,49 @@ def main() -> None:
                             ego_speed_mps=ego_mps,
                             use_segmentation_obstacles=True,
                         )
-                        lat_px = max(
-                            3,
-                            int(round(ENV_BRAKE_CORRIDOR_HALF_M * bev_geom.px_per_meter_side)),
+                        # Assume the cart will reach its target speed even if
+                        # currently stopped, so it won't launch into a predicted
+                        # collision while parked.
+                        plan_mps = max(ego_mps, args.target_mph * 0.44704)
+                        latest_collision = seg_occupancy.evaluate_collision_brake(
+                            latest_occupancy.all_tracks,
+                            plan_mps,
+                            horizon_s=ENV_BRAKE_HORIZON_S,
+                            hard_ttc_s=ENV_BRAKE_HARD_TTC_S,
+                            near_stop_m=ENV_BRAKE_NEAR_STOP_M,
+                            corridor_half_m=ENV_BRAKE_CORRIDOR_HALF_M,
+                            object_radius_m=ENV_BRAKE_OBJECT_RADIUS_M,
                         )
+                        # Image-space caution backstop: brake hard when an
+                        # obstacle fills the lower-centre view (close / no room to
+                        # pass) — robust where the BEV projection fails up close.
+                        latest_image_brake = seg_occupancy.imminent_obstacle_brake(
+                            seg_map,
+                            bottom_frac=ENV_BRAKE_IMG_BOTTOM_FRAC,
+                            center_lo=ENV_BRAKE_IMG_CENTER_LO,
+                            center_hi=ENV_BRAKE_IMG_CENTER_HI,
+                            cover_lo=ENV_BRAKE_IMG_COVER_LO,
+                            cover_hi=ENV_BRAKE_IMG_COVER_HI,
+                        )
+                        env_brake_target = max(
+                            float(latest_collision["brake_01"]),
+                            float(latest_image_brake["brake_01"]),
+                        )
+                        # Drawn on the BEV tile to show the hard-stop near zone.
                         latest_brake_corridor = forward_stop_corridor_bev(
                             bev_geom, ENV_BRAKE_NEAR_STOP_M
                         )
-                        # Stop mask = predicted future occupancy (moving objects)
-                        # OR currently-detected obstacle cells (stationary / just
-                        # appeared). Either inside the near corridor brakes.
-                        stop_mask = (
-                            latest_occupancy.risk_mask | latest_occupancy.current_mask
-                        )
-                        occ_conflict_frac = seg_occupancy.trajectory_conflict_frac(
-                            latest_brake_corridor, stop_mask, lateral_half_width_px=lat_px
-                        )
-                        env_brake_target = seg_occupancy.environment_brake_target(
-                            occ_conflict_frac, latest_brake_corridor, bev_cls_map,
-                            lateral_half_width_px=lat_px,
-                        )
                     else:
                         latest_occupancy = None
+                        latest_collision = None
+                        latest_image_brake = None
                         if not protective_enabled:
                             occupancy_tracker.reset()
                     brake_smoother.step(env_brake_target)
                     _, latest_env_brake_01 = brake_smoother.snapshot()
                     latest_protective_stop = build_environment_threat(
-                        latest_occupancy,
-                        occ_conflict_frac,
+                        latest_collision,
+                        latest_image_brake,
                         latest_env_brake_01,
                         enabled=protective_enabled,
                     )
@@ -2240,6 +2263,9 @@ def main() -> None:
                     f"above_{CLRNET_CONF_THRESHOLD:.2f}={latest_clrnet_fresh_count} "
                     f"conf=[{confs}] "
                     f"protective_stop={'Y' if latest_protective_stop.get('active') else 'N'} "
+                    f"brake={latest_env_brake_01:.2f} "
+                    f"ttc={latest_protective_stop.get('ttc_s')} "
+                    f"cov={latest_protective_stop.get('image_coverage', 0.0)} "
                     f"objects={int(latest_protective_stop.get('objects', 0))} "
                     f"gps_bias={float(latest_gps_route.get('bias_deg', 0.0)):+5.1f} "
                     f"turn={latest_gps_route.get('turn_text') or '-'} "
