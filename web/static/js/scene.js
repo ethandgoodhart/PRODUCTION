@@ -125,7 +125,7 @@ const LANES_PLANE_W = 6.5;       // ~road width minus a margin
 const LANES_PLANE_LEN = 24;      // forward extent
 const LANES_PLANE_NEAR_Z = -2.5; // just in front of the cart
 const LANES_PLANE_FAR_Z = LANES_PLANE_NEAR_Z - LANES_PLANE_LEN;
-const LANES_REFRESH_MS = 100;    // 10 Hz — matches autoware JPEG cadence
+const LANES_REFRESH_MS = 500;
 
 // Use an off-DOM <img> to drive a CanvasTexture-style update: setting
 // `texture.needsUpdate = true` after each load is the cheap path; three
@@ -192,6 +192,10 @@ scene.add(lanesPlane);
 // Pull a fresh texture every LANES_REFRESH_MS. Cache-buster on `t` keeps
 // the browser from serving the previous frame from disk cache.
 function refreshLanesTexture() {
+    if (!window.__showLanesTexture) {
+        lanesPlane.visible = false;
+        return;
+    }
     lanesImg.src = `/cam/lanes_solo.jpg?t=${Date.now()}`;
 }
 refreshLanesTexture();

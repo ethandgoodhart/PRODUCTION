@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import signal
@@ -15,6 +17,7 @@ AUTOWARE_STATE_FILE = os.environ.get(
 EGO_STATE_FILE = os.environ.get("EGO_STATE_FILE", "/tmp/ego_state.json")
 FRAMES_DIR = os.environ.get("CART_FRAMES_DIR", "/tmp/cart_frames")
 TELEOP_CMD_FILE = "/tmp/teleop_cmd.json"
+VIDEO_CONTROL_FILE = os.environ.get("VIDEO_CONTROL_FILE", "/tmp/video_control.json")
 NAV_ROUTE_FILE = os.environ.get("NAV_ROUTE_FILE", "/tmp/nav_route.json")
 GPS_STATE_FILE = os.environ.get("GPS_STATE_FILE", "/tmp/gps_state.json")
 TELEOP_CMD_FRESH_S = 0.50
@@ -383,6 +386,8 @@ def state():
         # Alpamayo-only fields (autoware doesn't write these — defaults
         # to 0 / [] so the UI can blindly read them either way).
         "target_speed_mph": float(auto.get("target_speed_mph", 0.0)) if auto else 0.0,
+        "speed_setpoint_mph": float(auto.get("speed_setpoint_mph", 0.0)) if auto else 0.0,
+        "collision_speed_mph": float(auto.get("collision_speed_mph", 0.0)) if auto else 0.0,
         "ego_speed_mph": float(auto.get("ego_speed_mph", 0.0)) if auto else 0.0,
         "ego_speed_ok": bool(auto.get("ego_speed_ok", False)) if auto else False,
         "steer_deg_base": float(auto.get("steer_deg_base", 0.0)) if auto else 0.0,
@@ -390,13 +395,22 @@ def state():
         "steer_lookahead_m": float(auto.get("steer_lookahead_m", 0.0)) if auto else 0.0,
         "target_gas": float(auto.get("target_gas", 0.0)) if auto else 0.0,
         "target_brake": float(auto.get("target_brake", 0.0)) if auto else 0.0,
+        "speed_mode": str(auto.get("speed_mode", "")) if auto else "",
+        "ground_truth_control": (
+            dict(auto.get("ground_truth_control", {}))
+            if auto and isinstance(auto.get("ground_truth_control"), dict) else None
+        ),
         "predicted_path": list(auto.get("predicted_path", [])),
+        "source": str(auto.get("source", "")) if auto else "",
+        "video": dict(auto.get("video", {})) if auto and isinstance(auto.get("video"), dict) else None,
         # Pass the alpamayo diagnostics block through verbatim so the UI
         # can show the per-prediction latency breakdown + live MB/s.
         # Empty dict for autoware (it never writes one), so the JS can
         # safely read .alpamayo?.latency_ms?.gpu etc.
         "alpamayo": dict(auto.get("alpamayo", {})) if auto else {},
         "segmentation": dict(auto.get("segmentation", {})) if auto else {},
+        "autospeed": dict(auto.get("autospeed", {})) if auto else {},
+        "stop_sign": dict(auto.get("stop_sign", {})) if auto else {},
         "stale": auto_stale,
     }
 
@@ -419,6 +433,24 @@ def state():
         data["teleop_url"] = TELEOP_TUNNEL_URL + "/teleop"
 
     return jsonify(data)
+
+
+@app.route("/offline-video-control", methods=["POST"])
+def offline_video_control():
+    payload = request.get_json(silent=True) or {}
+    try:
+        seek_s = float(payload.get("seek_s", 0.0))
+    except (TypeError, ValueError):
+        abort(400)
+    pause = bool(payload.get("pause", False))
+    seek_s = max(0.0, seek_s)
+    _atomic_json_write(VIDEO_CONTROL_FILE, {
+        "seq": time.time_ns(),
+        "ts": time.time(),
+        "seek_s": seek_s,
+        "pause": pause,
+    })
+    return jsonify({"ok": True, "seek_s": seek_s, "pause": pause})
 
 
 def _frame_path(slug: str) -> str | None:
@@ -802,6 +834,12 @@ def nav_route():
 def gps():
     snap = _gps_reader.latest()
     fix = snap.get("fix") or {}
+    if not fix or not snap.get("connected"):
+        file_snap, file_stale = _load_json(GPS_STATE_FILE, 2.0)
+        if file_snap and not file_stale and file_snap.get("connected"):
+            fix = file_snap.get("fix") or {}
+            snap = {"connected": True, "tcp_connected": False,
+                    "stale": False, "host": file_snap.get("host", "file")}
     has_fix = bool(fix) and "lat_deg" in fix and "lon_deg" in fix
     # Pull the next-turn announcement the segmentation brain computes against
     # the active route, so the map UI can render a turn banner from one poll.

@@ -253,6 +253,44 @@ html, body {
     font-variant-numeric: tabular-nums;
 }
 
+.video-scrubber {
+    display: grid;
+    grid-template-columns: 34px 48px 1fr 48px;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 12px;
+    border: 1px solid rgba(17, 18, 21, 0.12);
+    border-radius: 8px;
+    background: #f8f9fa;
+}
+.video-scrubber[hidden] {
+    display: none;
+}
+.video-play {
+    width: 34px;
+    height: 28px;
+    border: 1px solid rgba(17, 18, 21, 0.16);
+    border-radius: 6px;
+    background: #ffffff;
+    color: var(--ink);
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1;
+    cursor: pointer;
+}
+.video-time {
+    color: var(--ink-soft);
+    font-size: 12px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+}
+.video-range {
+    width: 100%;
+    accent-color: var(--accent);
+    cursor: pointer;
+}
+
 /* ===== Bottom bar ===== */
 .bottom-bar {
     position: fixed;
@@ -301,16 +339,36 @@ html, body {
 .side-indicators.left .indicator-dot:nth-child(2) { background: #d0d4dc; }
 .side-indicators.right .indicator-dot:nth-child(2) { background: #d0d4dc; }
 
-/* ===== Bottom-left HUD: steering wheel + pedal stack ===== */
-.hud-bottom-left {
-    position: fixed;
-    bottom: 40px;
-    left: 40px;
-    z-index: 10;
+/* ===== Right-side predicted/recorded control indicators ===== */
+.control-stack {
+    width: clamp(320px, 24vw, 420px);
     display: flex;
-    align-items: center;
-    gap: 26px;
+    flex-direction: column;
+    gap: 6px;
     pointer-events: none;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: #f8f9fa;
+    flex-shrink: 0;
+}
+.control-row {
+    display: grid;
+    grid-template-columns: 64px 90px 1fr;
+    align-items: center;
+    gap: 12px;
+    min-height: 80px;
+}
+.control-label {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    text-align: right;
+}
+.ground-truth-row {
+    opacity: 0.86;
 }
 
 .steering-widget {
@@ -321,13 +379,13 @@ html, body {
     color: var(--ink);
 }
 .wheel-svg {
-    width: 104px;
-    height: 104px;
+    width: 70px;
+    height: 70px;
     display: block;
     color: var(--ink);
     filter: drop-shadow(0 4px 14px rgba(0, 0, 0, 0.08));
 }
-.wheel-svg #wheel-rotate {
+.wheel-rotate {
     /* `fill-box` sets the reference frame to the group's bounding
        box — `50px 50px` then reads as 50px from its top-left, which is
        not its center. `center` (within the bbox) puts the pivot
@@ -357,6 +415,10 @@ html, body {
     color: #00bcd4;
     text-shadow: 0 0 10px rgba(0, 188, 212, 0.35);
 }
+.model-steering-angle.ground-truth {
+    color: #667085;
+    text-shadow: none;
+}
 .model-steering-angle[hidden] {
     display: none;
 }
@@ -365,10 +427,23 @@ html, body {
     display: flex;
     flex-direction: column;
     gap: 3px;
-    height: 104px;
+    height: 74px;
     width: 26px;
     padding: 2px 0;
     justify-content: space-between;
+}
+.pedal-widget {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.pedal-caption {
+    min-width: 120px;
+    color: var(--ink-soft);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    font-variant-numeric: tabular-nums;
 }
 .pedal-dash {
     flex: 1;
@@ -397,32 +472,45 @@ html, body {
    outputs (lanes / depth / objects / seg). The tile feeding the
    inference camera gets a blue ring + AUTOWARE badge. Viz tiles show a
    "model loading…" placeholder until inference is live. */
-.cam-grid {
-    position: fixed;
-    bottom: 40px;
-    right: 40px;
-    z-index: 10;
-    display: grid;
-    grid-template-columns: repeat(3, 240px);
-    grid-template-rows: repeat(2, 144px);
-    gap: 12px;
-    pointer-events: none;
-    transition: grid-template-columns 220ms ease, grid-template-rows 220ms ease;
+.dash-center {
+    grid-row: 1;
+    grid-column: 2;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
 }
-/* Manual / non-autonomous: shrink the camera grid so the cards don't
-   dominate the screen. We keep the larger 240×144 footprint only while
-   Autoware is actively driving (body lacks .compact-cams). JS in
-   index.html toggles .compact-cams on <body> off the autoware status. */
-body.compact-cams .cam-grid {
-    grid-template-columns: repeat(3, 140px);
-    grid-template-rows: repeat(2, 84px);
+.dash-right {
+    grid-row: 1;
+    grid-column: 3;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.cam-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: repeat(2, 1fr);
+    gap: 6px;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+body.segmentation-grid .cam-grid,
+body.compact-cams.segmentation-grid .cam-grid,
+.cam-grid.segmentation-grid {
+    grid-template-columns: repeat(3, 1fr);
     gap: 8px;
 }
-body.compact-cams .cam-tile .cam-label,
-body.compact-cams .cam-tile .cam-badge {
-    font-size: 9px;
-    padding: 2px 6px;
-    letter-spacing: 0.12em;
+.dash-scrubber {
+    grid-row: 2;
+    grid-column: 1 / -1;
+}
+.dash-scrubber .video-scrubber {
+    position: static;
+    margin: 0;
+    width: 100%;
 }
 
 
@@ -516,35 +604,35 @@ body.compact-cams .cam-tile .cam-badge {
 
 /* Larger model previews for BEV (alpamayo) and Segmentation
    (segmentation model), without letting them dominate the whole view. */
-.cam-grid { grid-auto-rows: 144px; }
-body.compact-cams .cam-grid { grid-auto-rows: 84px; }
 .cam-tile[data-cam="bev"],
 .cam-tile[data-cam="seg"] {
-    grid-column: span 2;
-    grid-row: span 2;
+    grid-column: auto;
+    grid-row: auto;
 }
 /* The enlarged BEV/seg images are letterboxed instead of cropped so
    the grid labels (and the seg image's bottom edge) stay visible.
    Black background fills any leftover area inside the tile. */
 .cam-tile[data-cam="bev"] img,
-.cam-tile[data-cam="seg"] img {
+.cam-tile[data-cam="seg"] img,
+.cam-tile[data-cam="objects"] img {
     object-fit: contain;
     background: #000;
 }
-/* Push the autoware HUD up to clear the enlarged viz tile. */
-body:has(.cam-tile[data-cam="bev"].viz-ready) .autoware-hud,
-body:has(.cam-tile[data-cam="seg"].viz-ready) .autoware-hud {
-    bottom: 376px;
+body.segmentation-grid .cam-tile img {
+    object-fit: contain;
+    background: #000;
+}
+/* Push the autoware HUD above the dashboard */
+body:has(.dashboard) .autoware-hud {
+    bottom: calc(50vh + 8px);
 }
 
 /* Autoware HUD — a small readout above the cam grid with predicted angle
    + status (autoware/human/stale/idle). Sits where the route-time footer
    used to, so we don't crowd the speed cluster. */
 .autoware-hud {
-    /* Sits above the 3x2 stream grid: 40 bottom margin + 144*2 rows + 12
-       gap + 12 breathing room = 352. Keep in sync with .cam-grid. */
     position: fixed;
-    bottom: 352px;
+    bottom: calc(50vh + 8px);
     right: 40px;
     z-index: 10;
     display: flex;
@@ -557,11 +645,6 @@ body:has(.cam-tile[data-cam="seg"].viz-ready) .autoware-hud {
     text-transform: uppercase;
     font-variant-numeric: tabular-nums;
     transition: bottom 220ms ease;
-}
-/* Compact grid is 84*2 + 8 gap = 176 tall, plus 40 bottom margin + 12
-   breathing room = 228. Mirrors the calculation above. */
-body.compact-cams .autoware-hud {
-    bottom: 228px;
 }
 .autoware-hud .aw-status-dot {
     width: 8px;
@@ -894,4 +977,265 @@ body.compact-cams .autoware-hud {
 @keyframes turn-banner-pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.55; }
+}
+
+/* ── Unified bottom dashboard ───────────────────────────────── */
+.dashboard {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 50vh;
+    z-index: 9;
+    background: #fff;
+    border-top: 1px solid var(--line);
+    display: grid;
+    grid-template-columns: 180px 1fr auto;
+    grid-template-rows: 1fr auto;
+    gap: 8px;
+    padding: 10px 12px;
+    box-shadow: 0 -2px 20px rgba(0,0,0,0.06);
+}
+.dash-left {
+    grid-row: 1;
+    grid-column: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow-y: auto;
+    min-height: 0;
+}
+.dash-card {
+    background: #f8f9fa;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    flex-shrink: 0;
+}
+.dash-map {
+    position: relative;
+    height: 160px;
+}
+.dash-map #mini-map { width: 100%; height: 100%; }
+
+/* ===== Autospeed Panel ===== */
+.autospeed-panel {
+    padding: 10px 14px 8px;
+    font-size: 12px;
+    color: var(--ink);
+    transition: border-color 0.2s;
+}
+.autospeed-panel.emergency {
+    border-color: #dc2626;
+    background: rgba(255, 240, 240, 0.95);
+}
+.as-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+.as-label {
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+}
+.as-emergency {
+    font-weight: 800;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: #dc2626;
+    animation: turn-banner-pulse 0.7s ease-in-out infinite;
+}
+.as-speeds {
+    display: flex;
+    gap: 18px;
+    margin-bottom: 10px;
+}
+.as-speed-block {
+    text-align: center;
+}
+.as-speed-value {
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+}
+.as-speed-value.as-max {
+    color: var(--muted);
+    font-size: 20px;
+}
+.as-speed-label {
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    margin-top: 2px;
+}
+.as-accel-bar {
+    position: relative;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--line);
+    margin-bottom: 4px;
+    overflow: visible;
+    display: flex;
+}
+.as-accel-decel {
+    flex: 3.5;
+    background: linear-gradient(90deg, #dc2626 0%, #f59e0b 100%);
+    border-radius: 3px 0 0 3px;
+    opacity: 0.4;
+}
+.as-accel-center {
+    flex: 0.5;
+    background: #d1d5db;
+}
+.as-accel-accel {
+    flex: 1.2;
+    background: linear-gradient(90deg, #10b981 0%, #22c55e 100%);
+    border-radius: 0 3px 3px 0;
+    opacity: 0.4;
+}
+.as-accel-needle {
+    position: absolute;
+    top: -3px;
+    width: 4px;
+    height: 12px;
+    background: var(--ink);
+    border-radius: 2px;
+    transform: translateX(-2px);
+    transition: left 0.15s ease-out;
+}
+.as-accel-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-align: center;
+    margin-bottom: 6px;
+}
+.as-accel-label.decel { color: #dc2626; }
+.as-accel-label.accel { color: #10b981; }
+.as-accel-label.coast { color: var(--muted); }
+.as-accel-label.emergency { color: #dc2626; }
+.as-limits {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+.as-limit {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    font-size: 10px;
+    color: var(--ink-soft);
+    padding: 2px 4px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.03);
+}
+.as-limit.most-limiting {
+    background: rgba(245, 158, 11, 0.12);
+    font-weight: 600;
+}
+.as-lim-speed {
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    min-width: 36px;
+}
+.as-lim-speed::after { content: ' mph'; font-weight: 400; color: var(--muted); }
+.as-lim-class {
+    min-width: 50px;
+    text-transform: capitalize;
+}
+.as-lim-dist, .as-lim-lat {
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    font-size: 9px;
+}
+
+/* ── Stop sign indicator ────────────────────────────────────── */
+.stop-sign-indicator {
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.stop-sign-indicator.approaching {
+    border-color: #f59e0b;
+    background: #fef3c7;
+}
+.stop-sign-indicator.stopped {
+    border-color: #dc2626;
+    background: #fee2e2;
+}
+.stop-sign-indicator.departing {
+    border-color: #22c55e;
+    background: #dcfce7;
+}
+.ss-icon { font-size: 18px; line-height: 1; flex-shrink: 0; }
+.ss-info { min-width: 0; }
+.ss-state {
+    font-weight: 700;
+    font-size: 12px;
+    letter-spacing: 0.5px;
+    color: var(--ink);
+}
+.ss-detail {
+    font-size: 10px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+.ss-conf {
+    font-size: 9px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    margin-top: 1px;
+}
+
+/* ── Mini-map ──────────────────────────────────────────────── */
+.mini-map-label {
+    position: absolute;
+    top: 4px;
+    left: 6px;
+    z-index: 1000;
+    font: 600 8px/1 var(--ff);
+    letter-spacing: 0.8px;
+    color: rgba(0,0,0,0.6);
+    background: rgba(255,255,255,0.7);
+    padding: 2px 5px;
+    border-radius: 3px;
+    pointer-events: none;
+}
+#mini-map {
+    width: 100%;
+    height: 100%;
+}
+.mini-ego-marker {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #2563eb;
+    border: 3px solid #fff;
+    box-shadow: 0 0 0 2px rgba(37,99,235,0.4), 0 0 8px rgba(0,0,0,0.5);
+}
+.mini-map-no-gps {
+    position: absolute;
+    bottom: 8px;
+    right: 8px;
+    z-index: 1000;
+    font: 600 10px/1 var(--ff);
+    letter-spacing: 0.5px;
+    color: rgba(255,80,80,0.9);
+    background: rgba(0,0,0,0.6);
+    padding: 3px 6px;
+    border-radius: 3px;
+    pointer-events: none;
+}
+
+/* ── CLRNet steering source indicator ──────────────────────── */
+.model-steering-angle.clrnet-active {
+    color: #4ade80;
+    text-shadow: 0 0 6px rgba(74,222,128,0.4);
 }

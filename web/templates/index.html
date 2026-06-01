@@ -5,9 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FSD · Golf Cart</title>
     <link href="{{ url_for('static', filename='vendor/fonts/fonts.css') }}" rel="stylesheet">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}?v=seggrid8">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
 </head>
-<body class="compact-cams">
+<body class="compact-cams segmentation-grid">
     <div id="scene-container"></div>
 
     <!-- Top status bar -->
@@ -88,44 +90,125 @@
             </div>
         </div>
     </div>
-    <!-- (P R N D gear selector intentionally removed) -->
-
-    <!-- Bottom info row (temporarily hidden)
-    <footer class="bottom-bar">
-        <div class="info-block">
-            <div class="info-label">NEXT</div>
-            <div class="info-value">Straight 0.3 mi</div>
-        </div>
-        <div class="info-block center">
-            <div class="info-label">ROUTE</div>
-            <div class="info-value">Campus Loop · 4 min</div>
-        </div>
-        <div class="info-block right">
-            <div class="info-label">RANGE</div>
-            <div class="info-value">142 mi</div>
-        </div>
-    </footer>
-    -->
-
-
-    <!-- Bottom-left HUD: steering wheel + gas/brake bar -->
-    <div class="hud-bottom-left">
-        <div class="steering-widget">
-            <svg class="wheel-svg" viewBox="0 0 100 100" aria-hidden="true">
-                <g id="wheel-rotate">
-                    <circle cx="50" cy="50" r="40" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-                    <circle cx="50" cy="50" r="10.5" fill="none" stroke="currentColor" stroke-width="3"/>
-                    <line x1="11" y1="50" x2="39" y2="50" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-                    <line x1="61" y1="50" x2="89" y2="50" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-                    <line x1="50" y1="61" x2="50" y2="89" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
-                </g>
-            </svg>
-            <div class="steering-readouts">
-                <span class="steering-angle" id="steer-angle">0°</span>
-                <span class="model-steering-angle" id="model-steer-angle">SEG —</span>
+    <!-- Bottom dashboard: organized grid of all visualization panels -->
+    <div class="dashboard" id="dashboard">
+        <div class="dash-left">
+            <!-- Mini-map -->
+            <div class="dash-card dash-map">
+                <div class="mini-map-label" id="mini-map-label">LIVE MAP</div>
+                <div id="mini-map"></div>
+                <div class="mini-map-no-gps" id="mini-map-no-gps" hidden>NO GPS</div>
+            </div>
+            <!-- Autospeed -->
+            <div class="dash-card autospeed-panel" id="autospeed-panel" hidden>
+                <div class="as-header">
+                    <span class="as-label">AUTOSPEED</span>
+                    <span class="as-emergency" id="as-emergency" hidden>EMERGENCY</span>
+                </div>
+                <div class="as-speeds">
+                    <div class="as-speed-block">
+                        <div class="as-speed-value" id="as-cmd-speed">—</div>
+                        <div class="as-speed-label">CMD MPH</div>
+                    </div>
+                    <div class="as-speed-block">
+                        <div class="as-speed-value as-max" id="as-max-speed">—</div>
+                        <div class="as-speed-label">MAX MPH</div>
+                    </div>
+                </div>
+                <div class="as-accel-bar">
+                    <div class="as-accel-decel"></div>
+                    <div class="as-accel-center"></div>
+                    <div class="as-accel-accel"></div>
+                    <div class="as-accel-needle" id="as-accel-needle"></div>
+                </div>
+                <div class="as-accel-label" id="as-accel-label">COAST</div>
+                <div class="as-limits" id="as-limits"></div>
+            </div>
+            <!-- Stop sign -->
+            <div class="dash-card stop-sign-indicator" id="stop-sign-indicator" hidden>
+                <div class="ss-icon">&#x1F6D1;</div>
+                <div class="ss-info">
+                    <div class="ss-state" id="ss-state">CLEAR</div>
+                    <div class="ss-detail" id="ss-detail"></div>
+                    <div class="ss-conf" id="ss-conf"></div>
+                </div>
             </div>
         </div>
-        <div class="pedal-stack" id="pedal-stack" aria-hidden="true"></div>
+        <!-- Cam grid -->
+        <div class="dash-center">
+            <div class="cam-grid" id="cam-grid">
+                <div class="cam-tile" data-cam="live_1"><img alt="" /><div class="cam-label">Camera 1</div><div class="cam-badge">—</div></div>
+                <div class="cam-tile" data-cam="live_2"><img alt="" /><div class="cam-label">Camera 2</div><div class="cam-badge">—</div></div>
+                <div class="cam-tile" data-cam="live_3"><img alt="" /><div class="cam-label">Camera 3</div><div class="cam-badge">—</div></div>
+                <div class="cam-tile" data-cam="live_4"><img alt="" /><div class="cam-label">Camera 4</div><div class="cam-badge">—</div></div>
+                <div class="cam-tile" data-cam="live_5"><img alt="" /><div class="cam-label">Camera 5</div><div class="cam-badge">—</div></div>
+                <div class="cam-tile" data-cam="live_6"><img alt="" /><div class="cam-label">Camera 6</div><div class="cam-badge">—</div></div>
+                <div class="cam-tile model-raw-tile" data-cam="front" style="display:none"><img alt="" /><div class="cam-label">Front Center</div><div class="cam-badge">—</div></div>
+                <div class="cam-tile viz-tile" data-cam="lanes"><img alt="" /><div class="cam-label">Lanes</div><div class="cam-pending">model loading…</div></div>
+                <div class="cam-tile viz-tile" data-cam="depth"><img alt="" /><div class="cam-label">Depth</div><div class="cam-pending">model loading…</div></div>
+                <div class="cam-tile viz-tile" data-cam="objects"><img alt="" /><div class="cam-label">Objects + Futures</div><div class="cam-pending">model loading…</div></div>
+                <div class="cam-tile viz-tile" data-cam="seg"><img alt="" /><div class="cam-label">Segmentation</div><div class="cam-pending">model loading…</div></div>
+                <div class="cam-tile viz-tile" data-cam="bev"><img alt="" /><div class="cam-label">BEV Planner</div><div class="cam-pending">awaiting prediction…</div></div>
+            </div>
+        </div>
+        <!-- Right column: steering/pedal controls -->
+        <div class="dash-right">
+            <div class="control-stack" id="control-stack">
+        <div class="control-row">
+            <div class="control-label">Predicted</div>
+            <div class="steering-widget">
+                <svg class="wheel-svg" viewBox="0 0 100 100" aria-hidden="true">
+                    <g id="wheel-rotate" class="wheel-rotate">
+                        <circle cx="50" cy="50" r="40" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                        <circle cx="50" cy="50" r="10.5" fill="none" stroke="currentColor" stroke-width="3"/>
+                        <line x1="11" y1="50" x2="39" y2="50" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                        <line x1="61" y1="50" x2="89" y2="50" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                        <line x1="50" y1="61" x2="50" y2="89" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                    </g>
+                </svg>
+                <div class="steering-readouts">
+                    <span class="steering-angle" id="steer-angle">0°</span>
+                    <span class="model-steering-angle" id="model-steer-angle">SEG —</span>
+                </div>
+            </div>
+            <div class="pedal-widget">
+                <div class="pedal-stack" id="pedal-stack" aria-hidden="true"></div>
+                <div class="pedal-caption" id="predicted-speed-label">target — mph</div>
+            </div>
+        </div>
+        <div class="control-row ground-truth-row">
+            <div class="control-label">Recorded</div>
+            <div class="steering-widget">
+                <svg class="wheel-svg" viewBox="0 0 100 100" aria-hidden="true">
+                    <g id="gt-wheel-rotate" class="wheel-rotate">
+                        <circle cx="50" cy="50" r="40" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                        <circle cx="50" cy="50" r="10.5" fill="none" stroke="currentColor" stroke-width="3"/>
+                        <line x1="11" y1="50" x2="39" y2="50" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                        <line x1="61" y1="50" x2="89" y2="50" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                        <line x1="50" y1="61" x2="50" y2="89" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+                    </g>
+                </svg>
+                <div class="steering-readouts">
+                    <span class="steering-angle" id="gt-steer-angle">—</span>
+                    <span class="model-steering-angle ground-truth" id="gt-source-label">REC —</span>
+                </div>
+            </div>
+            <div class="pedal-widget">
+                <div class="pedal-stack" id="gt-pedal-stack" aria-hidden="true"></div>
+                <div class="pedal-caption" id="gt-speed-label">recorded — mph</div>
+            </div>
+        </div>
+        </div>
+        </div>
+        <!-- Video scrubber spans full width -->
+        <div class="dash-scrubber">
+            <div class="video-scrubber" id="video-scrubber" hidden>
+                <button class="video-play" id="video-play" type="button" aria-label="Pause video">Ⅱ</button>
+                <span class="video-time" id="video-current">0:00</span>
+                <input class="video-range" id="video-range" type="range" min="0" max="0" step="0.1" value="0" aria-label="Video position" />
+                <span class="video-time" id="video-duration">0:00</span>
+            </div>
+        </div>
     </div>
 
     <!-- Left turn signal stack -->
@@ -188,77 +271,7 @@
          caps long-lived connections at 6 per host — 8 streams + /state
          polling would push some tiles into a queued state that freezes
          them once the persistent socket eventually drops. -->
-    <div class="cam-grid" id="cam-grid">
-        <!-- Raw cameras. The badge text is overwritten in JS from
-             aw.model so the same HTML works for both autoware (AUTOWARE)
-             and alpamayo (ALPAMAYO) backends. -->
-        <div class="cam-tile" data-cam="live_1">
-            <img alt="" />
-            <div class="cam-label">Camera 1</div>
-            <div class="cam-badge">—</div>
-        </div>
-        <div class="cam-tile" data-cam="live_2">
-            <img alt="" />
-            <div class="cam-label">Camera 2</div>
-            <div class="cam-badge">—</div>
-        </div>
-        <div class="cam-tile" data-cam="live_3">
-            <img alt="" />
-            <div class="cam-label">Camera 3</div>
-            <div class="cam-badge">—</div>
-        </div>
-        <div class="cam-tile" data-cam="live_4">
-            <img alt="" />
-            <div class="cam-label">Camera 4</div>
-            <div class="cam-badge">—</div>
-        </div>
-        <div class="cam-tile" data-cam="live_5">
-            <img alt="" />
-            <div class="cam-label">Camera 5</div>
-            <div class="cam-badge">—</div>
-        </div>
-        <div class="cam-tile" data-cam="live_6">
-            <img alt="" />
-            <div class="cam-label">Camera 6</div>
-            <div class="cam-badge">—</div>
-        </div>
-        <div class="cam-tile model-raw-tile" data-cam="front" style="display:none">
-            <img alt="" />
-            <div class="cam-label">Front Center</div>
-            <div class="cam-badge">—</div>
-        </div>
-
-        <!-- Row 2: model output viz tiles. Each tile is shown only while
-             its slug appears in aw.viz_streams. Autoware publishes
-             lanes/depth/objects/seg; Alpamayo publishes bev. Tiles whose
-             slug isn't being published get display:none in JS so the
-             grid auto-collapses. -->
-        <div class="cam-tile viz-tile" data-cam="lanes">
-            <img alt="" />
-            <div class="cam-label">Lanes</div>
-            <div class="cam-pending">model loading…</div>
-        </div>
-        <div class="cam-tile viz-tile" data-cam="depth">
-            <img alt="" />
-            <div class="cam-label">Depth</div>
-            <div class="cam-pending">model loading…</div>
-        </div>
-        <div class="cam-tile viz-tile" data-cam="objects">
-            <img alt="" />
-            <div class="cam-label">Obstacles</div>
-            <div class="cam-pending">model loading…</div>
-        </div>
-        <div class="cam-tile viz-tile" data-cam="seg">
-            <img alt="" />
-            <div class="cam-label">Segmentation</div>
-            <div class="cam-pending">model loading…</div>
-        </div>
-        <div class="cam-tile viz-tile" data-cam="bev">
-            <img alt="" />
-            <div class="cam-label">BEV (Alpamayo)</div>
-            <div class="cam-pending">awaiting prediction…</div>
-        </div>
-    </div>
+    <!-- cam-grid moved into dashboard -->
 
     <!-- Quit hot-corner: mouse dwell in top-right for 1.5 s triggers exit -->
     <div class="quit-corner" id="quit-corner">
@@ -293,39 +306,189 @@
         const wheelEl = document.getElementById('wheel-rotate');
         const angleEl = document.getElementById('steer-angle');
         const modelAngleEl = document.getElementById('model-steer-angle');
+        const gtWheelEl = document.getElementById('gt-wheel-rotate');
+        const gtAngleEl = document.getElementById('gt-steer-angle');
+        const gtSourceLabel = document.getElementById('gt-source-label');
+        const predictedSpeedLabel = document.getElementById('predicted-speed-label');
+        const gtSpeedLabel = document.getElementById('gt-speed-label');
+        const videoScrubber = document.getElementById('video-scrubber');
+        const videoPlay = document.getElementById('video-play');
+        const videoRange = document.getElementById('video-range');
+        const videoCurrent = document.getElementById('video-current');
+        const videoDuration = document.getElementById('video-duration');
+        let videoDragging = false;
+        let videoPaused = false;
+        let videoWasPausedBeforeDrag = false;
+        let lastVideoSeekPostAt = 0;
+
+        function formatVideoTime(seconds) {
+            const s = Math.max(0, Number(seconds) || 0);
+            const whole = Math.floor(s);
+            const mins = Math.floor(whole / 60);
+            const secs = String(whole % 60).padStart(2, '0');
+            return `${mins}:${secs}`;
+        }
+
+        function setVideoPauseUi(paused) {
+            videoPaused = !!paused;
+            videoPlay.textContent = videoPaused ? '▶' : 'Ⅱ';
+            videoPlay.setAttribute('aria-label', videoPaused ? 'Play video' : 'Pause video');
+        }
+
+        async function postVideoControl(seekS, pause, force = false) {
+            const now = performance.now();
+            if (!force && now - lastVideoSeekPostAt < 120) return;
+            lastVideoSeekPostAt = now;
+            try {
+                await fetch('/offline-video-control', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ seek_s: seekS, pause }),
+                });
+            } catch (_) {}
+        }
+
+        const PATH_WHEELBASE_M = 0.8;
+        const PATH_STEERING_COLUMN_RATIO = 15.0;
+        const PATH_STEER_GAIN = 1.6;
+        const PATH_STEER_FIT_MIN_M = 1.0;
+        const PATH_STEER_FIT_MAX_M = 10.0;
+
+        function clamp(v, lo, hi) {
+            return Math.max(lo, Math.min(hi, v));
+        }
+
+        function smoothPathPoints(points, win = 5) {
+            if (points.length < win) return points;
+            const half = Math.floor(win / 2);
+            return points.map((_, i) => {
+                let sx = 0;
+                let sy = 0;
+                for (let k = 0; k < win; k++) {
+                    const idx = clamp(i + k - half, 0, points.length - 1);
+                    sx += points[idx][0];
+                    sy += points[idx][1];
+                }
+                return [sx / win, sy / win];
+            });
+        }
+
+        function lookaheadPointFromPath(points, lookaheadM) {
+            const target = clamp(Number(lookaheadM) || 2.5, 1.0, 10.0);
+            let prev = [0, 0];
+            let traveled = 0;
+            for (const cur of points) {
+                const seg = Math.hypot(cur[0] - prev[0], cur[1] - prev[1]);
+                if (traveled + seg >= target && seg > 1e-6) {
+                    const t = (target - traveled) / seg;
+                    return [
+                        prev[0] + t * (cur[0] - prev[0]),
+                        prev[1] + t * (cur[1] - prev[1]),
+                    ];
+                }
+                traveled += seg;
+                prev = cur;
+            }
+            return points.length ? points[points.length - 1] : null;
+        }
+
+        function wheelDegFromDisplayedPath(path, lookaheadM) {
+            if (!Array.isArray(path) || path.length < 2) return null;
+            let points = path
+                .map(p => [Number(p && p[0]), Number(p && p[1])])
+                .filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1])
+                    && p[0] > PATH_STEER_FIT_MIN_M && p[0] < PATH_STEER_FIT_MAX_M);
+            if (points.length < 2) return null;
+            points = smoothPathPoints(points, 5);
+            const p = lookaheadPointFromPath(points, lookaheadM);
+            if (!p) return null;
+            const ld = Math.hypot(p[0], p[1]);
+            if (ld < 1e-3) return null;
+            const alpha = Math.atan2(p[1], p[0]);
+            const delta = Math.atan2(2.0 * PATH_WHEELBASE_M * Math.sin(alpha), ld);
+            const columnDeg = delta * 180 / Math.PI
+                * PATH_STEERING_COLUMN_RATIO * PATH_STEER_GAIN;
+            return clamp(columnDeg, -270.0, 270.0);
+        }
+
+        function updateVideoScrubber(aw) {
+            const video = aw.video || {};
+            const duration = Number(video.duration_s) || 0;
+            const scrubbable = !!video.scrubbable && duration > 0;
+            videoScrubber.hidden = !scrubbable;
+            if (!scrubbable) return;
+
+            const pos = Math.max(0, Math.min(duration, Number(video.position_s) || 0));
+            videoRange.max = duration.toFixed(1);
+            videoDuration.textContent = formatVideoTime(duration);
+            if (!videoDragging) {
+                videoRange.value = pos.toFixed(1);
+                videoCurrent.textContent = formatVideoTime(pos);
+                setVideoPauseUi(!!video.paused);
+            }
+        }
+
+        videoPlay.addEventListener('click', () => {
+            const seekS = Number(videoRange.value) || 0;
+            const nextPaused = !videoPaused;
+            setVideoPauseUi(nextPaused);
+            postVideoControl(seekS, nextPaused, true);
+        });
+        videoRange.addEventListener('pointerdown', () => {
+            videoDragging = true;
+            videoWasPausedBeforeDrag = videoPaused;
+            postVideoControl(Number(videoRange.value) || 0, true, true);
+        });
+        videoRange.addEventListener('input', () => {
+            if (!videoDragging) return;
+            const seekS = Number(videoRange.value) || 0;
+            videoCurrent.textContent = formatVideoTime(seekS);
+            postVideoControl(seekS, true);
+        });
+        function finishVideoDrag() {
+            if (!videoDragging) return;
+            videoDragging = false;
+            const seekS = Number(videoRange.value) || 0;
+            videoCurrent.textContent = formatVideoTime(seekS);
+            postVideoControl(seekS, videoWasPausedBeforeDrag, true);
+        }
+        videoRange.addEventListener('pointerup', finishVideoDrag);
+        videoRange.addEventListener('change', finishVideoDrag);
 
         // Pedal stack: 10 gas dashes (top) + 10 brake dashes (bottom). Dashes
         // closest to the center light up first, extending outward as the
         // driver presses harder — the center stays quiet when idle.
         const PEDAL_COUNT = 10;
-        const stackEl = document.getElementById('pedal-stack');
-        const gasDashes = [];
-        const brakeDashes = [];
-        for (let i = 0; i < PEDAL_COUNT; i++) {
-            const d = document.createElement('div');
-            d.className = 'pedal-dash gas';
-            stackEl.appendChild(d);
-            gasDashes.push(d);  // index 0 = top (max gas)
+        function buildPedalStack(stackEl) {
+            const gasDashes = [];
+            const brakeDashes = [];
+            for (let i = 0; i < PEDAL_COUNT; i++) {
+                const d = document.createElement('div');
+                d.className = 'pedal-dash gas';
+                stackEl.appendChild(d);
+                gasDashes.push(d);
+            }
+            for (let i = 0; i < PEDAL_COUNT; i++) {
+                const d = document.createElement('div');
+                d.className = 'pedal-dash brake';
+                stackEl.appendChild(d);
+                brakeDashes.push(d);
+            }
+            return { gasDashes, brakeDashes };
         }
-        for (let i = 0; i < PEDAL_COUNT; i++) {
-            const d = document.createElement('div');
-            d.className = 'pedal-dash brake';
-            stackEl.appendChild(d);
-            brakeDashes.push(d);  // index 0 = just below center, last = bottom
-        }
+        const predictedPedals = buildPedalStack(document.getElementById('pedal-stack'));
+        const gtPedals = buildPedalStack(document.getElementById('gt-pedal-stack'));
 
-        function updatePedalStack(gasFrac, brakeFrac) {
+        function updatePedalStack(stack, gasFrac, brakeFrac) {
             const gasLit = Math.round(gasFrac * PEDAL_COUNT);
             const brakeLit = Math.round(brakeFrac * PEDAL_COUNT);
             const gasEdge = gasLit > 0 ? PEDAL_COUNT - gasLit : -1;
             const brakeEdge = brakeLit > 0 ? brakeLit - 1 : -1;
             for (let i = 0; i < PEDAL_COUNT; i++) {
-                // gasDashes[0] is at the top = last to light up.
-                gasDashes[i].classList.toggle('active', i >= PEDAL_COUNT - gasLit);
-                gasDashes[i].classList.toggle('edge', i === gasEdge);
-                // brakeDashes[0] is just below center = first to light up.
-                brakeDashes[i].classList.toggle('active', i < brakeLit);
-                brakeDashes[i].classList.toggle('edge', i === brakeEdge);
+                stack.gasDashes[i].classList.toggle('active', i >= PEDAL_COUNT - gasLit);
+                stack.gasDashes[i].classList.toggle('edge', i === gasEdge);
+                stack.brakeDashes[i].classList.toggle('active', i < brakeLit);
+                stack.brakeDashes[i].classList.toggle('edge', i === brakeEdge);
             }
         }
 
@@ -365,6 +528,7 @@
         const statRegion = document.getElementById('stat-region');
         const reasoningPanel = document.getElementById('model-reasoning');
         const reasoningText  = document.getElementById('mr-text');
+        const camGrid = document.getElementById('cam-grid');
         const camTiles = {};
         const vizTiles = [];
         // Camera tiles (front_*) get their badge text overwritten from
@@ -383,106 +547,119 @@
         // sockets, so Firefox's per-host connection cap (6) doesn't choke
         // us with 8 simultaneous streams. The cache-buster on `t` keeps the
         // browser from serving a stale image from disk cache.
-        // Refresh rate matches the model sidecar's JPEG publish cadence
-        // (~15 Hz) so the browser shows every useful frame without polling
-        // far faster than new images are produced.
-        const FRAME_REFRESH_MS = Math.round(1000 / 15);
-        const renderedFrameLoaded = {};
-        const renderedFrameChanged = {};
-        const renderedFrameLastSrc = {};
-        const renderedFrameLastHash = {};
-        const frameHashCanvas = document.createElement('canvas');
-        const frameHashCtx = frameHashCanvas.getContext('2d', { willReadFrequently: true });
-        frameHashCanvas.width = 32;
-        frameHashCanvas.height = 18;
-        function renderedImageHash(img) {
-            if (!frameHashCtx || !img.naturalWidth || !img.naturalHeight) return null;
-            frameHashCtx.drawImage(img, 0, 0, frameHashCanvas.width, frameHashCanvas.height);
-            const data = frameHashCtx.getImageData(0, 0, frameHashCanvas.width, frameHashCanvas.height).data;
-            let h = 2166136261;
-            for (let i = 0; i < data.length; i += 4) {
-                h ^= data[i];
-                h = Math.imul(h, 16777619);
-                h ^= data[i + 1];
-                h = Math.imul(h, 16777619);
-                h ^= data[i + 2];
-                h = Math.imul(h, 16777619);
-            }
-            return h >>> 0;
+        // Keep snapshot polling near the remote-inference cadence so the
+        // browser does not burn CPU fetching duplicate frames.
+        const FRAME_REFRESH_MS = 66;
+
+        // ===== Tile refresh instrumentation =====
+        // Track every stage: request issued → load fired → content actually changed
+        const tileStats = {};
+        for (const slug in camTiles) {
+            tileStats[slug] = {
+                requested: 0,     // how many times we set img.src
+                loaded: 0,        // how many 'load' events fired
+                errors: 0,        // how many 'error' events fired
+                pending: 0,       // currently in-flight (requested but no load/error yet)
+                lastLoadAt: 0,    // perf timestamp of last load
+                lastRequestAt: 0, // perf timestamp of last request
+                avgLoadMs: 0,     // rolling avg of request→load latency
+            };
         }
+
+        // Wire up load/error listeners
         for (const [slug, el] of Object.entries(camTiles)) {
             const img = el.querySelector('img');
             if (!img) continue;
-            renderedFrameLoaded[slug] = 0;
-            renderedFrameChanged[slug] = 0;
+            const st = tileStats[slug];
             img.addEventListener('load', () => {
-                const src = img.currentSrc || img.src || '';
-                if (src && renderedFrameLastSrc[slug] !== src) {
-                    renderedFrameLastSrc[slug] = src;
-                    renderedFrameLoaded[slug] = (renderedFrameLoaded[slug] || 0) + 1;
+                st.loaded++;
+                st.pending = Math.max(0, st.pending - 1);
+                const now = performance.now();
+                if (st.lastRequestAt > 0) {
+                    const lat = now - st.lastRequestAt;
+                    st.avgLoadMs = st.avgLoadMs ? st.avgLoadMs * 0.8 + lat * 0.2 : lat;
                 }
-                try {
-                    const hash = renderedImageHash(img);
-                    if (hash != null && renderedFrameLastHash[slug] !== hash) {
-                        renderedFrameLastHash[slug] = hash;
-                        renderedFrameChanged[slug] = (renderedFrameChanged[slug] || 0) + 1;
-                    }
-                } catch (err) {
-                    console.warn('[frames] hash failed', slug, err);
-                }
+                st.lastLoadAt = now;
+            });
+            img.addEventListener('error', () => {
+                st.errors++;
+                st.pending = Math.max(0, st.pending - 1);
             });
         }
+
+        // On-screen FPS HUD
+        const fpsHud = document.createElement('div');
+        fpsHud.id = 'tile-fps-hud';
+        fpsHud.style.cssText = 'position:fixed;top:80px;left:12px;z-index:9999;' +
+            'background:rgba(0,0,0,0.85);color:#0f0;font:bold 11px/1.5 monospace;' +
+            'padding:8px 12px;border-radius:8px;pointer-events:none;white-space:pre;';
+        document.body.appendChild(fpsHud);
+
+        // Snapshot counters every second for the HUD
+        let prevStats = {};
+        let refreshCallCount = 0;
         setInterval(() => {
+            const lines = [];
             const visibleSlugs = Object.keys(camTiles)
-                .filter(slug => {
-                    const el = camTiles[slug];
-                    return el && el.style.display !== 'none';
-                });
-            const loaded = {};
-            const changed = {};
+                .filter(s => camTiles[s] && camTiles[s].style.display !== 'none'
+                    && (!camTiles[s].classList.contains('viz-tile') || camTiles[s].classList.contains('viz-ready')));
+            let totalReq = 0, totalLoad = 0, totalErr = 0;
             for (const slug of visibleSlugs) {
-                loaded[slug] = renderedFrameLoaded[slug] || 0;
-                changed[slug] = renderedFrameChanged[slug] || 0;
+                const st = tileStats[slug];
+                const prev = prevStats[slug] || { requested: 0, loaded: 0, errors: 0 };
+                const req = st.requested - prev.requested;
+                const ld = st.loaded - prev.loaded;
+                const er = st.errors - prev.errors;
+                totalReq += req;
+                totalLoad += ld;
+                totalErr += er;
+                lines.push(
+                    `${slug.padEnd(8)} req=${String(req).padStart(3)} ` +
+                    `load=${String(ld).padStart(3)} err=${er} ` +
+                    `pend=${st.pending} lat=${st.avgLoadMs.toFixed(0)}ms`
+                );
             }
-            const loadedTotal = Object.values(loaded).reduce((sum, count) => sum + count, 0);
-            const changedTotal = Object.values(changed).reduce((sum, count) => sum + count, 0);
-            console.log(
-                `[frames] rendered_last_1s loaded_total=${loadedTotal} ` +
-                `changed_total=${changedTotal} loaded=${JSON.stringify(loaded)} ` +
-                `changed=${JSON.stringify(changed)}`
+            lines.unshift(
+                `TILE FPS  req/s=${totalReq} load/s=${totalLoad} err/s=${totalErr} ` +
+                `refresh_calls=${refreshCallCount}`
             );
-            fetch('/browser-log', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    event: 'frames_last_1s',
-                    visible: visibleSlugs,
-                    loaded,
-                    changed,
-                }),
-            }).catch(() => {});
-            for (const slug in renderedFrameLoaded) renderedFrameLoaded[slug] = 0;
-            for (const slug in renderedFrameChanged) renderedFrameChanged[slug] = 0;
+            refreshCallCount = 0;
+            fpsHud.textContent = lines.join('\n');
+            console.log('[tile-fps] ' + lines.join(' | '));
+            // snapshot
+            prevStats = {};
+            for (const slug in tileStats) {
+                const st = tileStats[slug];
+                prevStats[slug] = { requested: st.requested, loaded: st.loaded, errors: st.errors };
+            }
         }, 1000);
-        function refreshTiles() {
+
+        let lastTileRefreshAt = 0;
+        function refreshTiles(force = false) {
+            const now = performance.now();
+            if (!force && now - lastTileRefreshAt < FRAME_REFRESH_MS) {
+                return;
+            }
+            lastTileRefreshAt = now;
+            refreshCallCount++;
             const t = Date.now();
             for (const slug in camTiles) {
                 const el = camTiles[slug];
-                if (el.style.display === 'none') {
-                    continue;
-                }
-                // Skip viz tiles that haven't been declared ready —
-                // requesting a non-existent /cam/lanes.jpg returns 404 and
-                // would just fill the console with noise.
-                if (el.classList.contains('viz-tile')
-                        && !el.classList.contains('viz-ready')) {
-                    continue;
-                }
+                if (el.style.display === 'none') continue;
+                if (el.classList.contains('viz-tile') && !el.classList.contains('viz-ready')) continue;
+                const st = tileStats[slug];
+                // Don't pile up requests if prior ones haven't returned
+                if (st.pending >= 2) continue;
                 const img = el.querySelector('img');
-                if (img) img.src = `/cam/${slug}.jpg?t=${t}`;
+                if (img) {
+                    st.requested++;
+                    st.pending++;
+                    st.lastRequestAt = now;
+                    img.src = `/cam/${slug}.jpg?t=${t}`;
+                }
             }
         }
-        refreshTiles();
+        refreshTiles(true);
         setInterval(refreshTiles, FRAME_REFRESH_MS);
 
         function updateAutoware(s) {
@@ -522,6 +699,8 @@
                 if (b) b.textContent = badgeText;
             }
             const segmentationMode = model === 'segmentation';
+            document.body.classList.toggle('segmentation-grid', segmentationMode);
+            if (camGrid) camGrid.classList.toggle('segmentation-grid', segmentationMode);
             for (const slug of ['live_1', 'live_2', 'live_3', 'live_4', 'live_5', 'live_6']) {
                 const el = camTiles[slug];
                 if (el) el.style.display = segmentationMode ? 'none' : '';
@@ -530,11 +709,8 @@
                 camTiles.front.style.display = segmentationMode ? '' : 'none';
             }
 
-            // Camera tile sizing follows drive mode: full-size only while
-            // the model is actively steering, compact in every other state.
-            document.body.classList.toggle('compact-cams', !engaged);
+            document.body.classList.remove('compact-cams');
 
-            // Angle shown is what the active model currently predicts.
             if (running && aw.inference) {
                 const d = Number(aw.steer_deg) || 0;
                 awAngle.textContent = `${d >= 0 ? '+' : ''}${d.toFixed(0)}°`;
@@ -554,9 +730,10 @@
                 ? Number(seg.clrnet_conf_threshold) : 0.40;
             const bestConf = confs.length ? Math.max(...confs) : null;
             const lanesAbove = Number(seg.clrnet_lanes_above_threshold) || 0;
+            const hasClrnet = !!seg.clrnet_enabled || (seg.clrnet_lanes > 0);
             const showLaneConfidence = running
                 && model === 'segmentation'
-                && !!seg.clrnet_enabled;
+                && hasClrnet;
             laneConfidence.hidden = !showLaneConfidence;
             if (showLaneConfidence) {
                 const ok = bestConf != null && bestConf >= confThreshold && lanesAbove > 0;
@@ -587,11 +764,13 @@
             // the rest so the grid doesn't sit forever on "model loading…".
             const live = new Set(aw.viz_streams || []);
             const vizLive = !!aw.viz;
+            window.__showLanesTexture = running && vizLive && live.has('lanes');
             for (const el of vizTiles) {
                 const inUse = vizLive && live.has(el.dataset.cam);
                 el.style.display = inUse ? '' : 'none';
                 el.classList.toggle('viz-ready', inUse);
             }
+            refreshTiles();
 
             // Recolor the 3D predicted path: gold while the model owns the
             // wheel, blue otherwise.
@@ -665,6 +844,68 @@
             }
         }
 
+        const autospeedPanel = document.getElementById('autospeed-panel');
+        const asCmdSpeed = document.getElementById('as-cmd-speed');
+        const asMaxSpeed = document.getElementById('as-max-speed');
+        const asEmergency = document.getElementById('as-emergency');
+        const asAccelNeedle = document.getElementById('as-accel-needle');
+        const asAccelLabel = document.getElementById('as-accel-label');
+        const asLimits = document.getElementById('as-limits');
+
+        function updateAutospeedPanel(aw) {
+            const as = aw.autospeed || {};
+            const running = !!aw.running && !!aw.inference;
+            const segMode = (aw.model || '').toLowerCase() === 'segmentation';
+            const show = running && segMode && as.commanded_speed_mph !== undefined;
+            autospeedPanel.hidden = !show;
+            if (!show) return;
+
+            const cmdMph = Number(as.commanded_speed_mph) || 0;
+            const maxMph = Number(as.max_speed_mph) || 0;
+            asCmdSpeed.textContent = cmdMph.toFixed(1);
+            asMaxSpeed.textContent = maxMph.toFixed(1);
+
+            const emergency = !!as.emergency_active;
+            asEmergency.hidden = !emergency;
+            autospeedPanel.classList.toggle('emergency', emergency);
+
+            const accel = Number(as.desired_accel) || 0;
+            // Map accel to needle position: -3.5..+1.2 -> 0%..100%
+            const range = 4.7;
+            const pct = clamp(((accel + 3.5) / range) * 100, 2, 98);
+            asAccelNeedle.style.left = `${pct}%`;
+
+            if (emergency) {
+                asAccelLabel.textContent = 'EMERGENCY STOP';
+                asAccelLabel.className = 'as-accel-label emergency';
+            } else if (accel < -0.3) {
+                asAccelLabel.textContent = `DECEL ${accel.toFixed(1)} m/s²`;
+                asAccelLabel.className = 'as-accel-label decel';
+            } else if (accel > 0.3) {
+                asAccelLabel.textContent = `ACCEL ${accel.toFixed(1)} m/s²`;
+                asAccelLabel.className = 'as-accel-label accel';
+            } else {
+                asAccelLabel.textContent = 'COAST';
+                asAccelLabel.className = 'as-accel-label coast';
+            }
+
+            const limits = as.speed_limits || [];
+            let html = '';
+            for (const lim of limits.slice(0, 4)) {
+                const isMostLimiting = as.most_limiting
+                    && as.most_limiting.track_id === lim.track_id
+                    && as.most_limiting.distance_m === lim.distance_m;
+                const cls = isMostLimiting ? 'as-limit most-limiting' : 'as-limit';
+                html += `<div class="${cls}">` +
+                    `<span class="as-lim-speed">${Number(lim.speed_mph).toFixed(1)}</span>` +
+                    `<span class="as-lim-class">${lim.obstacle_class || '?'}</span>` +
+                    `<span class="as-lim-dist">${Number(lim.distance_m).toFixed(1)}m</span>` +
+                    `<span class="as-lim-lat">${Number(lim.lateral_offset_m).toFixed(1)}m lat</span>` +
+                    `</div>`;
+            }
+            asLimits.innerHTML = html;
+        }
+
         async function pollState() {
             try {
                 const r = await fetch('/state', { cache: 'no-store' });
@@ -677,15 +918,25 @@
                 window.__mph = mph;
 
                 const steerDeg = Number(s.steer_deg) || 0;
-                wheelEl.style.transform = `rotate(${steerDeg}deg)`;
-                angleEl.textContent = `${steerDeg >= 0 ? '+' : ''}${steerDeg.toFixed(0)}°`;
+                const aw0 = s.autoware || {};
+                const segmentationActive = aw0.running
+                    && aw0.inference
+                    && (aw0.model || '').toLowerCase() === 'segmentation';
+                // Use the actual commanded steering angle (after pure-pursuit,
+                // sign flip, GPS bias, and EMA smoothing) — this is what the
+                // cart would actually steer. Previously re-derived from the
+                // displayed path which skipped EMA/bias and looked off.
+                const predictedWheelDeg = segmentationActive
+                    ? (Number(aw0.steer_deg) || 0)
+                    : steerDeg;
+                wheelEl.style.transform = `rotate(${predictedWheelDeg}deg)`;
+                angleEl.textContent = `${predictedWheelDeg >= 0 ? '+' : ''}${predictedWheelDeg.toFixed(0)}°`;
                 // Published for scene.js to bend the predicted path. When
                 // autoware is producing predictions, use the model's raw
                 // argmax (no autoware-side EMA, no ps5_drive gain/sign,
                 // no client-side smoothing) so the yellow strips track
                 // the model output exactly. Falls back to the commanded
                 // wheel angle in plain PS5 mode where autoware is off.
-                const aw0 = s.autoware || {};
                 if (aw0.running && aw0.inference) {
                     window.__steerDeg = Number(aw0.steer_deg_raw) || 0;
                 } else {
@@ -707,13 +958,20 @@
                 }
                 if (aw0.running && aw0.inference
                         && (aw0.model || '').toLowerCase() === 'segmentation') {
-                    const targetDeg = Number.isFinite(Number(s.auto_steer_cmd_deg))
-                        ? Number(s.auto_steer_cmd_deg)
-                        : (Number(aw0.steer_deg) || 0);
-                    modelAngleEl.textContent = `SEG ${targetDeg >= 0 ? '+' : ''}${targetDeg.toFixed(0)}°`;
+                    const cmdDeg = Number(aw0.steer_deg) || 0;
+                    const seg = aw0.segmentation || {};
+                    const clrOverride = !!seg.clrnet_override;
+                    const srcLabel = clrOverride ? 'CLR' : 'SEG';
+                    const clrConf = seg.clrnet_conf_threshold || 0.40;
+                    modelAngleEl.textContent = `${srcLabel} ${cmdDeg >= 0 ? '+' : ''}${cmdDeg.toFixed(0)}°`;
+                    modelAngleEl.className = 'model-steering-angle' + (clrOverride ? ' clrnet-active' : '');
                     modelAngleEl.hidden = false;
+                    modelAngleEl.title = clrOverride
+                        ? `CLRNet override (min conf ${clrConf})`
+                        : `Segmentation steering (CLRNet min conf ${clrConf})`;
                 } else {
                     modelAngleEl.textContent = 'SEG —';
+                    modelAngleEl.className = 'model-steering-angle';
                     modelAngleEl.hidden = true;
                 }
                 // Hand the alpamayo trajectory (if any) to scene.js so
@@ -730,10 +988,40 @@
                     window.__predictedPathInvertX = false;
                 }
 
-                updatePedalStack(
-                    Math.max(0, Math.min(1, Number(s.gas_frac) || 0)),
-                    Math.max(0, Math.min(1, Number(s.brake_frac) || 0)),
-                );
+                const predGas = Math.max(0, Math.min(1, Number(aw0.target_gas) || 0));
+                const predBrake = Math.max(0, Math.min(1, Number(aw0.target_brake) || 0));
+                updatePedalStack(predictedPedals, predGas, predBrake);
+                const targetMph = Number(aw0.target_speed_mph) || 0;
+                const collisionMph = Number.isFinite(Number(aw0.collision_speed_mph))
+                    ? Number(aw0.collision_speed_mph) : targetMph;
+                const autospeed = aw0.autospeed || {};
+                const cmdSpeedMph = Number(autospeed.commanded_speed_mph) || 0;
+                const maxSpeedMph = Number(autospeed.max_speed_mph) || targetMph;
+                predictedSpeedLabel.textContent =
+                    `autospeed ${cmdSpeedMph.toFixed(1)} mph · target ${targetMph.toFixed(1)} mph`;
+                updateAutospeedPanel(aw0);
+                updateStopSign(aw0);
+
+                const gt = aw0.ground_truth_control || null;
+                if (gt) {
+                    const gtSteer = Number(gt.steer_deg) || 0;
+                    gtWheelEl.style.transform = `rotate(${gtSteer}deg)`;
+                    gtAngleEl.textContent = `${gtSteer >= 0 ? '+' : ''}${gtSteer.toFixed(0)}°`;
+                    gtSourceLabel.textContent = 'REC';
+                    updatePedalStack(
+                        gtPedals,
+                        Math.max(0, Math.min(1, Number(gt.gas_frac) || 0)),
+                        Math.max(0, Math.min(1, Number(gt.brake_frac) || 0)),
+                    );
+                    const gtMph = Number(gt.mph) || 0;
+                    gtSpeedLabel.textContent = `recorded ${gtMph.toFixed(1)} mph`;
+                } else {
+                    gtWheelEl.style.transform = 'rotate(0deg)';
+                    gtAngleEl.textContent = '—';
+                    gtSourceLabel.textContent = 'REC —';
+                    updatePedalStack(gtPedals, 0, 0);
+                    gtSpeedLabel.textContent = 'recorded — mph';
+                }
 
                 setConnected(controllerDot, s.controller_connected);
                 setConnected(motorItem, s.motor_connected);
@@ -741,6 +1029,7 @@
                 setConnected(egoItem, s.ego_connected);
                 updateEgo(s);
                 updateAutoware(s);
+                updateVideoScrubber(aw0);
                 updateTeleop(s);
             } catch (e) {
                 setConnected(controllerDot, false);
@@ -752,7 +1041,7 @@
             }
         }
         pollState();
-        setInterval(pollState, 80);
+        setInterval(pollState, 200);
 
         // ===== Ego-motion 3D mini-cube =====
         // Hand-rolled isometric viewer: viewpoint is the +X/+Y/+Z corner
@@ -979,6 +1268,106 @@
             }
             renderEgoScene();
         }
+
+        // ===== Stop sign indicator =====
+        const ssIndicator = document.getElementById('stop-sign-indicator');
+        const ssState = document.getElementById('ss-state');
+        const ssDetail = document.getElementById('ss-detail');
+        const ssConf = document.getElementById('ss-conf');
+
+        function updateStopSign(aw) {
+            const ss = aw.stop_sign || {};
+            const state = ss.state || 'clear';
+            const show = state !== 'clear' && !!aw.running && !!aw.inference;
+            ssIndicator.hidden = !show;
+            if (!show) return;
+            ssIndicator.className = 'dash-card stop-sign-indicator ' + state;
+            const labels = {
+                approaching: 'APPROACHING',
+                stopped: 'STOPPED',
+                departing: 'DEPARTING',
+            };
+            ssState.textContent = labels[state] || state.toUpperCase();
+            if (state === 'approaching') {
+                const d = Number(ss.stop_target_m) || 0;
+                ssDetail.textContent = d.toFixed(1) + 'm to stop';
+            } else if (state === 'stopped') {
+                const w = ss.wait_remaining_s;
+                ssDetail.textContent = w != null ? w.toFixed(1) + 's remaining' : 'waiting...';
+            } else if (state === 'departing') {
+                ssDetail.textContent = 'resuming...';
+            } else {
+                ssDetail.textContent = '';
+            }
+            const minConf = ss.min_confidence;
+            const curConf = ss.curr_confidence;
+            if (minConf != null) {
+                const curStr = curConf != null ? curConf.toFixed(2) : '—';
+                ssConf.textContent = `conf ${curStr} / min ${minConf.toFixed(2)}`;
+            } else {
+                ssConf.textContent = '';
+            }
+        }
+    </script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script>
+        // ===== Mini-map =====
+        const miniMap = L.map('mini-map', {
+            zoomControl: false,
+            attributionControl: false,
+            dragging: false,
+            scrollWheelZoom: false,
+            doubleClickZoom: false,
+            boxZoom: false,
+            keyboard: false,
+            touchZoom: false,
+        }).setView([37.4275, -122.1697], 19);
+        const mbTile = L.tileLayer('/mbtile/{z}/{x}/{y}', {
+            maxZoom: 20, tileSize: 512, zoomOffset: -1,
+        });
+        const osmTile = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+        });
+        // Use Mapbox if token is configured, otherwise fall back to OSM
+        fetch('/mbtile/17/20966/50714').then(r => {
+            (r.ok ? mbTile : osmTile).addTo(miniMap);
+        }).catch(() => osmTile.addTo(miniMap));
+        const miniIcon = L.divIcon({
+            className: 'mini-ego-marker',
+            iconSize: [14, 14],
+        });
+        const miniMarker = L.marker([37.4275, -122.1697], { icon: miniIcon }).addTo(miniMap);
+        const miniNoGps = document.getElementById('mini-map-no-gps');
+        const miniLabel = document.getElementById('mini-map-label');
+        let miniFirstFix = true;
+        let miniHadFix = false;
+
+        async function pollMiniMap() {
+            try {
+                const r = await fetch('/gps', { cache: 'no-store' });
+                const d = await r.json();
+                if (d.has_fix && d.lat != null && d.lon != null) {
+                    const ll = [d.lat, d.lon];
+                    miniMarker.setLatLng(ll);
+                    miniMap.panTo(ll, { animate: !miniFirstFix, duration: 0.25 });
+                    if (miniFirstFix) { miniMap.setView(ll, 19); miniFirstFix = false; }
+                    miniNoGps.hidden = true;
+                    miniLabel.textContent = 'LIVE MAP';
+                    miniHadFix = true;
+                } else if (!miniHadFix) {
+                    miniNoGps.hidden = false;
+                    miniLabel.textContent = 'MAP · OFFLINE';
+                }
+            } catch (e) {
+                if (!miniHadFix) {
+                    miniNoGps.hidden = false;
+                    miniLabel.textContent = 'MAP · OFFLINE';
+                }
+            }
+        }
+        pollMiniMap();
+        setInterval(pollMiniMap, 1000);
     </script>
 </body>
 </html>

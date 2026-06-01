@@ -8,6 +8,9 @@ AUTOWARE_STATE_FILE="/tmp/autoware_state.json"
 EGO_STATE_FILE="/tmp/ego_state.json"
 GPS_STATE_FILE="/tmp/gps_state.json"
 FRAMES_DIR="/tmp/cart_frames"
+VIDEO_CONTROL_FILE="/tmp/video_control.json"
+OBJECT_PREDICTOR_URL=""
+OBJECT_PREDICTOR_PID=""
 
 # --mockspeed=N (or --mockspeed N) short-circuits the real PS5/Arduino/ODrive
 # stack and runs scripts/mock_state.py instead, so the UI animates (lane
@@ -22,6 +25,7 @@ AUTOSTEER=""
 VIDEO=""
 NO_LOOP=""
 DRY_RUN=""
+OFFLINE=""
 # AutoSteer / EgoLanes were trained on a ~30° forward-narrow view. Default
 # the front_narrow center-crop to 30° so the model gets the FOV it likes;
 # pass --narrow-fov-deg 0 (or any value >= source) to opt out.
@@ -42,6 +46,30 @@ SEGMENTATION_MPH="8"
 SEGMENTATION_CAMERA_SLOT="${SEGMENTATION_CAMERA_SLOT:-CAM_FRONT}"
 SEGMENTATION_CAMERA_INDEX="${SEGMENTATION_CAMERA_INDEX:-}"
 SEGMENTATION_WITH_CLRNET=""
+SEGMENTATION_CLRNET_CACHE="${SEGMENTATION_CLRNET_CACHE:-}"
+SEGMENTATION_REMOTE_MODAL="${SEGMENTATION_REMOTE_MODAL:-}"
+SEGMENTATION_MODAL_APP_NAME="${SEGMENTATION_MODAL_APP_NAME:-caddy-segformer-remote}"
+SEGMENTATION_MODAL_FUNCTION_NAME="${SEGMENTATION_MODAL_FUNCTION_NAME:-segment_jpeg}"
+SEGMENTATION_PUBLISH_HZ="${SEGMENTATION_PUBLISH_HZ:-}"
+SEGMENTATION_INFER_HZ="${SEGMENTATION_INFER_HZ:-}"
+SEGMENTATION_CACHE_META="${SEGMENTATION_CACHE_META:-}"
+SEGMENTATION_YOLO_CACHE="${SEGMENTATION_YOLO_CACHE:-}"
+SEGMENTATION_YOLO_MIN_CONF="${SEGMENTATION_YOLO_MIN_CONF:-0.20}"
+SEGMENTATION_OBJECT_PREDICTOR_URL="${SEGMENTATION_OBJECT_PREDICTOR_URL:-}"
+SEGMENTATION_OBJECT_PREDICTOR_TIMEOUT_MS="${SEGMENTATION_OBJECT_PREDICTOR_TIMEOUT_MS:-250}"
+SEGMENTATION_WITH_SOCIAL_STGCNN="${SEGMENTATION_WITH_SOCIAL_STGCNN:-}"
+SOCIAL_STGCNN_HOST="${SOCIAL_STGCNN_HOST:-127.0.0.1}"
+SOCIAL_STGCNN_PORT="${SOCIAL_STGCNN_PORT:-8766}"
+SOCIAL_STGCNN_REPO="${SOCIAL_STGCNN_REPO:-$PWD/.cache/third_party/social-nce-stgcnn}"
+SOCIAL_STGCNN_CHECKPOINT_DIR="${SOCIAL_STGCNN_CHECKPOINT_DIR:-$PWD/.cache/third_party/social-nce-stgcnn/checkpoint-snce/snce-social-stgcnn-univ}"
+SOCIAL_STGCNN_DEVICE="${SOCIAL_STGCNN_DEVICE:-cpu}"
+SEGMENTATION_WITH_TRAJECTRONPP="${SEGMENTATION_WITH_TRAJECTRONPP:-}"
+TRAJECTRONPP_HOST="${TRAJECTRONPP_HOST:-127.0.0.1}"
+TRAJECTRONPP_PORT="${TRAJECTRONPP_PORT:-8765}"
+TRAJECTRONPP_REPO="${TRAJECTRONPP_REPO:-$PWD/.cache/third_party/Trajectron-plus-plus}"
+TRAJECTRONPP_MODEL_DIR="${TRAJECTRONPP_MODEL_DIR:-$PWD/.cache/third_party/Trajectron-plus-plus/experiments/nuScenes/models/int_ee_me}"
+TRAJECTRONPP_CHECKPOINT="${TRAJECTRONPP_CHECKPOINT:-12}"
+SEGMENTATION_HOMOGRAPHY_CALIB="${SEGMENTATION_HOMOGRAPHY_CALIB:-$HOME/Programming/drive-by-segmentation/camera_calibration.json}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mockspeed=*)             MOCK_SPEED="${1#*=}"; shift ;;
@@ -51,6 +79,7 @@ while [[ $# -gt 0 ]]; do
         --video)                   VIDEO="$2"; shift 2 ;;
         --no-loop)                 NO_LOOP=1; shift ;;
         --dry-run)                 DRY_RUN=1; shift ;;
+        --offline|--ofline)        OFFLINE=1; shift ;;
         --narrow-fov-deg=*)        NARROW_FOV_DEG="${1#*=}"; shift ;;
         --narrow-fov-deg)          NARROW_FOV_DEG="$2"; shift 2 ;;
         --narrow-source-fov-deg=*) NARROW_SOURCE_FOV_DEG="${1#*=}"; shift ;;
@@ -62,6 +91,41 @@ while [[ $# -gt 0 ]]; do
         --mph=*)                   SEGMENTATION_MPH="${1#*=}"; shift ;;
         --mph)                     SEGMENTATION_MPH="$2"; shift 2 ;;
         --with-clrnet)             SEGMENTATION_WITH_CLRNET=1; shift ;;
+        --clrnet-cache=*)          SEGMENTATION_CLRNET_CACHE="${1#*=}"; shift ;;
+        --clrnet-cache)            SEGMENTATION_CLRNET_CACHE="$2"; shift 2 ;;
+        --seg-remote-modal)        SEGMENTATION_REMOTE_MODAL=1; shift ;;
+        --seg-modal-app-name=*)    SEGMENTATION_MODAL_APP_NAME="${1#*=}"; shift ;;
+        --seg-modal-app-name)      SEGMENTATION_MODAL_APP_NAME="$2"; shift 2 ;;
+        --seg-modal-function-name=*) SEGMENTATION_MODAL_FUNCTION_NAME="${1#*=}"; shift ;;
+        --seg-modal-function-name) SEGMENTATION_MODAL_FUNCTION_NAME="$2"; shift 2 ;;
+        --seg-cache-meta=*)       SEGMENTATION_CACHE_META="${1#*=}"; shift ;;
+        --seg-cache-meta)         SEGMENTATION_CACHE_META="$2"; shift 2 ;;
+        --seg-yolo-cache=*)       SEGMENTATION_YOLO_CACHE="${1#*=}"; shift ;;
+        --seg-yolo-cache)         SEGMENTATION_YOLO_CACHE="$2"; shift 2 ;;
+        --seg-yolo-min-conf=*)    SEGMENTATION_YOLO_MIN_CONF="${1#*=}"; shift ;;
+        --seg-yolo-min-conf)      SEGMENTATION_YOLO_MIN_CONF="$2"; shift 2 ;;
+        --seg-object-predictor-url=*) SEGMENTATION_OBJECT_PREDICTOR_URL="${1#*=}"; shift ;;
+        --seg-object-predictor-url) SEGMENTATION_OBJECT_PREDICTOR_URL="$2"; shift 2 ;;
+        --seg-object-predictor-timeout-ms=*) SEGMENTATION_OBJECT_PREDICTOR_TIMEOUT_MS="${1#*=}"; shift ;;
+        --seg-object-predictor-timeout-ms) SEGMENTATION_OBJECT_PREDICTOR_TIMEOUT_MS="$2"; shift 2 ;;
+        --with-social-stgcnn)     SEGMENTATION_WITH_SOCIAL_STGCNN=1; shift ;;
+        --social-stgcnn-repo=*)   SOCIAL_STGCNN_REPO="${1#*=}"; shift ;;
+        --social-stgcnn-repo)     SOCIAL_STGCNN_REPO="$2"; shift 2 ;;
+        --social-stgcnn-checkpoint-dir=*) SOCIAL_STGCNN_CHECKPOINT_DIR="${1#*=}"; shift ;;
+        --social-stgcnn-checkpoint-dir) SOCIAL_STGCNN_CHECKPOINT_DIR="$2"; shift 2 ;;
+        --social-stgcnn-port=*)   SOCIAL_STGCNN_PORT="${1#*=}"; shift ;;
+        --social-stgcnn-port)     SOCIAL_STGCNN_PORT="$2"; shift 2 ;;
+        --social-stgcnn-device=*) SOCIAL_STGCNN_DEVICE="${1#*=}"; shift ;;
+        --social-stgcnn-device)   SOCIAL_STGCNN_DEVICE="$2"; shift 2 ;;
+        --with-trajectronpp)      SEGMENTATION_WITH_TRAJECTRONPP=1; shift ;;
+        --trajectronpp-repo=*)    TRAJECTRONPP_REPO="${1#*=}"; shift ;;
+        --trajectronpp-repo)      TRAJECTRONPP_REPO="$2"; shift 2 ;;
+        --trajectronpp-model-dir=*) TRAJECTRONPP_MODEL_DIR="${1#*=}"; shift ;;
+        --trajectronpp-model-dir) TRAJECTRONPP_MODEL_DIR="$2"; shift 2 ;;
+        --trajectronpp-checkpoint=*) TRAJECTRONPP_CHECKPOINT="${1#*=}"; shift ;;
+        --trajectronpp-checkpoint) TRAJECTRONPP_CHECKPOINT="$2"; shift 2 ;;
+        --trajectronpp-port=*)    TRAJECTRONPP_PORT="${1#*=}"; shift ;;
+        --trajectronpp-port)      TRAJECTRONPP_PORT="$2"; shift 2 ;;
         --seg-camera-slot=*)       SEGMENTATION_CAMERA_SLOT="${1#*=}"; shift ;;
         --seg-camera-slot)         SEGMENTATION_CAMERA_SLOT="$2"; shift 2 ;;
         --seg-camera-index=*)      SEGMENTATION_CAMERA_INDEX="${1#*=}"; shift ;;
@@ -97,6 +161,7 @@ cleanup() {
     kill "$DRIVE_LOOP" 2>/dev/null || true
     kill "$MOCK_PID" 2>/dev/null || true
     kill "$AUTOWARE_PID" 2>/dev/null || true
+    kill "$OBJECT_PREDICTOR_PID" 2>/dev/null || true
     kill "$EGO_PID" 2>/dev/null || true
     kill "$EGO_LINK_PID" 2>/dev/null || true
     kill "$GPS_LINK_PID" 2>/dev/null || true
@@ -109,6 +174,8 @@ cleanup() {
     pkill -f "scripts/alpamayo_infer.py" 2>/dev/null || true
     pkill -f "scripts/clrnet_infer.py" 2>/dev/null || true
     pkill -f "scripts/segmentation_infer.py" 2>/dev/null || true
+    pkill -f "scripts/object_predictor_social_stgcnn.py" 2>/dev/null || true
+    pkill -f "scripts/object_predictor_trajectronpp.py" 2>/dev/null || true
     pkill -f "scripts/ego_state_writer.py" 2>/dev/null || true
     pkill -f "ego_sensor/ego_link.sh" 2>/dev/null || true
     # Any iproxy spawned by ego_link.sh.
@@ -119,6 +186,7 @@ cleanup() {
     rm -f "$AUTOWARE_STATE_FILE" "$AUTOWARE_STATE_FILE.tmp"
     rm -f "$EGO_STATE_FILE" "$EGO_STATE_FILE.tmp"
     rm -f "$GPS_STATE_FILE" "$GPS_STATE_FILE.tmp"
+    rm -f "$VIDEO_CONTROL_FILE" "$VIDEO_CONTROL_FILE.tmp"
     rm -f /tmp/teleop_cmd.json /tmp/teleop_cmd.json.tmp
     rm -rf "$FRAMES_DIR"
 }
@@ -128,8 +196,85 @@ export CART_STATE_FILE="$STATE_FILE"
 export AUTOWARE_STATE_FILE
 export EGO_STATE_FILE
 export GPS_STATE_FILE
+export VIDEO_CONTROL_FILE
 export CART_FRAMES_DIR="$FRAMES_DIR"
 mkdir -p "$FRAMES_DIR"
+
+if [[ -n "$SEGMENTATION_WITH_SOCIAL_STGCNN" ]]; then
+    OBJECT_PREDICTOR_URL="http://${SOCIAL_STGCNN_HOST}:${SOCIAL_STGCNN_PORT}/predict"
+    /opt/homebrew/bin/python3 scripts/object_predictor_social_stgcnn.py \
+        --host "$SOCIAL_STGCNN_HOST" \
+        --port "$SOCIAL_STGCNN_PORT" \
+        --repo "$SOCIAL_STGCNN_REPO" \
+        --checkpoint-dir "$SOCIAL_STGCNN_CHECKPOINT_DIR" \
+        --device "$SOCIAL_STGCNN_DEVICE" \
+        >>/tmp/object_predictor_social_stgcnn.log 2>&1 &
+    OBJECT_PREDICTOR_PID=$!
+    echo "[start] social-stgcnn provider pid=$OBJECT_PREDICTOR_PID url=$OBJECT_PREDICTOR_URL" \
+        >>/tmp/object_predictor_social_stgcnn.log
+    if /opt/homebrew/bin/python3 - "$SOCIAL_STGCNN_HOST" "$SOCIAL_STGCNN_PORT" <<'PY'
+import json
+import sys
+import time
+import urllib.request
+
+host, port = sys.argv[1], sys.argv[2]
+deadline = time.monotonic() + 8.0
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=1.0) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        if data.get("ready"):
+            raise SystemExit(0)
+    except Exception:
+        pass
+    time.sleep(0.25)
+raise SystemExit(1)
+PY
+    then
+        SEGMENTATION_OBJECT_PREDICTOR_URL="$OBJECT_PREDICTOR_URL"
+        echo "[start] social-stgcnn provider healthy; routing object futures to it" \
+            >>/tmp/object_predictor_social_stgcnn.log
+    else
+        echo "[start] social-stgcnn provider unavailable; keeping constant-velocity object fallback" \
+            >>/tmp/object_predictor_social_stgcnn.log
+    fi
+elif [[ -n "$SEGMENTATION_WITH_TRAJECTRONPP" ]]; then
+    OBJECT_PREDICTOR_URL="http://${TRAJECTRONPP_HOST}:${TRAJECTRONPP_PORT}/predict"
+    /opt/homebrew/bin/python3 scripts/object_predictor_trajectronpp.py \
+        --host "$TRAJECTRONPP_HOST" \
+        --port "$TRAJECTRONPP_PORT" \
+        --repo "$TRAJECTRONPP_REPO" \
+        --model-dir "$TRAJECTRONPP_MODEL_DIR" \
+        --checkpoint "$TRAJECTRONPP_CHECKPOINT" \
+        >>/tmp/object_predictor_trajectronpp.log 2>&1 &
+    OBJECT_PREDICTOR_PID=$!
+    echo "[start] trajectron++ provider pid=$OBJECT_PREDICTOR_PID url=$OBJECT_PREDICTOR_URL" \
+        >>/tmp/object_predictor_trajectronpp.log
+    sleep 1
+    if /opt/homebrew/bin/python3 - "$TRAJECTRONPP_HOST" "$TRAJECTRONPP_PORT" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.request
+
+host, port = sys.argv[1], sys.argv[2]
+try:
+    with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=0.5) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    raise SystemExit(0 if data.get("ready") else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+    then
+        SEGMENTATION_OBJECT_PREDICTOR_URL="$OBJECT_PREDICTOR_URL"
+        echo "[start] trajectron++ provider healthy; routing object futures to it" \
+            >>/tmp/object_predictor_trajectronpp.log
+    else
+        echo "[start] trajectron++ provider unavailable; keeping constant-velocity object fallback" \
+            >>/tmp/object_predictor_trajectronpp.log
+    fi
+fi
 
 # iPhone ARKit ego-motion publisher. ego_link.sh supervises the
 # usbmuxd/iproxy USB tunnel — waits for the phone to appear, launches
@@ -138,23 +283,34 @@ mkdir -p "$FRAMES_DIR"
 # mirrors connected/sample state into $EGO_STATE_FILE. If the tunnel
 # isn't yet up or the iOS app isn't streaming, the writer just keeps
 # retrying and the UI dot stays red.
-~/ego_sensor/ego_link.sh 5005 >>/tmp/ego_link.log 2>&1 &
-EGO_LINK_PID=$!
-echo "[start] ego_link pid=$EGO_LINK_PID (USB iproxy supervisor)" \
-    >>/tmp/ego_link.log
-/usr/bin/python3 scripts/ego_state_writer.py --state-file "$EGO_STATE_FILE" \
-    >>/tmp/ego_state_writer.log 2>&1 &
-EGO_PID=$!
-echo "[start] ego_state_writer pid=$EGO_PID -> $EGO_STATE_FILE" \
-    >>/tmp/ego_state_writer.log
+if [[ -z "$OFFLINE" ]]; then
+    ~/ego_sensor/ego_link.sh 5005 >>/tmp/ego_link.log 2>&1 &
+    EGO_LINK_PID=$!
+    echo "[start] ego_link pid=$EGO_LINK_PID (USB iproxy supervisor)" \
+        >>/tmp/ego_link.log
+    /usr/bin/python3 scripts/ego_state_writer.py --state-file "$EGO_STATE_FILE" \
+        >>/tmp/ego_state_writer.log 2>&1 &
+    EGO_PID=$!
+    echo "[start] ego_state_writer pid=$EGO_PID -> $EGO_STATE_FILE" \
+        >>/tmp/ego_state_writer.log
+else
+    echo '{"connected":false,"ts":0}' > "$EGO_STATE_FILE"
+    echo "[start] OFFLINE mode — skipping iPhone ARKit ego link" \
+        >>/tmp/ego_state_writer.log
+fi
 
 # iPhone CoreLocation GPS publisher. The iOS app exposes this as a separate
 # JSONL stream on port 5006; web/app.py connects to it and mirrors the latest
 # fix into $GPS_STATE_FILE for segmentation route bias.
-~/ego_sensor/ego_link.sh 5006 >>/tmp/gps_link.log 2>&1 &
-GPS_LINK_PID=$!
-echo "[start] gps_link pid=$GPS_LINK_PID (USB iproxy supervisor)" \
-    >>/tmp/gps_link.log
+if [[ -z "$OFFLINE" ]]; then
+    ~/ego_sensor/ego_link.sh 5006 >>/tmp/gps_link.log 2>&1 &
+    GPS_LINK_PID=$!
+    echo "[start] gps_link pid=$GPS_LINK_PID (USB iproxy supervisor)" \
+        >>/tmp/gps_link.log
+else
+    echo '{"connected":false,"ts":0}' > "$GPS_STATE_FILE"
+    echo "[start] OFFLINE mode — skipping iPhone GPS link" >>/tmp/gps_link.log
+fi
 
 # Inference sidecar — picked by --model. Both write to
 # $AUTOWARE_STATE_FILE so ps5_drive.py --autosteer reads from one place
@@ -215,13 +371,45 @@ elif [[ "$MODEL" == "segmentation" ]]; then
     INFER_ARGS=(--frames-dir "$FRAMES_DIR" --state-file "$AUTOWARE_STATE_FILE"
                 --target-mph "$SEGMENTATION_MPH"
                 --source uvc
-                --calib calibration/cameras/sparsedrive_REAL_pvc_calibration.json
+                --calib "$SEGMENTATION_HOMOGRAPHY_CALIB"
                 --camera-slot "$SEGMENTATION_CAMERA_SLOT"
                 --gps-route-gain 0.6
                 --gps-route-max-bias-deg 150
                 --gps-route-lookahead-m 5)
-    if [[ -z "$SEGMENTATION_WITH_CLRNET" ]]; then
+    if [[ -z "$SEGMENTATION_WITH_CLRNET" && -z "$SEGMENTATION_CLRNET_CACHE" ]]; then
         INFER_ARGS+=(--no-clrnet)
+    fi
+    if [[ -n "$SEGMENTATION_CLRNET_CACHE" ]]; then
+        INFER_ARGS+=(--clrnet-cache-file "$SEGMENTATION_CLRNET_CACHE")
+    fi
+    if [[ -n "$SEGMENTATION_REMOTE_MODAL" ]]; then
+        if [[ -n "$SEGMENTATION_CACHE_META" ]]; then
+            SEGMENTATION_PUBLISH_HZ="${SEGMENTATION_PUBLISH_HZ:-30}"
+            SEGMENTATION_INFER_HZ="${SEGMENTATION_INFER_HZ:-30}"
+        else
+            SEGMENTATION_PUBLISH_HZ="${SEGMENTATION_PUBLISH_HZ:-4}"
+            SEGMENTATION_INFER_HZ="${SEGMENTATION_INFER_HZ:-4}"
+        fi
+        INFER_ARGS+=(--remote-segmentation-modal
+                     --modal-app-name "$SEGMENTATION_MODAL_APP_NAME"
+                     --modal-function-name "$SEGMENTATION_MODAL_FUNCTION_NAME")
+    fi
+    if [[ -n "$SEGMENTATION_CACHE_META" ]]; then
+        INFER_ARGS+=(--segmentation-cache-meta "$SEGMENTATION_CACHE_META")
+    fi
+    if [[ -n "$SEGMENTATION_YOLO_CACHE" ]]; then
+        INFER_ARGS+=(--yolo-cache-file "$SEGMENTATION_YOLO_CACHE"
+                     --yolo-min-conf "$SEGMENTATION_YOLO_MIN_CONF")
+        if [[ -n "$SEGMENTATION_OBJECT_PREDICTOR_URL" ]]; then
+            INFER_ARGS+=(--object-predictor-url "$SEGMENTATION_OBJECT_PREDICTOR_URL"
+                         --object-predictor-timeout-ms "$SEGMENTATION_OBJECT_PREDICTOR_TIMEOUT_MS")
+        fi
+    fi
+    if [[ -n "$SEGMENTATION_PUBLISH_HZ" ]]; then
+        INFER_ARGS+=(--publish-hz "$SEGMENTATION_PUBLISH_HZ")
+    fi
+    if [[ -n "$SEGMENTATION_INFER_HZ" ]]; then
+        INFER_ARGS+=(--infer-hz "$SEGMENTATION_INFER_HZ")
     fi
     if [[ -n "$SEGMENTATION_CAMERA_INDEX" ]]; then
         INFER_ARGS+=(--camera-index "$SEGMENTATION_CAMERA_INDEX")
@@ -231,15 +419,23 @@ elif [[ "$MODEL" == "segmentation" ]]; then
     # probe race it for /dev/video4.
     export LIVE_CAMERA_COUNT=0
     if [[ -n "$VIDEO" ]]; then
-        INFER_ARGS+=(--video "$VIDEO")
+        INFER_ARGS+=(--video "$VIDEO" --video-control-file "$VIDEO_CONTROL_FILE")
         [[ -n "$NO_LOOP" ]] && INFER_ARGS+=(--no-loop)
         echo "[start] VIDEO mode — replaying $VIDEO into segmentation pipeline" \
             >>/tmp/autoware_infer.log
     fi
-    /usr/bin/python3 scripts/segmentation_infer.py "${INFER_ARGS[@]}" \
+    SEGMENTATION_PY="/usr/bin/python3"
+    if [[ -n "$SEGMENTATION_REMOTE_MODAL" ]]; then
+        if [[ -x /opt/homebrew/bin/python3 ]]; then
+            SEGMENTATION_PY="/opt/homebrew/bin/python3"
+        else
+            SEGMENTATION_PY="$(command -v python3)"
+        fi
+    fi
+    "$SEGMENTATION_PY" scripts/segmentation_infer.py "${INFER_ARGS[@]}" \
         >>/tmp/autoware_infer.log 2>&1 &
     AUTOWARE_PID=$!
-    echo "[start] model=segmentation (drive-by-segmentation, target ${SEGMENTATION_MPH} mph, iPhone closed-loop when available)" \
+    echo "[start] model=segmentation (target ${SEGMENTATION_MPH} mph, homography_calib=$SEGMENTATION_HOMOGRAPHY_CALIB, remote_modal=${SEGMENTATION_REMOTE_MODAL:-0}, py=$SEGMENTATION_PY)" \
         >>/tmp/autoware_infer.log
 else
     # Alpamayo: remote Modal-hosted Alpamayo-R1 reached over a Modal
@@ -292,6 +488,10 @@ SRV=$!
 echo "[start] web ui pid=$SRV; MPH source=iPhone ARKit ego speed, GPS fallback" \
     >>/tmp/flask.log
 
+if [[ -n "$OFFLINE" && -z "$MOCK_SPEED" ]]; then
+    MOCK_SPEED="$SEGMENTATION_MPH"
+fi
+
 if [[ -n "$MOCK_SPEED" ]]; then
     echo "[start] MOCK mode — mph=$MOCK_SPEED (skipping PS5/Arduino/ODrive)" >>/tmp/ps5_drive.log
     python3 scripts/mock_state.py --mph "$MOCK_SPEED" --state-file "$STATE_FILE" \
@@ -329,4 +529,26 @@ for i in {1..30}; do
     sleep 0.2
 done
 
-firefox --no-remote --new-instance --profile "$PROFILE" --kiosk http://127.0.0.1:5050
+URL="http://127.0.0.1:5050"
+if [[ -n "$OFFLINE" ]]; then
+    if command -v open >/dev/null 2>&1; then
+        open "$URL" >/dev/null 2>&1 || true
+    elif command -v firefox >/dev/null 2>&1; then
+        firefox --no-remote --new-instance --profile "$PROFILE" "$URL" >/dev/null 2>&1 || true
+    else
+        echo "[start] web ui ready at $URL"
+    fi
+    echo "[start] OFFLINE mode — web ui ready at $URL; waiting until interrupted" \
+        >>/tmp/flask.log
+    wait
+else
+    if command -v firefox >/dev/null 2>&1; then
+        firefox --no-remote --new-instance --profile "$PROFILE" --kiosk "$URL"
+    elif command -v open >/dev/null 2>&1; then
+        open "$URL" >/dev/null 2>&1 || true
+        wait
+    else
+        echo "[start] web ui ready at $URL"
+        wait
+    fi
+fi
