@@ -175,8 +175,8 @@ TURN_ANNOUNCE_MAX_M = 40.0   # don't announce turns farther out than this
 #   * gas is cut to 0 once the brake fraction clears ENV_BRAKE_GAS_CUT_FRAC
 #     (coast-then-brake), and
 #   * the UI "protective stop" state / STOP badge trips at ENV_BRAKE_STOP_FRAC.
-ENV_BRAKE_GAS_CUT_FRAC = 0.15
-ENV_BRAKE_STOP_FRAC = 0.5
+ENV_BRAKE_GAS_CUT_FRAC = float(os.environ.get("ENV_BRAKE_GAS_CUT_FRAC", "0.15"))
+ENV_BRAKE_STOP_FRAC = float(os.environ.get("ENV_BRAKE_STOP_FRAC", "0.5"))
 # Braking is a per-object SPACE-TIME (time-to-collision) test, not a space-only
 # corridor overlap: for each tracked obstacle we ask whether the cart and the
 # object will be at the same place at the same TIME (seg_occupancy.
@@ -186,11 +186,11 @@ ENV_BRAKE_STOP_FRAC = 0.5
 # with a hard-stop floor for anything close and currently dead-ahead. Object
 # forward distance comes from the blob's nearest (feet) point so the no-depth
 # BEV smear doesn't push obstacles artificially far away.
-ENV_BRAKE_CORRIDOR_HALF_M = 0.9   # lateral half-corridor the cart sweeps (m)
-ENV_BRAKE_OBJECT_RADIUS_M = 0.3   # added body radius of the obstacle (m)
-ENV_BRAKE_NEAR_STOP_M = 3.0       # hard-stop floor: dead-ahead obstacle within this (m)
-ENV_BRAKE_HORIZON_S = 4.0         # ignore collisions predicted beyond this TTC (s)
-ENV_BRAKE_HARD_TTC_S = 2.0        # TTC at/below this -> full brake; ramps to 0 by horizon
+ENV_BRAKE_CORRIDOR_HALF_M = float(os.environ.get("ENV_BRAKE_CORRIDOR_HALF_M", "0.9"))   # lateral half-corridor the cart sweeps (m)
+ENV_BRAKE_OBJECT_RADIUS_M = float(os.environ.get("ENV_BRAKE_OBJECT_RADIUS_M", "0.3"))   # added body radius of the obstacle (m)
+ENV_BRAKE_NEAR_STOP_M = float(os.environ.get("ENV_BRAKE_NEAR_STOP_M", "3.0"))  # hard-stop floor: dead-ahead obstacle within this (m)
+ENV_BRAKE_HORIZON_S = float(os.environ.get("ENV_BRAKE_HORIZON_S", "4.0"))      # ignore collisions predicted beyond this TTC (s)
+ENV_BRAKE_HARD_TTC_S = float(os.environ.get("ENV_BRAKE_HARD_TTC_S", "2.0"))    # TTC at/below this -> full brake; ramps to 0 by horizon
 # When a hard protective stop is active, freeze steering (hold the last command)
 # instead of letting the road-mask centerline swerve around the obstacle.
 ENV_BRAKE_FREEZE_STEER = True
@@ -2397,7 +2397,10 @@ def main() -> None:
                         if latest_env_brake_01 >= ENV_BRAKE_GAS_CUT_FRAC:
                             latest_target_gas = 0.0
                             latest_gas_trim = 0.0
-                            speed_ctrl.sync_gas(0.0)
+                            # Do not let the PI speed controller accumulate
+                            # throttle demand while an obstacle is holding the
+                            # cart back; otherwise release can surge.
+                            speed_ctrl.reset()
                     # Hard protective stop: hold the last steering command — don't
                     # let the road-mask centerline swerve around the obstacle while
                     # we brake to a stop.
