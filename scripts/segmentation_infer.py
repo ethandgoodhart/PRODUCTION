@@ -191,18 +191,25 @@ ENV_BRAKE_OBJECT_RADIUS_M = 0.3   # added body radius of the obstacle (m)
 ENV_BRAKE_NEAR_STOP_M = 3.0       # hard-stop floor: dead-ahead obstacle within this (m)
 ENV_BRAKE_HORIZON_S = 4.0         # ignore collisions predicted beyond this TTC (s)
 ENV_BRAKE_HARD_TTC_S = 2.0        # TTC at/below this -> full brake; ramps to 0 by horizon
-# Extra caution for an obstacle the cart cannot get around (person too close, or
-# no room to pass). Image-space backstop: when obstacle pixels fill a large
-# fraction of the lower-centre of the camera view, slow hard / brake graded by
-# coverage. Robust at close range where the BEV ground projection breaks down.
-ENV_BRAKE_IMG_BOTTOM_FRAC = 0.45  # lower portion of the image treated as "near"
-ENV_BRAKE_IMG_CENTER_LO = 0.28    # central horizontal band = directly ahead
-ENV_BRAKE_IMG_CENTER_HI = 0.72
-ENV_BRAKE_IMG_COVER_LO = 0.12     # coverage below this -> no extra brake
-ENV_BRAKE_IMG_COVER_HI = 0.35     # coverage at/above this -> full brake
 # When a hard protective stop is active, freeze steering (hold the last command)
 # instead of letting the road-mask centerline swerve around the obstacle.
 ENV_BRAKE_FREEZE_STEER = True
+
+# Dynamic actor policy. Pedestrians/riders/bicycles should not carve holes into
+# the static road mask that the centerline planner chases; they are handled by
+# the actor tracker/brake policy instead.
+DYNAMIC_ACTOR_CLASS_IDS = (11, 12, 18)  # person, rider, bicycle
+DYNAMIC_ACTOR_CLASS_NAMES = {
+    11: "person",
+    12: "rider",
+    18: "bicycle",
+}
+DYNAMIC_ACTOR_DILATE_PX = 5
+DYNAMIC_ACTOR_ROAD_CONTEXT_PX = 23
+DYNAMIC_ACTOR_MIN_ROAD_FRACTION = 0.03
+
+# Optional detector classes from COCO-style YOLO models.
+YOLO_ACTOR_CLASS_NAMES = frozenset({"person", "bicycle"})
 
 
 def discover_v4l2_indices(count: int = 4, max_scan: int = 16) -> list[int]:
@@ -548,6 +555,15 @@ def timed_segment_frame(frame_rgb: np.ndarray, proc, model, device: str) -> tupl
     return seg, timings
 
 
+def configure_segformer_processor(proc, input_size: int) -> int | None:
+    """Optionally lower SegFormer resize resolution for faster CPU inference."""
+    if input_size <= 0:
+        return None
+    size = int(np.clip(input_size, 256, 1024))
+    proc.size = {"height": size, "width": size}
+    return size
+
+
 def read_ego_speed_mph(path: Path, fresh_s: float = 1.0) -> tuple[float, bool]:
     try:
         with path.open() as f:
@@ -673,31 +689,313 @@ def bev_class_map_cached(seg_map: np.ndarray, remap: seg_fast.BevRemap) -> np.nd
     return out
 
 
+def neutralize_dynamic_actors_for_planning(
+    road_mask: np.ndarray,
+    class_map: np.ndarray | None,
+    *,
+    enabled: bool = True,
+) -> tuple[np.ndarray, dict]:
+    """Fill VRU footprints back into the planning road mask.
+
+    Segmentation still sees the actor, and occupancy still tracks/brakes for it.
+    This only affects the static centerline planner so a person/bike blob does
+    not become an artificial curb that makes the cart swerve.
+    """
+    raw = np.asarray(road_mask, dtype=bool)
+    info = {
+        "enabled": bool(enabled),
+        "mode": "dynamic_actor_mask_to_road_context",
+        "class_ids": list(DYNAMIC_ACTOR_CLASS_IDS),
+        "actor_px": 0,
+        "expanded_actor_px": 0,
+        "recovered_px": 0,
+        "actor_px_on_raw_road": 0,
+        "actor_px_on_planning_road": 0,
+        "actor_px_remaining_nonroad": 0,
+        "road_px_raw": int(raw.sum()),
+        "road_px_planning": int(raw.sum()),
+    }
+    if not enabled or class_map is None:
+        return raw, info
+
+    cls = np.asarray(class_map)
+    if cls.shape[:2] != raw.shape[:2]:
+        info["enabled"] = False
+        info["reason"] = "shape_mismatch"
+        return raw, info
+
+    actor_raw = np.isin(cls, DYNAMIC_ACTOR_CLASS_IDS)
+    info["actor_px"] = int(actor_raw.sum())
+    info["actor_px_on_raw_road"] = int((actor_raw & raw).sum())
+    if not actor_raw.any():
+        return raw, info
+
+    actor_u8 = actor_raw.astype(np.uint8)
+    if DYNAMIC_ACTOR_DILATE_PX > 0:
+        k = DYNAMIC_ACTOR_DILATE_PX * 2 + 1
+        actor_u8 = cv2.dilate(actor_u8, np.ones((k, k), np.uint8), iterations=1)
+    actor = actor_u8.astype(bool)
+
+    road_u8 = raw.astype(np.uint8)
+    ctx_k = max(3, int(DYNAMIC_ACTOR_ROAD_CONTEXT_PX) | 1)
+    road_nearby = cv2.dilate(road_u8, np.ones((ctx_k, ctx_k), np.uint8), iterations=1).astype(bool)
+    road_fraction = cv2.blur(road_u8.astype(np.float32), (ctx_k, ctx_k))
+    valid = cls != 255
+    recover = actor & valid & (road_nearby | (road_fraction >= DYNAMIC_ACTOR_MIN_ROAD_FRACTION))
+
+    planning = raw.copy()
+    planning[recover] = True
+    info["expanded_actor_px"] = int(actor.sum())
+    info["recovered_px"] = int(recover.sum())
+    info["actor_px_on_planning_road"] = int((actor_raw & planning).sum())
+    info["actor_px_remaining_nonroad"] = int((actor_raw & ~planning).sum())
+    info["road_px_planning"] = int(planning.sum())
+    return planning, info
+
+
+class BevImageProjector:
+    """Nearest-neighbour inverse lookup from image pixels to BEV local metres."""
+
+    def __init__(self, remap: seg_fast.BevRemap, geom: seg_occupancy.BevGeometry):
+        by, bx = np.nonzero(remap.valid)
+        self.bx = bx.astype(np.int32)
+        self.by = by.astype(np.int32)
+        self.u = remap.map_u[by, bx].astype(np.float32)
+        self.v = remap.map_v[by, bx].astype(np.float32)
+        self.geom = geom
+
+    def image_point_to_local(
+        self,
+        u: float,
+        v: float,
+        *,
+        max_pixel_error: float = 48.0,
+    ) -> dict | None:
+        if self.u.size == 0:
+            return None
+        du = self.u - float(u)
+        dv = self.v - float(v)
+        d2 = du * du + dv * dv
+        idx = int(np.argmin(d2))
+        err = float(math.sqrt(float(d2[idx])))
+        if err > max_pixel_error:
+            return None
+        bx = int(self.bx[idx])
+        by = int(self.by[idx])
+        fwd, left = self.geom.bev_to_local(bx, by)
+        return {
+            "fwd_m": float(fwd),
+            "left_m": float(left),
+            "bev_px": [bx, by],
+            "projection_error_px": round(err, 2),
+        }
+
+
+class YoloActorDetector:
+    """Optional pedestrian/bicycle detector.
+
+    The segmentation model remains the primary source. YOLO adds box-level
+    detections when the package/model are present, but this class degrades to a
+    no-op so the cart can still run from semantic VRU blobs alone.
+    """
+
+    def __init__(self, model_name: str, conf: float, imgsz: int, enabled: bool = True):
+        self.model_name = model_name
+        self.conf = float(np.clip(conf, 0.01, 0.99))
+        self.imgsz = int(max(128, imgsz))
+        self.enabled = bool(enabled)
+        self.available = False
+        self.error: str | None = None
+        self.model = None
+        self.names: dict[int, str] = {}
+        self.actor_class_ids: set[int] = set()
+        if not self.enabled:
+            return
+        try:
+            cfg_dir = Path(os.environ.get("YOLO_CONFIG_DIR", "/tmp"))
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            os.environ.setdefault("YOLO_CONFIG_DIR", str(cfg_dir))
+            from ultralytics import YOLO
+
+            self.model = YOLO(model_name)
+            raw_names = getattr(self.model, "names", {}) or {}
+            self.names = {
+                int(k): str(v).lower()
+                for k, v in (
+                    raw_names.items()
+                    if isinstance(raw_names, dict)
+                    else enumerate(raw_names)
+                )
+            }
+            self.actor_class_ids = {
+                cls_id for cls_id, name in self.names.items()
+                if name in YOLO_ACTOR_CLASS_NAMES
+            }
+            if not self.actor_class_ids:
+                self.error = "model_has_no_person_or_bicycle_classes"
+                return
+            self.available = True
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+
+    def status(self) -> dict:
+        return {
+            "enabled": bool(self.enabled),
+            "available": bool(self.available),
+            "model": self.model_name,
+            "conf": self.conf,
+            "imgsz": self.imgsz,
+            "classes": sorted(YOLO_ACTOR_CLASS_NAMES),
+            "error": self.error,
+        }
+
+    def detect(self, frame_bgr: np.ndarray) -> tuple[list[dict], dict]:
+        state = self.status()
+        if not self.available or self.model is None:
+            state["count"] = 0
+            return [], state
+        t0 = time.perf_counter()
+        try:
+            results = self.model.predict(
+                frame_bgr,
+                imgsz=self.imgsz,
+                conf=self.conf,
+                verbose=False,
+            )
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+            state = self.status()
+            state["count"] = 0
+            state["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
+            return [], state
+
+        actors: list[dict] = []
+        result = results[0] if results else None
+        boxes = getattr(result, "boxes", None) if result is not None else None
+        if boxes is not None:
+            for box in boxes:
+                try:
+                    cls_id = int(box.cls[0].detach().cpu().item())
+                    if cls_id not in self.actor_class_ids:
+                        continue
+                    conf = float(box.conf[0].detach().cpu().item())
+                    xyxy = box.xyxy[0].detach().cpu().numpy().astype(float)
+                except Exception:
+                    continue
+                label = self.names.get(cls_id, str(cls_id))
+                actors.append({
+                    "source": "yolo",
+                    "class": label,
+                    "class_id": cls_id,
+                    "confidence": round(conf, 3),
+                    "bbox_xyxy": [round(float(v), 1) for v in xyxy.tolist()],
+                })
+        state = self.status()
+        state["count"] = len(actors)
+        state["latency_ms"] = round((time.perf_counter() - t0) * 1000.0, 3)
+        return actors, state
+
+
+def project_detector_actors_to_bev(
+    actors: list[dict],
+    projector: BevImageProjector | None,
+) -> tuple[list[dict], list[seg_occupancy.MotionDetection]]:
+    if projector is None:
+        return actors, []
+    projected: list[dict] = []
+    detections: list[seg_occupancy.MotionDetection] = []
+    for actor in actors:
+        out = dict(actor)
+        box = actor.get("bbox_xyxy") or []
+        if len(box) == 4:
+            x1, y1, x2, y2 = [float(v) for v in box]
+            h = max(1.0, y2 - y1)
+            # Feet/contact point: slightly above the bottom of the box to avoid
+            # projecting a shadow/crop edge.
+            u = 0.5 * (x1 + x2)
+            v = y2 - 0.04 * h
+            local = projector.image_point_to_local(u, v)
+            if local is not None:
+                out.update(local)
+                conf = float(actor.get("confidence", 1.0))
+                detections.append(
+                    seg_occupancy.MotionDetection(
+                        fwd_m=float(local["fwd_m"]),
+                        left_m=float(local["left_m"]),
+                        confidence=conf,
+                    )
+                )
+        projected.append(out)
+    return projected, detections
+
+
+def summarize_actor_tracks(
+    occ: "seg_occupancy.PredictedOccupancy | None",
+    *,
+    limit: int = 16,
+) -> list[dict]:
+    if occ is None:
+        return []
+    tracks = sorted(
+        occ.all_tracks,
+        key=lambda t: (float(t.pos_m[0]), -float(t.confidence)),
+    )
+    out: list[dict] = []
+    for tk in tracks[:limit]:
+        out.append({
+            "id": int(tk.track_id),
+            "fwd_m": round(float(tk.pos_m[0]), 3),
+            "left_m": round(float(tk.pos_m[1]), 3),
+            "vx_mps": round(float(tk.vel_mps[0]), 3),
+            "vy_mps": round(float(tk.vel_mps[1]), 3),
+            "speed_mps": round(float(tk.speed_mps), 3),
+            "hits": int(tk.hits),
+            "confidence": round(float(tk.confidence), 3),
+        })
+    return out
+
+
+def build_actor_policy_state(
+    neutralization: dict,
+    detector_state: dict,
+    detector_actors: list[dict],
+    occ: "seg_occupancy.PredictedOccupancy | None",
+    collision: dict | None,
+    brake_01: float,
+) -> dict:
+    tracks = summarize_actor_tracks(occ)
+    return {
+        "mode": "single_bev_path_actor_speed_policy",
+        "steering_source": "actor_neutralized_bev_centerline",
+        "speed_source": "space_time_actor_brake",
+        "neutralization": neutralization,
+        "detector": detector_state,
+        "detector_actors": detector_actors[:16],
+        "tracks": tracks,
+        "track_count": len(tracks),
+        "brake_01": round(float(brake_01), 3),
+        "collision": collision or {"brake_01": 0.0, "objects": 0, "threat": None},
+    }
+
+
 def build_environment_threat(
     collision: dict | None,
     image: dict | None,
     brake_01: float,
     enabled: bool,
 ) -> dict:
-    """Summarize the brake decision (space-time collision + image proximity) for state/UI.
+    """Summarize the brake decision (space-time actor collision) for state/UI.
 
     Mirrors the shape the web UI expects from the old protective-stop block
     (``active`` / ``objects`` / ``threat.{label,x_m}``) and adds the graded
     fields (``brake_target`` / ``ttc_s`` / ``image_coverage``). The threat
     label/distance/TTC come from ``evaluate_collision_brake``'s nearest
-    collision; when the image-proximity backstop is the dominant brake the
-    reason reflects an un-navigable obstacle directly ahead."""
+    collision."""
     collision = collision or {}
-    image = image or {}
+    image = image or {"brake_01": 0.0, "coverage": 0.0, "enabled": False}
     active = bool(enabled and brake_01 >= ENV_BRAKE_STOP_FRAC)
-    coll_brake = float(collision.get("brake_01", 0.0))
-    img_brake = float(image.get("brake_01", 0.0))
     if active:
-        reason = (
-            "obstacle blocking path ahead (no room to pass)"
-            if img_brake > coll_brake
-            else str(collision.get("reason", ""))
-        )
+        reason = str(collision.get("reason", ""))
     else:
         reason = ""
     return {
@@ -707,6 +1005,7 @@ def build_environment_threat(
         "reason": reason,
         "brake_target": round(float(brake_01), 3),
         "ttc_s": collision.get("ttc_s"),
+        "image_backstop_enabled": bool(image.get("enabled", False)),
         "image_coverage": image.get("coverage", 0.0),
         "objects": int(collision.get("objects", 0)),
         "threat": collision.get("threat"),
@@ -1367,7 +1666,8 @@ def draw_bev_viz(bev_rgb: np.ndarray, lane_traj: np.ndarray | None,
                  bev_geom: "seg_occupancy.BevGeometry | None" = None,
                  brake_corridor: np.ndarray | None = None,
                  brake_01: float = 0.0,
-                 stop_active: bool = False) -> np.ndarray:
+                 stop_active: bool = False,
+                 actor_markers: list[dict] | None = None) -> np.ndarray:
     out = bev_rgb.copy()
     # Foot-labelled distance grid. RANGE_FWD covers 0..forward_ft (ego at
     # bottom); RANGE_SIDE covers ±side_ft (ego column at horizontal
@@ -1444,6 +1744,21 @@ def draw_bev_viz(bev_rgb: np.ndarray, lane_traj: np.ndarray | None,
                     cv2.polylines(out, [np.array(pts, dtype=np.int32)], False,
                                   (255, 80, 80), 2, cv2.LINE_AA)
 
+    if actor_markers and bev_geom is not None:
+        for actor in actor_markers[:12]:
+            if "fwd_m" not in actor or "left_m" not in actor:
+                continue
+            bx, by = bev_geom.local_to_bev(actor["fwd_m"], actor["left_m"])
+            bxi, byi = int(round(float(bx))), int(round(float(by)))
+            if not (0 <= bxi < w and 0 <= byi < h):
+                continue
+            cv2.circle(out, (bxi, byi), 6, (80, 190, 255), 2, cv2.LINE_AA)
+            label = str(actor.get("class", "actor"))[:10]
+            cv2.putText(out, label, (bxi + 7, byi - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(out, label, (bxi + 7, byi - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (80, 190, 255), 1, cv2.LINE_AA)
+
     # Near forward stop corridor the brake is actually judged against.
     if brake_corridor is not None and len(brake_corridor) > 1 and bev_geom is not None:
         half_px = max(3, int(round(ENV_BRAKE_CORRIDOR_HALF_M * bev_geom.px_per_meter_side)))
@@ -1501,6 +1816,10 @@ def main() -> None:
     p.add_argument("--camera-height-m", type=float, default=None,
                    help="Ground height for E2E BEV projection when the E2E origin is camera-center.")
     p.add_argument("--model", default="b0", choices=("b0", "b2", "b5"))
+    p.add_argument("--seg-input-size", type=int,
+                   default=int(os.environ.get("SEGMENTATION_INPUT_SIZE", "0")),
+                   help="Resize SegFormer input to NxN before inference. "
+                        "0 keeps the model processor default.")
     p.add_argument("--device", default=None)
     p.add_argument("--publish-hz", type=float, default=PUBLISH_HZ_DEFAULT)
     p.add_argument("--infer-hz", type=float, default=INFER_HZ_DEFAULT)
@@ -1549,6 +1868,18 @@ def main() -> None:
     p.add_argument("--gps-route-lookahead-m", type=float, default=GPS_ROUTE_LOOKAHEAD_M)
     p.add_argument("--gps-route-gain", type=float, default=GPS_ROUTE_GAIN)
     p.add_argument("--gps-route-max-bias-deg", type=float, default=GPS_ROUTE_MAX_BIAS_DEG)
+    p.add_argument("--no-actor-neutralization", action="store_true",
+                   help="Do not fill pedestrian/rider/bicycle footprints back "
+                        "into the BEV road mask before path planning.")
+    p.add_argument("--no-actor-detector", action="store_true",
+                   help="Disable the optional YOLO person/bicycle detector. "
+                        "Semantic actor tracking still runs.")
+    p.add_argument("--actor-detector-model",
+                   default=os.environ.get("CADDY_ACTOR_DETECTOR_MODEL", "yolo11n.pt"),
+                   help="Ultralytics YOLO model for optional person/bicycle detections.")
+    p.add_argument("--actor-detector-conf", type=float, default=0.25)
+    p.add_argument("--actor-detector-imgsz", type=int, default=640)
+    p.add_argument("--actor-detector-hz", type=float, default=5.0)
     p.add_argument("--no-protective-stop", action="store_true",
                    help="Disable predicted-occupancy environment braking. "
                         "Intended only for bench tests.")
@@ -1581,6 +1912,7 @@ def main() -> None:
     # Ceiling is the steering-column travel limit, not 90°, so a strong route
     # authority can actually pull the cart through a turn instead of saturating.
     args.gps_route_max_bias_deg = float(np.clip(args.gps_route_max_bias_deg, 0.0, 270.0))
+    args.actor_detector_hz = max(0.0, float(args.actor_detector_hz))
     target_gas_ff = constant_gas_for_mph(args.target_mph)
     speed_ctrl = SpeedController()
     # Predicted future-occupancy obstacle tracker + brake smoother (replaces the
@@ -1592,6 +1924,26 @@ def main() -> None:
     last_occ_update_s = time.monotonic()
     launch_start_t: float | None = None
     stuck_since: float | None = None
+    actor_detector = YoloActorDetector(
+        args.actor_detector_model,
+        args.actor_detector_conf,
+        args.actor_detector_imgsz,
+        enabled=not args.no_actor_detector,
+    )
+    if actor_detector.enabled:
+        status = actor_detector.status()
+        if actor_detector.available:
+            print(
+                f"[actors] detector ready model={status['model']} "
+                f"classes={','.join(status['classes'])}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[actors] detector unavailable, using semantic actor tracks only: "
+                f"{status.get('error')}",
+                flush=True,
+            )
 
     seg_live, rt, plan_path, create_bev, create_overlay, colors = (
         import_segmentation_stack(args.seg_repo)
@@ -1639,6 +1991,13 @@ def main() -> None:
         raise RuntimeError(f"active camera {active_slug} not available")
 
     proc, model = seg_live.load_segformer(args.model, device)
+    seg_input_size = configure_segformer_processor(proc, int(args.seg_input_size))
+    if seg_input_size is not None:
+        print(
+            f"[seg] processor input resized to {seg_input_size}x{seg_input_size} "
+            f"for faster CPU inference.",
+            flush=True,
+        )
     steer_est = rt.SteeringEstimator()
     clrnet = None
     clrnet_runner = None
@@ -1671,6 +2030,7 @@ def main() -> None:
     infer_times: list[float] = []
 
     bev_remap: seg_fast.BevRemap | None = None
+    bev_projector: BevImageProjector | None = None
     use_fast = not args.no_fast and args.bev_mode == "homography"
 
     latest_overlay_bgr: np.ndarray | None = None
@@ -1707,6 +2067,30 @@ def main() -> None:
     latest_collision: dict | None = None
     latest_image_brake: dict | None = None
     latest_brake_corridor: np.ndarray | None = None
+    latest_actor_neutralization: dict = {
+        "enabled": not args.no_actor_neutralization,
+        "mode": "dynamic_actor_mask_to_road_context",
+        "class_ids": list(DYNAMIC_ACTOR_CLASS_IDS),
+        "actor_px": 0,
+        "expanded_actor_px": 0,
+        "recovered_px": 0,
+        "road_px_raw": 0,
+        "road_px_planning": 0,
+        "actor_px_on_raw_road": 0,
+        "actor_px_on_planning_road": 0,
+        "actor_px_remaining_nonroad": 0,
+    }
+    latest_detector_state: dict = actor_detector.status()
+    latest_detector_actors: list[dict] = []
+    latest_actor_policy: dict = build_actor_policy_state(
+        latest_actor_neutralization,
+        latest_detector_state,
+        latest_detector_actors,
+        None,
+        None,
+        0.0,
+    )
+    next_detector_t = 0.0
     latest_protective_stop: dict = build_environment_threat(
         None, None, 0.0, enabled=not args.no_protective_stop
     )
@@ -1793,6 +2177,8 @@ def main() -> None:
                                     f"planner active.",
                                     flush=True,
                                 )
+                                if bev_geom is not None:
+                                    bev_projector = BevImageProjector(bev_remap, bev_geom)
                             bev_rgb = seg_fast.create_bev_cached(seg_map, palette, bev_remap)
                             bev_cls_map = bev_class_map_cached(seg_map, bev_remap)
                         else:
@@ -1801,10 +2187,15 @@ def main() -> None:
                             )
                             bev_rgb, bev_cls_map = bev_out
                     mark("bev_ms")
-                    road_mask = (
+                    road_mask_raw = (
                         np.all(bev_rgb == road_color, axis=-1)
                         | np.all(bev_rgb == grid_color, axis=-1)
                         | np.all(bev_rgb == grid2_color, axis=-1)
+                    )
+                    road_mask, latest_actor_neutralization = neutralize_dynamic_actors_for_planning(
+                        road_mask_raw,
+                        bev_cls_map,
+                        enabled=not args.no_actor_neutralization,
                     )
                     mark("road_mask_ms")
                     if use_fast:
@@ -1844,6 +2235,27 @@ def main() -> None:
                         args.ego_state_file
                     )
                     latest_lookahead_m = adaptive_lookahead_m(latest_ego_speed_mph, latest_ego_speed_ok)
+                    detector_detections_m: list[seg_occupancy.MotionDetection] = []
+                    if (
+                        actor_detector.available
+                        and args.actor_detector_hz > 0.0
+                        and now >= next_detector_t
+                    ):
+                        next_detector_t = now + 1.0 / args.actor_detector_hz
+                        raw_actors, latest_detector_state = actor_detector.detect(frame_bgr)
+                        latest_detector_actors, detector_detections_m = project_detector_actors_to_bev(
+                            raw_actors, bev_projector
+                        )
+                        latest_detector_state["projected_count"] = sum(
+                            1 for a in latest_detector_actors if "fwd_m" in a
+                        )
+                    else:
+                        latest_detector_state = actor_detector.status()
+                        latest_detector_state["count"] = len(latest_detector_actors)
+                        latest_detector_state["projected_count"] = sum(
+                            1 for a in latest_detector_actors if "fwd_m" in a
+                        )
+                    mark("actor_detector_ms")
                     # Per-object SPACE-TIME collision braking. Obstacles in the
                     # BEV class map are tracked (position + velocity); we brake
                     # only if the cart and an object are predicted to occupy the
@@ -1868,6 +2280,7 @@ def main() -> None:
                             bev_geom,
                             dt_s=occ_dt,
                             ego_speed_mps=ego_mps,
+                            extra_detections_m=detector_detections_m,
                             use_segmentation_obstacles=True,
                         )
                         # Assume the cart will reach its target speed even if
@@ -1883,21 +2296,12 @@ def main() -> None:
                             corridor_half_m=ENV_BRAKE_CORRIDOR_HALF_M,
                             object_radius_m=ENV_BRAKE_OBJECT_RADIUS_M,
                         )
-                        # Image-space caution backstop: brake hard when an
-                        # obstacle fills the lower-centre view (close / no room to
-                        # pass) — robust where the BEV projection fails up close.
-                        latest_image_brake = seg_occupancy.imminent_obstacle_brake(
-                            seg_map,
-                            bottom_frac=ENV_BRAKE_IMG_BOTTOM_FRAC,
-                            center_lo=ENV_BRAKE_IMG_CENTER_LO,
-                            center_hi=ENV_BRAKE_IMG_CENTER_HI,
-                            cover_lo=ENV_BRAKE_IMG_COVER_LO,
-                            cover_hi=ENV_BRAKE_IMG_COVER_HI,
-                        )
-                        env_brake_target = max(
-                            float(latest_collision["brake_01"]),
-                            float(latest_image_brake["brake_01"]),
-                        )
+                        latest_image_brake = {
+                            "enabled": False,
+                            "brake_01": 0.0,
+                            "coverage": 0.0,
+                        }
+                        env_brake_target = float(latest_collision["brake_01"])
                         # Drawn on the BEV tile to show the hard-stop near zone.
                         latest_brake_corridor = forward_stop_corridor_bev(
                             bev_geom, ENV_BRAKE_NEAR_STOP_M
@@ -1915,6 +2319,14 @@ def main() -> None:
                         latest_image_brake,
                         latest_env_brake_01,
                         enabled=protective_enabled,
+                    )
+                    latest_actor_policy = build_actor_policy_state(
+                        latest_actor_neutralization,
+                        latest_detector_state,
+                        latest_detector_actors,
+                        latest_occupancy,
+                        latest_collision,
+                        latest_env_brake_01,
                     )
                     mark("protective_stop_ms")
                     if args.constant_speed:
@@ -2082,6 +2494,7 @@ def main() -> None:
                         brake_corridor=latest_brake_corridor,
                         brake_01=latest_env_brake_01,
                         stop_active=bool(latest_protective_stop.get("active")),
+                        actor_markers=latest_detector_actors,
                     )
                     if clrnet is not None and latest_clrnet_lanes:
                         latest_clrnet_overlay_bgr = clrnet.render_overlay(
@@ -2221,6 +2634,7 @@ def main() -> None:
                         "jpeg_ms": {k: round(float(v), 3) for k, v in jpeg_ms.items()},
                         "publish_jpeg_total_ms": round(float(publish_jpeg_total_ms), 3),
                         "infer_count": int(infer_count),
+                        "seg_input_size": seg_input_size,
                         "camera_fps": round(float(latest_camera_fps), 3),
                         "camera_frame_count": int(latest_camera_frame_count),
                         "camera_age_s": (
@@ -2240,6 +2654,7 @@ def main() -> None:
                         "clrnet_steer_deg": float(latest_clrnet_steer_filtered),
                         "clrnet_steer_deg_raw": float(latest_clrnet_steer_raw),
                         "protective_stop": latest_protective_stop,
+                        "actor_policy": latest_actor_policy,
                         "gps_route": latest_gps_route,
                         "map_file": str(args.segmentation_map_file),
                         "map_schema": "caddy.segmentation_map.v1",
@@ -2267,6 +2682,8 @@ def main() -> None:
                     f"ttc={latest_protective_stop.get('ttc_s')} "
                     f"cov={latest_protective_stop.get('image_coverage', 0.0)} "
                     f"objects={int(latest_protective_stop.get('objects', 0))} "
+                    f"actors={latest_actor_policy.get('track_count', 0)} "
+                    f"neutralized={latest_actor_neutralization.get('recovered_px', 0)} "
                     f"gps_bias={float(latest_gps_route.get('bias_deg', 0.0)):+5.1f} "
                     f"turn={latest_gps_route.get('turn_text') or '-'} "
                     f"steer={latest_steer_raw:+6.1f}",

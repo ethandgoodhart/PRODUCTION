@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -e
 cd "$(dirname "$0")"
+ROOT_DIR="$(pwd)"
+
+DEFAULT_PYTHON="python3"
+if [[ "$(uname -s)" == "Darwin" && -x "$ROOT_DIR/.venv/bin/python" ]]; then
+    DEFAULT_PYTHON="$ROOT_DIR/.venv/bin/python"
+fi
+PYTHON_BIN="${PYTHON_BIN:-$DEFAULT_PYTHON}"
+WEB_PYTHON="${WEB_PYTHON:-$PYTHON_BIN}"
+EGO_PYTHON="${EGO_PYTHON:-$PYTHON_BIN}"
+if [[ -z "${AUTOWARE_PY:-}" ]]; then
+    if [[ "$(uname -s)" == "Darwin" && -x "$ROOT_DIR/.venv/bin/python" ]]; then
+        AUTOWARE_PY="$ROOT_DIR/.venv/bin/python"
+    else
+        AUTOWARE_PY="/usr/bin/python3"
+    fi
+fi
 
 PROFILE="$(mktemp -d)"
 STATE_FILE="/tmp/cart_state.json"
@@ -22,6 +38,7 @@ AUTOSTEER=""
 VIDEO=""
 NO_LOOP=""
 DRY_RUN=""
+NO_BROWSER=""
 # AutoSteer / EgoLanes were trained on a ~30° forward-narrow view. Default
 # the front_narrow center-crop to 30° so the model gets the FOV it likes;
 # pass --narrow-fov-deg 0 (or any value >= source) to opt out.
@@ -41,6 +58,17 @@ ALPAMAYO_APP_NAME="${ALPAMAYO_APP_NAME:-alpamayo-live-demo}"
 SEGMENTATION_MPH="8"
 SEGMENTATION_CAMERA_SLOT="${SEGMENTATION_CAMERA_SLOT:-CAM_FRONT}"
 SEGMENTATION_CAMERA_INDEX="${SEGMENTATION_CAMERA_INDEX:-}"
+SEGMENTATION_REPO="${SEGMENTATION_REPO:-}"
+SEGMENTATION_INPUT_SIZE="${SEGMENTATION_INPUT_SIZE:-512}"
+SEGMENTATION_ACTOR_DETECTOR_IMGSZ="${SEGMENTATION_ACTOR_DETECTOR_IMGSZ:-416}"
+SEGMENTATION_ACTOR_DETECTOR_HZ="${SEGMENTATION_ACTOR_DETECTOR_HZ:-2}"
+if [[ -z "$SEGMENTATION_REPO" ]]; then
+    if [[ -d "$ROOT_DIR/vendor/drive-by-segmentation" ]]; then
+        SEGMENTATION_REPO="$ROOT_DIR/vendor/drive-by-segmentation"
+    else
+        SEGMENTATION_REPO="/home/caddy/drive-by-segmentation"
+    fi
+fi
 SEGMENTATION_WITH_CLRNET=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -51,6 +79,7 @@ while [[ $# -gt 0 ]]; do
         --video)                   VIDEO="$2"; shift 2 ;;
         --no-loop)                 NO_LOOP=1; shift ;;
         --dry-run)                 DRY_RUN=1; shift ;;
+        --no-browser)              NO_BROWSER=1; shift ;;
         --narrow-fov-deg=*)        NARROW_FOV_DEG="${1#*=}"; shift ;;
         --narrow-fov-deg)          NARROW_FOV_DEG="$2"; shift 2 ;;
         --narrow-source-fov-deg=*) NARROW_SOURCE_FOV_DEG="${1#*=}"; shift ;;
@@ -62,6 +91,12 @@ while [[ $# -gt 0 ]]; do
         --mph=*)                   SEGMENTATION_MPH="${1#*=}"; shift ;;
         --mph)                     SEGMENTATION_MPH="$2"; shift 2 ;;
         --with-clrnet)             SEGMENTATION_WITH_CLRNET=1; shift ;;
+        --seg-input-size=*)        SEGMENTATION_INPUT_SIZE="${1#*=}"; shift ;;
+        --seg-input-size)          SEGMENTATION_INPUT_SIZE="$2"; shift 2 ;;
+        --actor-detector-imgsz=*)  SEGMENTATION_ACTOR_DETECTOR_IMGSZ="${1#*=}"; shift ;;
+        --actor-detector-imgsz)    SEGMENTATION_ACTOR_DETECTOR_IMGSZ="$2"; shift 2 ;;
+        --actor-detector-hz=*)     SEGMENTATION_ACTOR_DETECTOR_HZ="${1#*=}"; shift ;;
+        --actor-detector-hz)       SEGMENTATION_ACTOR_DETECTOR_HZ="$2"; shift 2 ;;
         --seg-camera-slot=*)       SEGMENTATION_CAMERA_SLOT="${1#*=}"; shift ;;
         --seg-camera-slot)         SEGMENTATION_CAMERA_SLOT="$2"; shift 2 ;;
         --seg-camera-index=*)      SEGMENTATION_CAMERA_INDEX="${1#*=}"; shift ;;
@@ -109,6 +144,12 @@ cleanup() {
     pkill -f "scripts/alpamayo_infer.py" 2>/dev/null || true
     pkill -f "scripts/clrnet_infer.py" 2>/dev/null || true
     pkill -f "scripts/segmentation_infer.py" 2>/dev/null || true
+    pkill -f "web/app.py" 2>/dev/null || true
+    if command -v lsof >/dev/null 2>&1; then
+        for pid in $(lsof -ti tcp:5050 2>/dev/null || true); do
+            kill "$pid" 2>/dev/null || true
+        done
+    fi
     pkill -f "scripts/ego_state_writer.py" 2>/dev/null || true
     pkill -f "ego_sensor/ego_link.sh" 2>/dev/null || true
     # Any iproxy spawned by ego_link.sh.
@@ -123,6 +164,22 @@ cleanup() {
     rm -rf "$FRAMES_DIR"
 }
 trap cleanup EXIT
+
+# Best-effort stale process cleanup from a previous shell/thread before we bind
+# the Flask port or start a new inference sidecar.
+pkill -f "scripts/ps5_drive.py" 2>/dev/null || true
+pkill -f "scripts/mock_state.py" 2>/dev/null || true
+pkill -f "scripts/autoware_infer.py" 2>/dev/null || true
+pkill -f "scripts/alpamayo_infer.py" 2>/dev/null || true
+pkill -f "scripts/clrnet_infer.py" 2>/dev/null || true
+pkill -f "scripts/segmentation_infer.py" 2>/dev/null || true
+pkill -f "scripts/ego_state_writer.py" 2>/dev/null || true
+pkill -f "web/app.py" 2>/dev/null || true
+if command -v lsof >/dev/null 2>&1; then
+    for pid in $(lsof -ti tcp:5050 2>/dev/null || true); do
+        kill "$pid" 2>/dev/null || true
+    done
+fi
 
 export CART_STATE_FILE="$STATE_FILE"
 export AUTOWARE_STATE_FILE
@@ -142,7 +199,7 @@ mkdir -p "$FRAMES_DIR"
 EGO_LINK_PID=$!
 echo "[start] ego_link pid=$EGO_LINK_PID (USB iproxy supervisor)" \
     >>/tmp/ego_link.log
-/usr/bin/python3 scripts/ego_state_writer.py --state-file "$EGO_STATE_FILE" \
+"$EGO_PYTHON" scripts/ego_state_writer.py --state-file "$EGO_STATE_FILE" \
     >>/tmp/ego_state_writer.log 2>&1 &
 EGO_PID=$!
 echo "[start] ego_state_writer pid=$EGO_PID -> $EGO_STATE_FILE" \
@@ -182,7 +239,7 @@ if [[ "$MODEL" == "autoware" ]]; then
     fi
     # autoware_infer.py needs torch — runs on system Python 3.12 with the
     # Jetson CUDA wheel, not PRODUCTION's uv-managed 3.13.
-    /usr/bin/python3 scripts/autoware_infer.py "${INFER_ARGS[@]}" \
+    "$AUTOWARE_PY" scripts/autoware_infer.py "${INFER_ARGS[@]}" \
         >>/tmp/autoware_infer.log 2>&1 &
     AUTOWARE_PID=$!
     echo "[start] model=autoware (on-device perception)" >>/tmp/autoware_infer.log
@@ -199,7 +256,7 @@ elif [[ "$MODEL" == "clrnet" ]]; then
         echo "[start] VIDEO mode — replaying $VIDEO into clrnet pipeline" \
             >>/tmp/autoware_infer.log
     fi
-    /usr/bin/python3 scripts/clrnet_infer.py "${INFER_ARGS[@]}" \
+    "$AUTOWARE_PY" scripts/clrnet_infer.py "${INFER_ARGS[@]}" \
         >>/tmp/autoware_infer.log 2>&1 &
     AUTOWARE_PID=$!
     echo "[start] model=clrnet (CLRerNet, on-device, target 7 mph)" \
@@ -213,10 +270,14 @@ elif [[ "$MODEL" == "segmentation" ]]; then
     # segmentation_infer closes the loop on actual MPH. If the phone stream is
     # unavailable, it falls back to the calibrated feed-forward pedal pot.
     INFER_ARGS=(--frames-dir "$FRAMES_DIR" --state-file "$AUTOWARE_STATE_FILE"
+                --seg-repo "$SEGMENTATION_REPO"
                 --target-mph "$SEGMENTATION_MPH"
                 --source uvc
                 --calib calibration/cameras/sparsedrive_REAL_pvc_calibration.json
                 --camera-slot "$SEGMENTATION_CAMERA_SLOT"
+                --seg-input-size "$SEGMENTATION_INPUT_SIZE"
+                --actor-detector-imgsz "$SEGMENTATION_ACTOR_DETECTOR_IMGSZ"
+                --actor-detector-hz "$SEGMENTATION_ACTOR_DETECTOR_HZ"
                 --gps-route-gain 0.6
                 --gps-route-max-bias-deg 150
                 --gps-route-lookahead-m 5)
@@ -236,7 +297,7 @@ elif [[ "$MODEL" == "segmentation" ]]; then
         echo "[start] VIDEO mode — replaying $VIDEO into segmentation pipeline" \
             >>/tmp/autoware_infer.log
     fi
-    /usr/bin/python3 scripts/segmentation_infer.py "${INFER_ARGS[@]}" \
+    "$AUTOWARE_PY" scripts/segmentation_infer.py "${INFER_ARGS[@]}" \
         >>/tmp/autoware_infer.log 2>&1 &
     AUTOWARE_PID=$!
     echo "[start] model=segmentation (drive-by-segmentation, target ${SEGMENTATION_MPH} mph, iPhone closed-loop when available)" \
@@ -287,14 +348,14 @@ fi
 # speed from $EGO_STATE_FILE, falling back to iPhone CoreLocation GPS speed
 # from port 5006 when ARKit speed is unavailable. The old gas/brake-derived
 # estimate remains in /state as drive_mph_estimate.
-(cd web && exec python3 app.py) >/tmp/flask.log 2>&1 &
+(cd web && exec "$WEB_PYTHON" app.py) >/tmp/flask.log 2>&1 &
 SRV=$!
 echo "[start] web ui pid=$SRV; MPH source=iPhone ARKit ego speed, GPS fallback" \
     >>/tmp/flask.log
 
 if [[ -n "$MOCK_SPEED" ]]; then
     echo "[start] MOCK mode — mph=$MOCK_SPEED (skipping PS5/Arduino/ODrive)" >>/tmp/ps5_drive.log
-    python3 scripts/mock_state.py --mph "$MOCK_SPEED" --state-file "$STATE_FILE" \
+"$PYTHON_BIN" scripts/mock_state.py --mph "$MOCK_SPEED" --state-file "$STATE_FILE" \
         >>/tmp/ps5_drive.log 2>&1 &
     MOCK_PID=$!
 else
@@ -329,4 +390,16 @@ for i in {1..30}; do
     sleep 0.2
 done
 
-firefox --no-remote --new-instance --profile "$PROFILE" --kiosk http://127.0.0.1:5050
+if [[ -n "$NO_BROWSER" ]]; then
+    echo "[start] browser disabled; web UI at http://127.0.0.1:5050" \
+        >>/tmp/flask.log
+    wait "$SRV"
+elif command -v firefox >/dev/null 2>&1; then
+    firefox --no-remote --new-instance --profile "$PROFILE" --kiosk http://127.0.0.1:5050
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+    open http://127.0.0.1:5050
+    wait "$SRV"
+else
+    echo "[start] ERROR: firefox not found; rerun with --no-browser" >&2
+    wait "$SRV"
+fi

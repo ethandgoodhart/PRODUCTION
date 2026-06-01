@@ -26,6 +26,8 @@ Caddy-Training-Data-*/
 Depth_Caddy-Training-Data-*/
 *.zip
 models/
+*.pt
+vendor/
 ego_evals/
 .claude/
 web/.mapbox_token

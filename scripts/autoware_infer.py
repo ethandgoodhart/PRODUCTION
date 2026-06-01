@@ -51,9 +51,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# autoware_vision_pilot is a sibling of PRODUCTION — hardcoded path lets us
-# run without installing it, since it has no pyproject and lives outside.
-AUTOWARE_ROOT = Path("/home/caddy/autoware_vision_pilot")
+# autoware_vision_pilot is normally a sibling checkout on the cart. On dev
+# laptops we allow a vendored checkout, or an explicit AUTOWARE_ROOT override.
+_LOCAL_AUTOWARE_ROOT = Path(__file__).resolve().parents[1] / "vendor" / "autoware_vision_pilot"
+if _LOCAL_AUTOWARE_ROOT.exists():
+    _DEFAULT_AUTOWARE_ROOT = _LOCAL_AUTOWARE_ROOT
+else:
+    _DEFAULT_AUTOWARE_ROOT = Path("/home/caddy/autoware_vision_pilot")
+AUTOWARE_ROOT = Path(os.environ.get("AUTOWARE_ROOT", str(_DEFAULT_AUTOWARE_ROOT))).expanduser()
 sys.path.insert(0, str(AUTOWARE_ROOT))
 sys.path.insert(0, str(AUTOWARE_ROOT / "Models"))
 
@@ -399,7 +404,7 @@ _EGOLANES_COLORS_NUMPY = np.array([
 ], dtype=np.float32)
 
 
-def load_all_models(device, with_autospeed: bool):
+def load_all_models(device, with_autospeed: bool, dtype):
     """Load every Autoware perception head we display.
 
     JIT trace failures silently fall back to eager mode. AutoSpeed's
@@ -416,7 +421,7 @@ def load_all_models(device, with_autospeed: bool):
     def _load(net, fname):
         net.load_state_dict(torch.load(weights / fname,
                                         weights_only=True, map_location="cpu"))
-        return net.half().to(device).eval()
+        return net.to(device=device, dtype=dtype).eval()
 
     models = {}
     models["scene_seg"] = _load(SceneSegNetwork(), "scene_seg.pth")
@@ -430,13 +435,17 @@ def load_all_models(device, with_autospeed: bool):
         # fully-built model under the 'model' key, not a state_dict.
         asp = torch.load(weights / "auto_speed.pth",
                          map_location="cpu", weights_only=False)["model"]
-        models["auto_speed"] = asp.to(device).eval()
+        models["auto_speed"] = asp.to(device=device, dtype=dtype).eval()
+
+    if device.type != "cuda":
+        print(f"[models] JIT trace skipped on {device.type}; running eager.")
+        return models
 
     print("[models] JIT trace ...")
     dummy_img = torch.randn(1, 3, INF_SIZE[1], INF_SIZE[0],
-                             dtype=torch.float16, device=device)
+                             dtype=dtype, device=device)
     dummy_steer = torch.randn(1, 6, INF_SIZE[1] // 4, INF_SIZE[0] // 4,
-                               dtype=torch.float16, device=device)
+                               dtype=dtype, device=device)
     with torch.no_grad():
         for name in ("scene_seg", "scene_3d", "ego_lanes"):
             try:
@@ -477,12 +486,14 @@ class InferencePipeline:
         import torch.nn.functional as F  # noqa: F401 — used in inference body
         self.torch = torch
         self.device = device
+        self.dtype = torch.float16 if device.type == "cuda" else torch.float32
         self.with_autospeed = with_autospeed
-        self.models = load_all_models(device, with_autospeed=with_autospeed)
+        self.models = load_all_models(device, with_autospeed=with_autospeed,
+                                      dtype=self.dtype)
 
-        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float16,
+        self.mean = torch.tensor([0.485, 0.456, 0.406], dtype=self.dtype,
                                   device=device).view(1, 3, 1, 1)
-        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float16,
+        self.std = torch.tensor([0.229, 0.224, 0.225], dtype=self.dtype,
                                  device=device).view(1, 3, 1, 1)
         self.cityscapes_lut = torch.from_numpy(_CITYSCAPES_LUT_NUMPY).to(device)
         # Pre-built viridis 256-entry BGR LUT for depth viz. cmapy isn't
@@ -506,7 +517,7 @@ class InferencePipeline:
         resized = cv2.resize(frame_bgr, INF_SIZE)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         t = (torch.from_numpy(rgb).to(self.device, non_blocking=True)
-             .permute(2, 0, 1).unsqueeze(0).half() / 255.0)
+             .permute(2, 0, 1).unsqueeze(0).to(dtype=self.dtype) / 255.0)
         return (t - self.mean) / self.std
 
     def _autospeed_preprocess(self, inf_tensor):
@@ -522,7 +533,7 @@ class InferencePipeline:
         if scale != 1.0:
             raw = F.interpolate(raw, size=(nh, nw), mode="bilinear", align_corners=False)
         padded = torch.full((1, 3, th, tw), 114.0 / 255.0,
-                             dtype=torch.float16, device=self.device)
+                             dtype=self.dtype, device=self.device)
         padded[:, :, py:py + nh, px:px + nw] = raw
         return padded, scale, px, py
 
@@ -618,16 +629,21 @@ class InferencePipeline:
         with torch.no_grad():
             # Concurrent SceneSeg / Scene3D / EgoLanes via CUDA streams —
             # they're independent and the GPU has plenty of SM headroom.
-            stream_ss = torch.cuda.Stream()
-            stream_3d = torch.cuda.Stream()
-            stream_el = torch.cuda.Stream()
-            with torch.cuda.stream(stream_ss):
+            if self.device.type == "cuda":
+                stream_ss = torch.cuda.Stream()
+                stream_3d = torch.cuda.Stream()
+                stream_el = torch.cuda.Stream()
+                with torch.cuda.stream(stream_ss):
+                    ss_pred = self.models["scene_seg"](tensor)
+                with torch.cuda.stream(stream_3d):
+                    s3d_pred = self.models["scene_3d"](tensor)
+                with torch.cuda.stream(stream_el):
+                    el_pred = self.models["ego_lanes"](tensor)
+                torch.cuda.synchronize()
+            else:
                 ss_pred = self.models["scene_seg"](tensor)
-            with torch.cuda.stream(stream_3d):
                 s3d_pred = self.models["scene_3d"](tensor)
-            with torch.cuda.stream(stream_el):
                 el_pred = self.models["ego_lanes"](tensor)
-            torch.cuda.synchronize()
 
             # AutoSteer needs two consecutive EgoLanes outputs concatenated
             # along channel dim. First frame: feed the same tensor twice.
@@ -660,7 +676,12 @@ class InferencePipeline:
                     xy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
                     xy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
                     xy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
-                    keep = ops.nms(xy.float(), sc.float(), AUTOSPEED_NMS_IOU)
+                    if xy.device.type == "mps":
+                        keep = ops.nms(
+                            xy.float().cpu(), sc.float().cpu(), AUTOSPEED_NMS_IOU,
+                        ).to(xy.device)
+                    else:
+                        keep = ops.nms(xy.float(), sc.float(), AUTOSPEED_NMS_IOU)
                     xy, sc, ci = xy[keep], sc[keep], ci[keep]
                     # Map letterboxed 640x640 coords back to INF_SIZE.
                     xy[:, [0, 2]] = ((xy[:, [0, 2]] - px) / scale).clamp(0, INF_SIZE[0])
@@ -867,7 +888,12 @@ def main() -> int:
     active_slug = INFERENCE_SLUG
     if not args.no_infer:
         import torch
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
         print(f"[models] device: {device}")
         if device.type == "cuda":
             print(f"[models] gpu: {torch.cuda.get_device_name(0)}")
