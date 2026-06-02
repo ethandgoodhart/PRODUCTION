@@ -42,6 +42,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import seg_fast  # noqa: E402
 import seg_occupancy  # noqa: E402
+import bev_fusion  # noqa: E402
 
 
 SEG_REPO_DEFAULT = Path(
@@ -1024,6 +1025,16 @@ class VideoReader(threading.Thread):
 def write_jpeg_atomic(path: Path, frame_bgr: np.ndarray, quality: int = JPEG_QUALITY) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        return
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(buf.tobytes())
+    os.replace(tmp, path)
+
+
+def write_png_atomic(path: Path, img: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ok, buf = cv2.imencode(".png", img)
     if not ok:
         return
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -3488,6 +3499,14 @@ def main() -> None:
     p.add_argument("--mono3d-score-threshold", type=float, default=0.05)
     p.add_argument("--segmentation-cache-meta", type=Path, default=None,
                    help="Precomputed uint8 segmentation cache metadata for offline video.")
+    p.add_argument("--segmentation-cache-meta-left", type=Path, default=None,
+                   help="Precomputed segmentation cache for the front-left camera.")
+    p.add_argument("--segmentation-cache-meta-right", type=Path, default=None,
+                   help="Precomputed segmentation cache for the front-right camera.")
+    p.add_argument("--camera-slot-left", default="CAM_FRONT_LEFT",
+                   help="E2E calibration slot for the front-left camera.")
+    p.add_argument("--camera-slot-right", default="CAM_FRONT_RIGHT",
+                   help="E2E calibration slot for the front-right camera.")
     p.add_argument("--yolo-cache-file", type=Path, default=None,
                    help="Precomputed YOLO11+ByteTrack detection JSON for offline video.")
     p.add_argument("--yolo-min-conf", type=float, default=0.20)
@@ -3723,6 +3742,32 @@ def main() -> None:
             f"frames={seg_cache.frame_count} shape={seg_cache.height}x{seg_cache.width}",
             flush=True,
         )
+    seg_cache_left: SegmentationMapCache | None = None
+    seg_cache_right: SegmentationMapCache | None = None
+    multi_cam_remaps: list[seg_fast.BevRemap] | None = None
+    if args.segmentation_cache_meta_left is not None:
+        seg_cache_left = SegmentationMapCache(args.segmentation_cache_meta_left)
+        print(f"[seg] left cache {seg_cache_left.data_path} frames={seg_cache_left.frame_count}", flush=True)
+    if args.segmentation_cache_meta_right is not None:
+        seg_cache_right = SegmentationMapCache(args.segmentation_cache_meta_right)
+        print(f"[seg] right cache {seg_cache_right.data_path} frames={seg_cache_right.frame_count}", flush=True)
+    multi_cam_enabled = seg_cache is not None and seg_cache_left is not None and seg_cache_right is not None
+    if multi_cam_enabled:
+        raw_calib = load_json_file(args.calib or (args.seg_repo / "camera_calibration.json"))
+        multi_cam_height_m = calib["extrinsics"]["height_m"]
+        multi_cam_fwd_ft = bev_range.get("forward_ft", 100)
+        multi_cam_side_ft = bev_range.get("side_ft", 50)
+        rt.RANGE_SIDE = multi_cam_side_ft * rt.FT_TO_M
+        bev_geom = seg_occupancy.BevGeometry.from_ranges(
+            rt.BEV_SIZE, rt.RANGE_FWD, rt.RANGE_SIDE
+        )
+        print(
+            f"[seg] multi-cam fusion enabled: "
+            f"slots={args.camera_slot},{args.camera_slot_left},{args.camera_slot_right} "
+            f"range_side_ft={multi_cam_side_ft}",
+            flush=True,
+        )
+
     if remote_segmentation:
         if seg_cache is None:
             print(
@@ -3787,6 +3832,7 @@ def main() -> None:
 
     latest_overlay_bgr: np.ndarray | None = None
     latest_bev_bgr: np.ndarray | None = None
+    latest_bev_cls_map: np.ndarray | None = None
     latest_objects_bgr: np.ndarray | None = None
     latest_yolo_bgr: np.ndarray | None = None
     latest_mono3d_bgr: np.ndarray | None = None
@@ -3909,7 +3955,32 @@ def main() -> None:
                     stage_last = time.perf_counter()
 
                     bev_cls_map = None
-                    if args.bev_mode == "depth":
+                    if multi_cam_enabled and args.video:
+                        seg_map_left = seg_cache_left.get(source_frame_index)
+                        seg_map_right = seg_cache_right.get(source_frame_index)
+                        if multi_cam_remaps is None:
+                            img_h, img_w = seg_map.shape[:2]
+                            raw_calib_local = load_json_file(args.calib or (args.seg_repo / "camera_calibration.json"))
+                            multi_cam_remaps = bev_fusion.build_multi_cam_remaps(
+                                raw_calib_local,
+                                [args.camera_slot, args.camera_slot_left, args.camera_slot_right],
+                                img_h, img_w, rt.BEV_SIZE,
+                                calib["extrinsics"]["height_m"],
+                                range_fwd_ft=bev_range.get("forward_ft", 100),
+                                range_side_ft=bev_range.get("side_ft", 50),
+                            )
+                            print(
+                                f"[seg] built multi-cam BEV remaps "
+                                f"({img_w}x{img_h} -> {rt.BEV_SIZE}x{rt.BEV_SIZE}) "
+                                f"for {len(multi_cam_remaps)} cameras",
+                                flush=True,
+                            )
+                        bev_rgb, bev_cls_map = bev_fusion.fused_bev_colored(
+                            [seg_map, seg_map_left, seg_map_right],
+                            multi_cam_remaps,
+                            palette,
+                        )
+                    elif args.bev_mode == "depth":
                         if args.source != "realsense":
                             raise RuntimeError("--bev-mode depth requires --source realsense")
                         bev_rgb = cloud_bev_rgb(
@@ -4217,6 +4288,8 @@ def main() -> None:
                         latest_overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
                     mark("overlay_ms")
                     if render_viz:
+                        if bev_cls_map is not None:
+                            latest_bev_cls_map = bev_cls_map
                         latest_bev_bgr = draw_bev_viz(
                             bev_rgb, lane_traj, lane_local, rt,
                             occ=latest_occupancy, bev_geom=bev_geom,
@@ -4282,6 +4355,10 @@ def main() -> None:
                     t = time.perf_counter()
                     write_jpeg_atomic(args.frames_dir / "bev.jpg", latest_bev_bgr, quality=85)
                     jpeg_ms["jpeg_bev_ms"] = (time.perf_counter() - t) * 1000.0
+                if latest_bev_cls_map is not None:
+                    t = time.perf_counter()
+                    write_png_atomic(args.frames_dir / "bev_classmap.png", latest_bev_cls_map)
+                    jpeg_ms["png_bev_classmap_ms"] = (time.perf_counter() - t) * 1000.0
                 if latest_objects_bgr is not None:
                     t = time.perf_counter()
                     write_jpeg_atomic(args.frames_dir / "objects.jpg", latest_objects_bgr, quality=85)
@@ -4409,6 +4486,12 @@ def main() -> None:
                         if latest_clrnet_override
                         else (latest_path if inference_ok else [])
                     ),
+                    "bev": {
+                        "bev_size": rt.BEV_SIZE,
+                        "range_fwd_ft": round(rt.RANGE_FWD / rt.FT_TO_M, 1),
+                        "range_side_ft": round(rt.RANGE_SIDE / rt.FT_TO_M, 1),
+                        "multi_cam": bool(multi_cam_enabled),
+                    },
                     "segmentation": {
                         "bev_mode": args.bev_mode,
                         "remote_modal": bool(remote_segmentation),

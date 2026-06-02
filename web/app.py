@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import signal
@@ -6,7 +8,7 @@ import glob
 import threading
 import time
 
-from flask import Flask, Response, abort, jsonify, render_template, request
+from flask import Flask, Response, abort, jsonify, render_template, request, send_from_directory
 
 STATE_FILE = os.environ.get("CART_STATE_FILE", "/tmp/cart_state.json")
 AUTOWARE_STATE_FILE = os.environ.get(
@@ -15,6 +17,7 @@ AUTOWARE_STATE_FILE = os.environ.get(
 EGO_STATE_FILE = os.environ.get("EGO_STATE_FILE", "/tmp/ego_state.json")
 FRAMES_DIR = os.environ.get("CART_FRAMES_DIR", "/tmp/cart_frames")
 TELEOP_CMD_FILE = "/tmp/teleop_cmd.json"
+VIDEO_CONTROL_FILE = os.environ.get("VIDEO_CONTROL_FILE", "/tmp/video_control.json")
 NAV_ROUTE_FILE = os.environ.get("NAV_ROUTE_FILE", "/tmp/nav_route.json")
 GPS_STATE_FILE = os.environ.get("GPS_STATE_FILE", "/tmp/gps_state.json")
 TELEOP_CMD_FRESH_S = 0.50
@@ -33,7 +36,7 @@ CAM_SLUGS = (
     "front", "front_left", "front_right",
     "front_wide", "front_narrow", "left", "right",
     "lanes", "depth", "seg", "objects",
-    "lanes_solo",
+    "lanes_solo", "yolo", "mono3d",
     # Alpamayo-only viz: top-down trajectory tile written by alpamayo_infer.py.
     "bev",
 )
@@ -335,9 +338,38 @@ def _override_display_speed_from_iphone(data: dict, ego: dict, ego_stale: bool) 
     data["iphone_speed_ok"] = False
 
 
+_WEB_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    dist_index = os.path.join(_WEB_DIR, "static", "dist", "index.html")
+    with open(dist_index) as f:
+        return Response(f.read(), mimetype="text/html")
+
+
+@app.route("/assets/<path:filename>")
+def dist_assets(filename: str):
+    dist_dir = os.path.join(_WEB_DIR, "static", "dist", "assets")
+    return send_from_directory(dist_dir, filename)
+
+
+@app.route("/vendor/<path:filename>")
+def dist_vendor(filename: str):
+    dist_dir = os.path.join(_WEB_DIR, "static", "dist", "vendor")
+    return send_from_directory(dist_dir, filename)
+
+
+@app.route("/img/<path:filename>")
+def dist_img(filename: str):
+    dist_dir = os.path.join(_WEB_DIR, "static", "dist", "img")
+    return send_from_directory(dist_dir, filename)
+
+
+@app.route("/models/<path:filename>")
+def dist_models(filename: str):
+    dist_dir = os.path.join(_WEB_DIR, "static", "dist", "models")
+    return send_from_directory(dist_dir, filename)
 
 
 @app.route("/state")
@@ -383,6 +415,8 @@ def state():
         # Alpamayo-only fields (autoware doesn't write these — defaults
         # to 0 / [] so the UI can blindly read them either way).
         "target_speed_mph": float(auto.get("target_speed_mph", 0.0)) if auto else 0.0,
+        "speed_setpoint_mph": float(auto.get("speed_setpoint_mph", 0.0)) if auto else 0.0,
+        "collision_speed_mph": float(auto.get("collision_speed_mph", 0.0)) if auto else 0.0,
         "ego_speed_mph": float(auto.get("ego_speed_mph", 0.0)) if auto else 0.0,
         "ego_speed_ok": bool(auto.get("ego_speed_ok", False)) if auto else False,
         "steer_deg_base": float(auto.get("steer_deg_base", 0.0)) if auto else 0.0,
@@ -390,13 +424,22 @@ def state():
         "steer_lookahead_m": float(auto.get("steer_lookahead_m", 0.0)) if auto else 0.0,
         "target_gas": float(auto.get("target_gas", 0.0)) if auto else 0.0,
         "target_brake": float(auto.get("target_brake", 0.0)) if auto else 0.0,
+        "speed_mode": str(auto.get("speed_mode", "")) if auto else "",
+        "ground_truth_control": (
+            dict(auto.get("ground_truth_control", {}))
+            if auto and isinstance(auto.get("ground_truth_control"), dict) else None
+        ),
         "predicted_path": list(auto.get("predicted_path", [])),
+        "source": str(auto.get("source", "")) if auto else "",
+        "video": dict(auto.get("video", {})) if auto and isinstance(auto.get("video"), dict) else None,
         # Pass the alpamayo diagnostics block through verbatim so the UI
         # can show the per-prediction latency breakdown + live MB/s.
         # Empty dict for autoware (it never writes one), so the JS can
         # safely read .alpamayo?.latency_ms?.gpu etc.
         "alpamayo": dict(auto.get("alpamayo", {})) if auto else {},
         "segmentation": dict(auto.get("segmentation", {})) if auto else {},
+        "autospeed": dict(auto.get("autospeed", {})) if auto else {},
+        "stop_sign": dict(auto.get("stop_sign", {})) if auto else {},
         "stale": auto_stale,
     }
 
@@ -419,6 +462,24 @@ def state():
         data["teleop_url"] = TELEOP_TUNNEL_URL + "/teleop"
 
     return jsonify(data)
+
+
+@app.route("/offline-video-control", methods=["POST"])
+def offline_video_control():
+    payload = request.get_json(silent=True) or {}
+    try:
+        seek_s = float(payload.get("seek_s", 0.0))
+    except (TypeError, ValueError):
+        abort(400)
+    pause = bool(payload.get("pause", False))
+    seek_s = max(0.0, seek_s)
+    _atomic_json_write(VIDEO_CONTROL_FILE, {
+        "seq": time.time_ns(),
+        "ts": time.time(),
+        "seek_s": seek_s,
+        "pause": pause,
+    })
+    return jsonify({"ok": True, "seek_s": seek_s, "pause": pause})
 
 
 def _frame_path(slug: str) -> str | None:
@@ -455,6 +516,19 @@ def cam_snapshot(slug: str):
     except FileNotFoundError:
         abort(404)
     return Response(buf, mimetype="image/jpeg", headers={
+        "Cache-Control": "no-store, must-revalidate",
+    })
+
+
+@app.route("/cam/bev_classmap.png")
+def bev_classmap_png():
+    path = os.path.join(FRAMES_DIR, "bev_classmap.png")
+    try:
+        with open(path, "rb") as f:
+            buf = f.read()
+    except FileNotFoundError:
+        abort(404)
+    return Response(buf, mimetype="image/png", headers={
         "Cache-Control": "no-store, must-revalidate",
     })
 
@@ -798,10 +872,124 @@ def nav_route():
     return jsonify({"ok": True, **payload})
 
 
+_gps_trace_cache = {"points": None, "path": None}
+
+def _load_gps_trace():
+    """Load the GPS trace from the video's companion gps.json."""
+    import math as _math
+    if _gps_trace_cache["points"] is not None:
+        return _gps_trace_cache["points"]
+    auto, _ = _load_json(AUTOWARE_STATE_FILE, 9999)
+    if not auto:
+        return None
+    video = (auto.get("video") or {}).get("path")
+    if not video:
+        return None
+    import pathlib
+    gps_path = pathlib.Path(video).parent / "gps.json"
+    if str(gps_path) == _gps_trace_cache.get("path"):
+        return _gps_trace_cache["points"]
+    _gps_trace_cache["path"] = str(gps_path)
+    try:
+        with open(gps_path) as f:
+            data = json.load(f)
+        samples = data.get("samples", [])
+        pts = [(s["lat"], s["lon"]) for s in samples if "lat" in s and "lon" in s]
+        _gps_trace_cache["points"] = pts if len(pts) > 10 else None
+    except Exception:
+        _gps_trace_cache["points"] = None
+    return _gps_trace_cache["points"]
+
+
+def _gps_trace_turn(lat, lon):
+    """Compute upcoming turn from GPS trace geometry."""
+    import math as _math
+    pts = _load_gps_trace()
+    if not pts or lat is None or lon is None:
+        return None
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return None
+
+    R = 6371000.0
+    def dist_m(la1, lo1, la2, lo2):
+        dlat = _math.radians(la2 - la1)
+        dlon = _math.radians(lo2 - lo1)
+        return _math.sqrt((dlat * R) ** 2 + (dlon * R * _math.cos(_math.radians(la1))) ** 2)
+
+    def bearing(la1, lo1, la2, lo2):
+        dlon = _math.radians(lo2 - lo1)
+        y = _math.sin(dlon) * _math.cos(_math.radians(la2))
+        x = (_math.cos(_math.radians(la1)) * _math.sin(_math.radians(la2))
+             - _math.sin(_math.radians(la1)) * _math.cos(_math.radians(la2)) * _math.cos(dlon))
+        return _math.degrees(_math.atan2(y, x)) % 360
+
+    # Find closest point on trace
+    best_i, best_d = 0, float("inf")
+    for i, (plat, plon) in enumerate(pts):
+        d = dist_m(lat, lon, plat, plon)
+        if d < best_d:
+            best_d = d
+            best_i = i
+    if best_d > 50:
+        return None
+
+    # Look ahead: compute heading at current pos and ~30m ahead
+    LOOKAHEAD_M = 30.0
+    NEAR_M = 5.0
+    # Current heading (from next few points)
+    near_i = best_i
+    acc = 0.0
+    for j in range(best_i, min(best_i + len(pts), len(pts) - 1)):
+        acc += dist_m(pts[j][0], pts[j][1], pts[j + 1][0], pts[j + 1][1])
+        if acc >= NEAR_M:
+            near_i = j + 1
+            break
+    if near_i == best_i:
+        return None
+    current_bearing = bearing(pts[best_i][0], pts[best_i][1], pts[near_i][0], pts[near_i][1])
+
+    # Future heading
+    far_i = best_i
+    acc = 0.0
+    for j in range(best_i, min(best_i + len(pts), len(pts) - 1)):
+        acc += dist_m(pts[j][0], pts[j][1], pts[j + 1][0], pts[j + 1][1])
+        if acc >= LOOKAHEAD_M:
+            far_i = j + 1
+            break
+    if far_i <= near_i:
+        return None
+    future_bearing = bearing(pts[near_i][0], pts[near_i][1], pts[far_i][0], pts[far_i][1])
+
+    # Heading change
+    delta = future_bearing - current_bearing
+    delta = (delta + 180) % 360 - 180  # normalize to [-180, 180]
+
+    if abs(delta) < 12:
+        return {"turn_dir": "straight", "turn_dist_m": round(acc, 1),
+                "turn_text": "KEEP STRAIGHT"}
+    elif delta > 0:
+        label = "TURN RIGHT" if abs(delta) > 30 else "BEAR RIGHT"
+        return {"turn_dir": "right", "turn_dist_m": round(acc, 1),
+                "turn_text": f"{label} {round(acc)}m"}
+    else:
+        label = "TURN LEFT" if abs(delta) > 30 else "BEAR LEFT"
+        return {"turn_dir": "left", "turn_dist_m": round(acc, 1),
+                "turn_text": f"{label} {round(acc)}m"}
+
+
 @app.route("/gps")
 def gps():
     snap = _gps_reader.latest()
     fix = snap.get("fix") or {}
+    if not fix or not snap.get("connected"):
+        file_snap, file_stale = _load_json(GPS_STATE_FILE, 2.0)
+        if file_snap and not file_stale and file_snap.get("connected"):
+            fix = file_snap.get("fix") or {}
+            snap = {"connected": True, "tcp_connected": False,
+                    "stale": False, "host": file_snap.get("host", "file")}
     has_fix = bool(fix) and "lat_deg" in fix and "lon_deg" in fix
     # Pull the next-turn announcement the segmentation brain computes against
     # the active route, so the map UI can render a turn banner from one poll.
@@ -813,6 +1001,14 @@ def gps():
         turn_dir = gr.get("turn_dir")
         turn_dist_m = gr.get("turn_dist_m")
         turn_text = gr.get("turn_text") or ""
+    # If no route-based turn info, compute from GPS trace geometry.
+    if not turn_text and has_fix:
+        trace_turn = _gps_trace_turn(fix.get("lat_deg"), fix.get("lon_deg"))
+        if trace_turn:
+            turn_dir = trace_turn["turn_dir"]
+            turn_dist_m = trace_turn["turn_dist_m"]
+            turn_text = trace_turn["turn_text"]
+
     return jsonify({
         "connected": snap["connected"],
         "tcp_connected": snap["tcp_connected"],
@@ -876,8 +1072,141 @@ def browser_log():
     return "", 204
 
 
+_ego_trace_cache = {"samples": None, "path": None}
+
+@app.route("/ego-trace")
+def ego_trace():
+    """Return the full ego (IMU) trace as a JSON array of {t_s, x_m, y_m, z_m}."""
+    if _ego_trace_cache["samples"] is not None:
+        return jsonify(_ego_trace_cache["samples"])
+    auto, _ = _load_json(AUTOWARE_STATE_FILE, 9999)
+    video_path = (auto or {}).get("video", {}).get("path") if auto else None
+    if not video_path:
+        return jsonify([])
+    import pathlib
+    ego_path = pathlib.Path(video_path).parent / "ego.jsonl"
+    if not ego_path.exists():
+        return jsonify([])
+    try:
+        import math as _m
+        samples = []
+        raw = []
+        with open(ego_path) as f:
+            for line in f:
+                d = json.loads(line)
+                if "x_m" in d and "rel_t" in d:
+                    raw.append(d)
+        gx, gy = 0.0, 0.0
+        for i, d in enumerate(raw):
+            if i > 0:
+                dt = d["rel_t"] - raw[i - 1]["rel_t"]
+                if 0 < dt < 1:
+                    speed = float(d.get("speed_mps", 0) or 0)
+                    yaw = float(d.get("yaw_rad", 0) or 0)
+                    gx += speed * dt * _m.cos(yaw)
+                    gy += speed * dt * _m.sin(yaw)
+            samples.append({
+                "t": round(float(d["rel_t"]), 3),
+                "x": round(gx, 3),
+                "y": round(gy, 3),
+            })
+        _ego_trace_cache["samples"] = samples
+        _ego_trace_cache["path"] = str(ego_path)
+    except Exception:
+        return jsonify([])
+    return jsonify(samples)
+
+
+@app.route("/bev-tuner")
+def bev_tuner():
+    return send_from_directory(os.path.join(_WEB_DIR, "templates"), "bev_tuner.html")
+
+
+@app.route("/bev-tuner/preview")
+def bev_tuner_preview():
+    """Render a BEV from the current camera frame with caller-supplied calib params."""
+    import sys, numpy as np, cv2, math
+
+    scripts_dir = os.path.join(os.path.dirname(_WEB_DIR), "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import seg_fast
+
+    height_m = float(request.args.get("height_m", 1.78))
+    pitch_deg = float(request.args.get("pitch_deg", 3.5))
+    roll_deg = float(request.args.get("roll_deg", 0.0))
+    yaw_deg = float(request.args.get("yaw_deg", 0.0))
+    forward_ft = int(float(request.args.get("forward_ft", 100)))
+    side_ft = int(float(request.args.get("side_ft", 50)))
+    fx = float(request.args.get("fx", 428.0))
+    fy = float(request.args.get("fy", 427.0))
+    cx = float(request.args.get("cx", 317.0))
+    cy = float(request.args.get("cy", 247.0))
+
+    frame_path = _frame_path("front")
+    if frame_path is None:
+        frame_path = _frame_path("front_wide")
+    if frame_path is None:
+        abort(404, "No camera frame available")
+    try:
+        raw = open(frame_path, "rb").read()
+    except FileNotFoundError:
+        abort(404)
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        abort(500, "Failed to decode frame")
+    img_h, img_w = img.shape[:2]
+
+    calib = {
+        "intrinsics": {
+            "model": "pinhole", "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+            "k1": 0.0, "k2": 0.0, "resolution": [img_w, img_h],
+        },
+        "extrinsics": {
+            "height_m": height_m, "pitch_deg": pitch_deg,
+            "roll_deg": roll_deg, "yaw_deg": yaw_deg,
+        },
+        "bev_range": {"forward_ft": forward_ft, "side_ft": side_ft},
+    }
+
+    bev_size = 400
+    remap = seg_fast.build_bev_remap(calib, img_h, img_w, bev_size)
+
+    bev = remap.bg_canvas.copy()
+    colors = img[remap.map_v, remap.map_u]
+    np.copyto(bev, colors, where=remap.valid[..., None])
+    if remap.grid_mask.any():
+        bev[remap.grid_mask] = np.clip(
+            bev[remap.grid_mask].astype(np.int16) + 35, 0, 255
+        ).astype(np.uint8)
+    cv2.fillPoly(bev, [remap.ego_pts], (255, 255, 255))
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.35
+    font_color = (180, 180, 180)
+    font_thick = 1
+    # Y-axis labels (forward distance, left edge)
+    for dist_ft in range(10, forward_ft + 1, 10):
+        by = int((1 - dist_ft * 0.3048 / (forward_ft * 0.3048)) * bev_size)
+        if 0 <= by < bev_size:
+            cv2.putText(bev, f"{dist_ft}ft", (4, by + 4), font, font_scale, font_color, font_thick, cv2.LINE_AA)
+    # X-axis labels (lateral distance, bottom edge)
+    for dist_ft in range(-side_ft, side_ft + 1, 10):
+        bx = int((dist_ft / side_ft * 0.5 + 0.5) * bev_size)
+        if 0 <= bx < bev_size and dist_ft != 0:
+            label = f"{dist_ft}ft"
+            (tw, _), _ = cv2.getTextSize(label, font, font_scale, font_thick)
+            cv2.putText(bev, label, (bx - tw // 2, bev_size - 4), font, font_scale, font_color, font_thick, cv2.LINE_AA)
+
+    _, buf = cv2.imencode(".jpg", bev, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return Response(buf.tobytes(), mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
 if __name__ == "__main__":
-    # threaded=True so multiple MJPEG clients (4 cams × N browsers) don't
-    # serialize on the dev server. Still a dev server — put it behind nginx
-    # for anything other than local use.
-    app.run(host="127.0.0.1", port=5050, debug=False, threaded=True)
+    import sys
+    port = 5050
+    for i, a in enumerate(sys.argv[1:], 1):
+        if a == "--port" and i < len(sys.argv) - 1:
+            port = int(sys.argv[i + 1])
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
