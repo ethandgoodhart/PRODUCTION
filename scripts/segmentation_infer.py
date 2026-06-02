@@ -21,6 +21,7 @@ operator trigger overrides.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import os
@@ -28,7 +29,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+import zlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -39,7 +44,12 @@ import seg_fast  # noqa: E402
 import seg_occupancy  # noqa: E402
 
 
-SEG_REPO_DEFAULT = Path("/home/caddy/drive-by-segmentation")
+SEG_REPO_DEFAULT = Path(
+    os.environ.get(
+        "SEGMENTATION_HOMOGRAPHY_REPO",
+        str(Path.home() / "Programming/drive-by-segmentation"),
+    )
+)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -54,6 +64,7 @@ SEGMENTATION_MAP_FILE_DEFAULT = Path(
 EGO_STATE_FILE_DEFAULT = Path(os.environ.get("EGO_STATE_FILE", "/tmp/ego_state.json"))
 GPS_STATE_FILE_DEFAULT = Path(os.environ.get("GPS_STATE_FILE", "/tmp/gps_state.json"))
 NAV_ROUTE_FILE_DEFAULT = Path(os.environ.get("NAV_ROUTE_FILE", "/tmp/nav_route.json"))
+VIDEO_CONTROL_FILE_DEFAULT = Path(os.environ.get("VIDEO_CONTROL_FILE", "/tmp/video_control.json"))
 
 # Segmentation currently drives from the center-front E2E-calibrated camera.
 SLUGS = ("front",)
@@ -69,7 +80,7 @@ FRONT_CAMERA_BRIGHTNESS = 32
 STEERING_SIGN = -1.0
 STEERING_COLUMN_RATIO = 15.0
 STEERING_EMA = 0.35
-CLRNET_CONF_THRESHOLD = 0.40
+CLRNET_CONF_THRESHOLD = 0.60
 LOOKAHEAD_MIN_M = 2.5
 LOOKAHEAD_MAX_M = 10.0
 LOOKAHEAD_TIME_S = 0.9
@@ -163,46 +174,515 @@ TURN_MIN_DEG = 25.0          # heading change at a route vertex to count as a tu
 TURN_NOW_M = 5.0             # within this distance the call becomes "NOW"
 TURN_ANNOUNCE_MAX_M = 40.0   # don't announce turns farther out than this
 
-# Environment brake. Independent of steering: moving objects (pedestrians,
-# riders, bikes, vehicles) are detected from the SegFormer BEV class map,
-# tracked to estimate velocity, and extrapolated into a future-occupancy risk
-# mask (scripts/seg_occupancy.py, ported from drive-by-segmentation's
-# unified-planner live.py). The planner's trajectory is braked in proportion to
-# how much of it conflicts with that risk mask, with an immediate semantic
-# override for a vulnerable road user sitting directly on the planned path.
-#
-# Smoothed brake fraction (0..1) maps onto the pedal pot:
-#   * gas is cut to 0 once the brake fraction clears ENV_BRAKE_GAS_CUT_FRAC
-#     (coast-then-brake), and
-#   * the UI "protective stop" state / STOP badge trips at ENV_BRAKE_STOP_FRAC.
-ENV_BRAKE_GAS_CUT_FRAC = 0.15
-ENV_BRAKE_STOP_FRAC = 0.5
-# Braking is a per-object SPACE-TIME (time-to-collision) test, not a space-only
-# corridor overlap: for each tracked obstacle we ask whether the cart and the
-# object will be at the same place at the same TIME (seg_occupancy.
-# evaluate_collision_brake). A person standing off to the side never enters the
-# corridor; a person crossing fast clears it before the cart arrives; a person
-# stopped or stepping into the path does not -> brake. Brake is graded by TTC,
-# with a hard-stop floor for anything close and currently dead-ahead. Object
-# forward distance comes from the blob's nearest (feet) point so the no-depth
-# BEV smear doesn't push obstacles artificially far away.
-ENV_BRAKE_CORRIDOR_HALF_M = 0.9   # lateral half-corridor the cart sweeps (m)
-ENV_BRAKE_OBJECT_RADIUS_M = 0.3   # added body radius of the obstacle (m)
-ENV_BRAKE_NEAR_STOP_M = 3.0       # hard-stop floor: dead-ahead obstacle within this (m)
-ENV_BRAKE_HORIZON_S = 4.0         # ignore collisions predicted beyond this TTC (s)
-ENV_BRAKE_HARD_TTC_S = 2.0        # TTC at/below this -> full brake; ramps to 0 by horizon
-# Extra caution for an obstacle the cart cannot get around (person too close, or
-# no room to pass). Image-space backstop: when obstacle pixels fill a large
-# fraction of the lower-centre of the camera view, slow hard / brake graded by
-# coverage. Robust at close range where the BEV ground projection breaks down.
-ENV_BRAKE_IMG_BOTTOM_FRAC = 0.45  # lower portion of the image treated as "near"
-ENV_BRAKE_IMG_CENTER_LO = 0.28    # central horizontal band = directly ahead
-ENV_BRAKE_IMG_CENTER_HI = 0.72
-ENV_BRAKE_IMG_COVER_LO = 0.12     # coverage below this -> no extra brake
-ENV_BRAKE_IMG_COVER_HI = 0.35     # coverage at/above this -> full brake
+# Autospeed controller: unified path-aware obstacle speed management. Replaces
+# the old TTC-brake + PI speed-control stack with a single controller that
+# outputs a commanded_speed in m/s from path geometry and obstacle predictions.
+AUTOSPEED_PATH_WIDTH = 2.0        # half-width (m) of the corridor around the path
+AUTOSPEED_COMFORT_DECEL = 1.5     # max deceleration for normal smooth stops (m/s^2)
+AUTOSPEED_EMERGENCY_DECEL = 3.5   # max deceleration for emergency only (m/s^2)
+AUTOSPEED_MAX_JERK = 0.9          # max rate of change of acceleration (m/s^3)
+AUTOSPEED_LOOKAHEAD_TIME = 6.0    # how far ahead in time to care about obstacles (s)
+AUTOSPEED_MIN_GAP = 2.0           # absolute minimum distance to maintain (m)
+AUTOSPEED_REACTION_BUFFER = 0.5   # extra time margin for safety (s)
+AUTOSPEED_CREEP_SPEED = 0.5       # speed for inching past uncertain situations (m/s)
+AUTOSPEED_DT = 0.1                # control cycle period (s)
 # When a hard protective stop is active, freeze steering (hold the last command)
 # instead of letting the road-mask centerline swerve around the obstacle.
 ENV_BRAKE_FREEZE_STEER = True
+# Legacy constants kept for BEV viz corridor drawing
+ENV_BRAKE_CORRIDOR_HALF_M = AUTOSPEED_PATH_WIDTH
+ENV_BRAKE_NEAR_STOP_M = AUTOSPEED_MIN_GAP
+
+# Stop sign controller: detects stop signs via YOLO, estimates distance from
+# BEV projection, and manages a smooth stop→wait→depart cycle.
+STOP_SIGN_APPROACH_M = 18.0
+STOP_SIGN_STOP_BUFFER_M = 4.0
+STOP_SIGN_WAIT_S = 1.5
+STOP_SIGN_DEPART_RAMP_S = 2.5
+STOP_SIGN_MIN_CONF = 0.28
+STOP_SIGN_MIN_BBOX_AREA = 60
+STOP_SIGN_LOST_FRAMES = 90
+
+CITYSCAPES_COLORS = [
+    (128, 64, 128),   # road
+    (244, 35, 232),   # sidewalk
+    (70, 70, 70),     # building
+    (102, 102, 156),  # wall
+    (190, 153, 153),  # fence
+    (153, 153, 153),  # pole
+    (250, 170, 30),   # traffic light
+    (220, 220, 0),    # traffic sign
+    (107, 142, 35),   # vegetation
+    (152, 251, 152),  # terrain
+    (70, 130, 180),   # sky
+    (220, 20, 60),    # person
+    (255, 0, 0),      # rider
+    (0, 0, 142),      # car
+    (0, 0, 70),       # truck
+    (0, 60, 100),     # bus
+    (0, 80, 100),     # train
+    (0, 0, 230),      # motorcycle
+    (119, 11, 32),    # bicycle
+]
+
+MODEL_VARIANTS = {
+    "b0": "nvidia/segformer-b0-finetuned-cityscapes-1024-1024",
+    "b2": "nvidia/segformer-b2-finetuned-cityscapes-1024-1024",
+    "b5": "nvidia/segformer-b5-finetuned-cityscapes-1024-1024",
+}
+
+
+def load_segformer(variant: str, device: str):
+    from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+
+    name = MODEL_VARIANTS[variant]
+    print(f"Loading {name} on {device}...", flush=True)
+    t0 = time.time()
+    proc = SegformerImageProcessor.from_pretrained(name)
+    model = SegformerForSemanticSegmentation.from_pretrained(name).to(device).eval()
+    params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"  Loaded in {time.time() - t0:.1f}s ({params:.1f}M params)", flush=True)
+    return proc, model
+
+
+def create_overlay(frame_rgb: np.ndarray, seg_map: np.ndarray, alpha: float = 0.45) -> np.ndarray:
+    palette = np.asarray(CITYSCAPES_COLORS, dtype=np.uint8)
+    color_mask = palette[np.clip(seg_map, 0, len(palette) - 1)]
+    return cv2.addWeighted(frame_rgb, 1.0 - alpha, color_mask, alpha, 0.0)
+
+
+def create_bev(seg_map: np.ndarray, calib: dict, bev_size: int = 500,
+               return_class_map: bool = False):
+    remap = seg_fast.build_bev_remap(calib, seg_map.shape[0], seg_map.shape[1], bev_size)
+    palette = np.array(CITYSCAPES_COLORS, dtype=np.uint8)
+    bev = seg_fast.create_bev_cached(seg_map, palette, remap)
+    if return_class_map:
+        return bev, bev_class_map_cached(seg_map, remap)
+    return bev
+
+
+def object_viz_color_rgb(class_name: object) -> tuple[int, int, int]:
+    name = str(class_name or "").lower()
+    if "stop sign" in name or "sign" in name or "light" in name:
+        return (216, 164, 192)
+    if "person" in name or "rider" in name:
+        return (245, 137, 55)
+    if "motorcycle" in name or "bicycle" in name or "bike" in name:
+        return (45, 172, 155)
+    if any(v in name for v in ("car", "truck", "bus", "train", "vehicle")):
+        return (105, 166, 232)
+    return (126, 151, 180)
+
+
+def object_dimensions_3d_m(class_name: object) -> tuple[float, float, float]:
+    name = str(class_name or "").lower()
+    if "bus" in name:
+        return 11.5, 2.6, 3.2
+    if "truck" in name:
+        return 7.0, 2.5, 3.0
+    if "car" in name or "vehicle" in name:
+        return 4.4, 2.0, 1.6
+    if "motorcycle" in name or "bicycle" in name or "bike" in name:
+        return 1.9, 0.7, 1.6
+    if "person" in name or "rider" in name:
+        return 0.8, 0.6, 1.75
+    if "stop sign" in name or "sign" in name or "light" in name:
+        return 0.55, 0.55, 1.9
+    return 1.2, 0.9, 1.5
+
+
+def object_heading_rad(obj: dict) -> float:
+    vx = float(obj.get("vx_mps", 0.0) or 0.0)
+    vy = float(obj.get("vy_mps", 0.0) or 0.0)
+    if math.hypot(vx, vy) > 0.05:
+        return math.atan2(vy, vx)
+    future = obj.get("future_m") if isinstance(obj.get("future_m"), list) else []
+    if future:
+        try:
+            fx, fy = float(future[-1][0]), float(future[-1][1])
+            x = float(obj["x_m"])
+            y = float(obj["y_m"])
+            if math.hypot(fx - x, fy - y) > 0.05:
+                return math.atan2(fy - y, fx - x)
+        except (KeyError, TypeError, ValueError, IndexError):
+            pass
+    return 0.0
+
+
+def object_cuboid_local_m(obj: dict) -> dict | None:
+    try:
+        fwd = float(obj["x_m"])
+        lat = float(obj["y_m"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    length_m, width_m, height_m = object_dimensions_3d_m(obj.get("class_name"))
+    theta = object_heading_rad(obj)
+    forward = np.array([math.cos(theta), math.sin(theta)], dtype=np.float32)
+    left = np.array([-math.sin(theta), math.cos(theta)], dtype=np.float32)
+    center = np.array([fwd, lat], dtype=np.float32)
+    bottom: list[tuple[float, float, float]] = []
+    top: list[tuple[float, float, float]] = []
+    for lf, wl in ((1, 1), (1, -1), (-1, -1), (-1, 1)):
+        p = center + forward * (lf * length_m * 0.5) + left * (wl * width_m * 0.5)
+        bottom.append((float(p[0]), float(p[1]), 0.0))
+        top.append((float(p[0]), float(p[1]), float(height_m)))
+    return {
+        "center_m": [round(fwd, 3), round(lat, 3), round(height_m * 0.5, 3)],
+        "size_m": [round(length_m, 3), round(width_m, 3), round(height_m, 3)],
+        "yaw_rad": round(float(theta), 4),
+        "corners_m": bottom + top,
+        "source": "yolo_ground_plane_class_priors",
+    }
+
+
+def mono3d_objects_to_tracks(objects: list[dict] | None) -> list[dict]:
+    tracks: list[dict] = []
+    for i, obj in enumerate(objects or []):
+        if not isinstance(obj, dict):
+            continue
+        box = obj.get("camera_box3d")
+        if not isinstance(box, list) or len(box) < 7:
+            continue
+        try:
+            cam_x = float(box[0])
+            cam_z = float(box[2])
+            length_m = abs(float(box[3]))
+            height_m = abs(float(box[4]))
+            width_m = abs(float(box[5]))
+            yaw_rad = float(box[6])
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(v) for v in (cam_x, cam_z, length_m, width_m, height_m, yaw_rad)):
+            continue
+        fwd_m = cam_z
+        left_m = cam_x
+        if fwd_m <= 0.2 or fwd_m > 90.0 or abs(left_m) > 50.0:
+            continue
+
+        vx_mps = 0.0
+        vy_mps = 0.0
+        if len(box) >= 9:
+            try:
+                vx_mps = float(box[8])
+                vy_mps = float(box[7])
+            except (TypeError, ValueError):
+                vx_mps = 0.0
+                vy_mps = 0.0
+        speed_mps = math.hypot(vx_mps, vy_mps)
+        future: list[list[float]] = []
+        if speed_mps > 0.05:
+            for step_s in (0.5, 1.0, 1.5, 2.0):
+                future.append([
+                    round(float(fwd_m + vx_mps * step_s), 3),
+                    round(float(left_m + vy_mps * step_s), 3),
+                ])
+
+        confidence = float(obj.get("confidence", 0.0) or 0.0)
+        class_name = str(obj.get("class_name") or "object")
+        track = {
+            "track_id": int(300000 + i),
+            "class_id": int(obj.get("class_id", -1) or -1),
+            "class_name": class_name,
+            "confidence": confidence,
+            "x_m": round(float(fwd_m), 3),
+            "y_m": round(float(left_m), 3),
+            "distance_m": round(float(math.hypot(fwd_m, left_m)), 3),
+            "vx_mps": round(float(vx_mps), 3),
+            "vy_mps": round(float(vy_mps), 3),
+            "speed_mps": round(float(speed_mps), 3),
+            "future_m": future,
+            "future_modes": [{"prob": 1.0, "future_m": future, "source": "mono3d_velocity"}],
+            "future_source": "mono3d_velocity",
+            "length_m": round(float(length_m), 3),
+            "width_m": round(float(width_m), 3),
+            "height_m": round(float(height_m), 3),
+            "yaw_rad": round(float(yaw_rad), 4),
+            "camera_box3d": [float(x) for x in box],
+            "box3d": {
+                "center_m": [round(float(fwd_m), 3), round(float(left_m), 3), round(float(height_m * 0.5), 3)],
+                "size_m": [round(float(length_m), 3), round(float(width_m), 3), round(float(height_m), 3)],
+                "yaw_rad": round(float(yaw_rad), 4),
+                "source": "mmdet3d_fcos3d_camera_box",
+            },
+            "provider": obj.get("provider", "mmdet3d_fcos3d_nuscenes"),
+        }
+        tracks.append(track)
+    return tracks
+
+
+def draw_mono3d_overlay(
+    frame_bgr: np.ndarray,
+    objects: list[dict] | None,
+    calib: dict,
+) -> np.ndarray:
+    out = frame_bgr.copy()
+    h, w = out.shape[:2]
+    intr = calib.get("intrinsics", {})
+    try:
+        fx = float(intr.get("fx", intr.get("focal_length")))
+        fy = float(intr.get("fy", intr.get("focal_length", fx)))
+        cx = float(intr["cx"])
+        cy = float(intr["cy"])
+    except (KeyError, TypeError, ValueError):
+        return out
+
+    def project(pt: tuple[float, float, float]) -> tuple[int, int] | None:
+        x, y, z = pt
+        if z <= 0.15 or not all(math.isfinite(v) for v in (x, y, z)):
+            return None
+        u = fx * x / z + cx
+        v = fy * y / z + cy
+        if not (math.isfinite(u) and math.isfinite(v)):
+            return None
+        return int(round(u)), int(round(v))
+
+    def draw_line(a: tuple[int, int] | None, b: tuple[int, int] | None, color: tuple[int, int, int], thick: int) -> None:
+        if a is None or b is None:
+            return
+        ax, ay = a
+        bx, by = b
+        if (
+            max(ax, bx) < -w or min(ax, bx) > 2 * w
+            or max(ay, by) < -h or min(ay, by) > 2 * h
+        ):
+            return
+        cv2.line(out, a, b, color, thick, cv2.LINE_AA)
+
+    drawn = 0
+    sorted_objects = sorted(
+        [o for o in (objects or []) if isinstance(o, dict)],
+        key=lambda o: float(o.get("confidence", 0.0) or 0.0),
+        reverse=True,
+    )
+    for obj in sorted_objects[:80]:
+        box = obj.get("camera_box3d")
+        if not isinstance(box, list) or len(box) < 7:
+            continue
+        try:
+            x = float(box[0])
+            y_bottom = float(box[1])
+            z = float(box[2])
+            size_x = max(0.05, abs(float(box[3])))
+            size_y = max(0.05, abs(float(box[4])))
+            size_z = max(0.05, abs(float(box[5])))
+            yaw = float(box[6])
+            conf = float(obj.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if z <= 0.15 or not all(math.isfinite(v) for v in (x, y_bottom, z, size_x, size_y, size_z, yaw)):
+            continue
+
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        bottom_pts: list[tuple[float, float, float]] = []
+        top_pts: list[tuple[float, float, float]] = []
+        for x_sign, z_sign in ((1, 1), (1, -1), (-1, -1), (-1, 1)):
+            lx = x_sign * size_x * 0.5
+            lz = z_sign * size_z * 0.5
+            # Camera coordinates: x right, y down, z forward. FCOS3D yaw is
+            # around the camera vertical axis; this is enough for a clear
+            # overlay even when exact dataset conventions vary slightly.
+            px = x + c * lx + s * lz
+            pz = z - s * lx + c * lz
+            bottom_pts.append((px, y_bottom, pz))
+            top_pts.append((px, y_bottom - size_y, pz))
+
+        bottom = [project(p) for p in bottom_pts]
+        top = [project(p) for p in top_pts]
+        visible = [p for p in bottom + top if p is not None and -w <= p[0] <= 2 * w and -h <= p[1] <= 2 * h]
+        if not visible:
+            center = project((x, y_bottom - size_y * 0.5, z))
+            if center is None:
+                continue
+            visible = [center]
+
+        color_rgb = object_viz_color_rgb(obj.get("class_name"))
+        color = tuple(int(v) for v in reversed(color_rgb))
+        shadow = (0, 0, 0)
+        for ring in (bottom, top):
+            for a, b in zip(ring, ring[1:] + ring[:1]):
+                draw_line(a, b, shadow, 5)
+                draw_line(a, b, color, 2)
+        for a, b in zip(bottom, top):
+            draw_line(a, b, shadow, 5)
+            draw_line(a, b, color, 2)
+
+        anchor = min(visible, key=lambda p: p[1])
+        label = f"{obj.get('class_name', 'object')} {conf:.2f}"
+        tx = max(2, min(w - 2, anchor[0]))
+        ty = max(14, min(h - 4, anchor[1] - 6))
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        cv2.rectangle(out, (tx, ty - th - 5), (min(w - 1, tx + tw + 6), ty + 3), shadow, -1)
+        cv2.putText(out, label, (tx + 3, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+        drawn += 1
+
+    summary = f"FCOS3D {drawn}/{len(objects or [])}"
+    cv2.rectangle(out, (8, 8), (150, 30), (0, 0, 0), -1)
+    cv2.putText(out, summary, (14, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+    return out
+
+
+def draw_yolo_overlay(
+    frame_bgr: np.ndarray,
+    objects: list[dict] | None,
+    projector: "GroundPlaneProjector | None" = None,
+) -> np.ndarray:
+    out = frame_bgr.copy()
+    for obj in objects or []:
+        xyxy = obj.get("xyxy") if isinstance(obj, dict) else None
+        if not isinstance(xyxy, list) or len(xyxy) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [int(round(float(v))) for v in xyxy]
+        except (TypeError, ValueError):
+            continue
+        h, w = out.shape[:2]
+        x1, x2 = sorted((max(0, min(w - 1, x1)), max(0, min(w - 1, x2))))
+        y1, y2 = sorted((max(0, min(h - 1, y1)), max(0, min(h - 1, y2))))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        color_rgb = object_viz_color_rgb(obj.get("class_name"))
+        color_bgr = tuple(reversed(color_rgb))
+        box3d = obj.get("box3d")
+        if projector is not None and isinstance(box3d, dict):
+            corners = box3d.get("corners_m")
+            pts = []
+            if isinstance(corners, list) and len(corners) == 8:
+                for corner in corners:
+                    if not isinstance(corner, (list, tuple)) or len(corner) < 3:
+                        pts = []
+                        break
+                    px = projector.local_to_image(float(corner[0]), float(corner[1]), float(corner[2]))
+                    if px is None:
+                        pts = []
+                        break
+                    pts.append((int(round(px[0])), int(round(px[1]))))
+            if len(pts) == 8:
+                edges = (
+                    (0, 1), (1, 2), (2, 3), (3, 0),
+                    (4, 5), (5, 6), (6, 7), (7, 4),
+                    (0, 4), (1, 5), (2, 6), (3, 7),
+                )
+                for a, b in edges:
+                    cv2.line(out, pts[a], pts[b], color_bgr, 2, cv2.LINE_AA)
+            else:
+                cv2.rectangle(out, (x1, y1), (x2, y2), color_bgr, 2, cv2.LINE_AA)
+        else:
+            cv2.rectangle(out, (x1, y1), (x2, y2), color_bgr, 2, cv2.LINE_AA)
+        label = str(obj.get("class_name") or "object")
+        conf = obj.get("confidence")
+        try:
+            label = f"3D {label} {float(conf):.2f}"
+        except (TypeError, ValueError):
+            label = f"3D {label}"
+        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        label_y1 = max(0, y1 - th - baseline - 5)
+        label_y2 = label_y1 + th + baseline + 5
+        label_x2 = min(w - 1, x1 + tw + 8)
+        cv2.rectangle(out, (x1, label_y1), (label_x2, label_y2), color_bgr, -1)
+        cv2.putText(
+            out,
+            label,
+            (x1 + 4, label_y2 - baseline - 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return out
+
+
+class SteeringEstimator:
+    BEV_EMA = 0.30
+    W_BEV = 142.0
+    INTERCEPT = 9.0
+
+    def __init__(self) -> None:
+        self._ema_heading = 0.0
+
+    @property
+    def steering_deg(self) -> float:
+        raw = self.W_BEV * self._ema_heading + self.INTERCEPT
+        return max(-270.0, min(270.0, raw))
+
+    def update_bev(self, lane_local: np.ndarray | None) -> None:
+        if lane_local is None or len(lane_local) < 4:
+            return
+        fwd = lane_local[:, 0]
+        left = lane_local[:, 1]
+        mask = (fwd > 0.5) & (fwd < 3.0)
+        if mask.sum() >= 2:
+            raw_heading = math.atan2(
+                left[mask][-1] - left[mask][0],
+                fwd[mask][-1] - fwd[mask][0],
+            )
+            self._ema_heading = (
+                self.BEV_EMA * raw_heading + (1.0 - self.BEV_EMA) * self._ema_heading
+            )
+
+
+class SegRuntime(SimpleNamespace):
+    FT_TO_M = 0.3048
+    RANGE_FWD = 50 * FT_TO_M
+    RANGE_SIDE = 25 * FT_TO_M
+    BEV_SIZE = 500
+    LOOKAHEAD_FT = 25.0
+    LOOKAHEAD_M = LOOKAHEAD_FT * FT_TO_M
+    SteeringEstimator = SteeringEstimator
+
+    def lookahead_point(self, traj_local: np.ndarray | None):
+        if traj_local is None or len(traj_local) < 4:
+            return None, 0.0
+        fwd = traj_local[1:, 0]
+        left = traj_local[1:, 1]
+        if len(fwd) < 5:
+            return None, 0.0
+        coeffs = np.polyfit(fwd, left, 2)
+        la_fwd_val = self.LOOKAHEAD_M
+        la_left_val = float(np.polyval(coeffs, la_fwd_val))
+        return (la_fwd_val, la_left_val), self.LOOKAHEAD_FT
+
+    def draw_trajectory(self, bev_img: np.ndarray, traj_bev: np.ndarray | None,
+                        color, thickness: int = 3, label: str | None = None) -> None:
+        if traj_bev is None or len(traj_bev) < 2:
+            return
+        pts = traj_bev.copy()
+        valid = (
+            (pts[:, 0] >= 0)
+            & (pts[:, 0] < self.BEV_SIZE)
+            & (pts[:, 1] >= 0)
+            & (pts[:, 1] < self.BEV_SIZE)
+        )
+        if valid.sum() < 2:
+            return
+        for i in range(len(pts) - 1):
+            if valid[i] and valid[i + 1]:
+                cv2.line(
+                    bev_img,
+                    (int(pts[i, 0]), int(pts[i, 1])),
+                    (int(pts[i + 1, 0]), int(pts[i + 1, 1])),
+                    color,
+                    thickness,
+                    cv2.LINE_AA,
+                )
+        for i in range(0, len(pts), 5):
+            if valid[i]:
+                cv2.circle(bev_img, (int(pts[i, 0]), int(pts[i, 1])), 3, color, -1, cv2.LINE_AA)
+        if label:
+            for i in range(len(pts)):
+                if valid[i]:
+                    cv2.putText(
+                        bev_img,
+                        label,
+                        (int(pts[i, 0]) + 6, int(pts[i, 1]) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.35,
+                        color,
+                        1,
+                        cv2.LINE_AA,
+                    )
+                    break
 
 
 def discover_v4l2_indices(count: int = 4, max_scan: int = 16) -> list[int]:
@@ -401,15 +881,77 @@ class CameraReader(threading.Thread):
 
 
 class VideoReader(threading.Thread):
-    def __init__(self, video_path: str, loop: bool = True):
+    def __init__(self, video_path: str, loop: bool = True,
+                 control_file: Path | None = None):
         super().__init__(daemon=True, name="video-reader")
         self.video_path = video_path
         self.loop = loop
+        self.control_file = control_file
         self.lock = threading.Lock()
         self.frame: np.ndarray | None = None
         self.frame_count = 0
         self.last_ok_s = 0.0
+        self.fps = 30.0
+        self.duration_s = 0.0
+        self.total_frames = 0
+        self.position_s = 0.0
+        self.source_frame_index = 0
+        self.paused = False
+        self.last_control_seq = None
         self._stop = threading.Event()
+
+    def _read_control(self) -> dict | None:
+        if self.control_file is None:
+            return None
+        try:
+            with self.control_file.open() as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _apply_control(self, cap: cv2.VideoCapture) -> bool:
+        data = self._read_control()
+        if not data:
+            return False
+        seq = data.get("seq")
+        pause_changed = False
+        with self.lock:
+            old_paused = self.paused
+            self.paused = bool(data.get("pause", False))
+            pause_changed = old_paused != self.paused
+        if seq == self.last_control_seq:
+            return pause_changed
+        self.last_control_seq = seq
+        seek_s = data.get("seek_s")
+        try:
+            seek_s = float(seek_s)
+        except (TypeError, ValueError):
+            return pause_changed
+        if self.duration_s > 0.0:
+            seek_s = float(np.clip(seek_s, 0.0, max(0.0, self.duration_s - 1e-3)))
+        else:
+            seek_s = max(0.0, seek_s)
+        cap.set(cv2.CAP_PROP_POS_MSEC, seek_s * 1000.0)
+        with self.lock:
+            self.position_s = seek_s
+            self.source_frame_index = int(round(seek_s * max(self.fps, 1e-6)))
+        return True
+
+    def status(self) -> dict:
+        with self.lock:
+            return {
+                "path": self.video_path,
+                "duration_s": float(self.duration_s),
+                "position_s": float(self.position_s),
+                "fps": float(self.fps),
+                "frame_index": int(self.source_frame_index),
+                "frame_count": int(self.total_frames),
+                "reader_frame_count": int(self.frame_count),
+                "paused": bool(self.paused),
+                "loop": bool(self.loop),
+                "scrubbable": self.control_file is not None,
+            }
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -418,17 +960,46 @@ class VideoReader(threading.Thread):
                 print(f"[video] failed to open {self.video_path}", flush=True)
                 return
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            duration_s = (total_frames / fps) if total_frames > 0 and fps > 0 else 0.0
+            with self.lock:
+                self.fps = float(fps)
+                self.total_frames = int(total_frames)
+                self.duration_s = float(duration_s)
             period = 1.0 / fps
             next_t = time.monotonic()
             while not self._stop.is_set():
+                control_changed = self._apply_control(cap)
+                with self.lock:
+                    paused = self.paused
+                if paused:
+                    if control_changed:
+                        ok, frame = cap.read()
+                        if ok and frame is not None:
+                            frame = cv2.resize(frame, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
+                            pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+                            src_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                            with self.lock:
+                                self.frame = frame
+                                self.frame_count += 1
+                                self.last_ok_s = time.monotonic()
+                                self.position_s = pos_msec / 1000.0
+                                self.source_frame_index = src_frame
+                    next_t = time.monotonic() + period
+                    time.sleep(0.05)
+                    continue
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     break
                 frame = cv2.resize(frame, (CAM_W, CAM_H), interpolation=cv2.INTER_AREA)
+                pos_msec = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
+                src_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
                 with self.lock:
                     self.frame = frame
                     self.frame_count += 1
                     self.last_ok_s = time.monotonic()
+                    self.position_s = pos_msec / 1000.0
+                    self.source_frame_index = src_frame
                 next_t += period
                 wait = next_t - time.monotonic()
                 if wait > 0:
@@ -548,6 +1119,777 @@ def timed_segment_frame(frame_rgb: np.ndarray, proc, model, device: str) -> tupl
     return seg, timings
 
 
+class ModalSegmentationClient:
+    def __init__(self, app_name: str, function_name: str, variant: str):
+        import modal
+
+        self.variant = variant
+        self.fn = modal.Function.from_name(app_name, function_name)
+
+    def segment(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
+        timings: dict[str, float] = {}
+
+        t = time.perf_counter()
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        ok, enc = cv2.imencode(
+            ".jpg",
+            frame_bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+        )
+        if not ok:
+            raise RuntimeError("failed to JPEG-encode frame for Modal segmentation")
+        jpeg_bytes = enc.tobytes()
+        timings["modal_jpeg_encode_ms"] = (time.perf_counter() - t) * 1000.0
+        timings["modal_jpeg_bytes"] = float(len(jpeg_bytes))
+
+        t = time.perf_counter()
+        result = self.fn.remote(jpeg_bytes, self.variant)
+        timings["modal_roundtrip_ms"] = (time.perf_counter() - t) * 1000.0
+
+        t = time.perf_counter()
+        if result.get("dtype") != "uint8":
+            raise RuntimeError(f"Modal returned unsupported dtype: {result.get('dtype')}")
+        shape = tuple(int(x) for x in result["shape"])
+        raw = zlib.decompress(result["zlib"])
+        seg = np.frombuffer(raw, dtype=np.uint8).reshape(shape).copy()
+        timings["modal_decode_ms"] = (time.perf_counter() - t) * 1000.0
+
+        for k, v in (result.get("timings_ms") or {}).items():
+            try:
+                timings[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+        return seg, timings
+
+
+def timed_segment_frame_modal(
+    frame_rgb: np.ndarray,
+    client: ModalSegmentationClient,
+) -> tuple[np.ndarray, dict[str, float]]:
+    return client.segment(frame_rgb)
+
+
+class ModalMonocular3DClient:
+    def __init__(self, app_name: str, function_name: str, calib: dict, score_thr: float):
+        import modal
+
+        intr = calib["intrinsics"]
+        self.fx = float(intr.get("fx", intr.get("focal_length")))
+        self.fy = float(intr.get("fy", intr.get("focal_length", self.fx)))
+        self.cx = float(intr["cx"])
+        self.cy = float(intr["cy"])
+        self.score_thr = float(score_thr)
+        self.fn = modal.Function.from_name(app_name, function_name)
+        self.provider = f"{app_name}/{function_name}"
+        self.last_ok = False
+        self.last_error = ""
+        self.last_latency_ms = 0.0
+
+    def detect(self, frame_bgr: np.ndarray) -> tuple[np.ndarray | None, list[dict], dict[str, float]]:
+        import base64
+
+        timings: dict[str, float] = {}
+        t = time.perf_counter()
+        ok, enc = cv2.imencode(
+            ".jpg",
+            frame_bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+        )
+        if not ok:
+            raise RuntimeError("failed to JPEG-encode frame for Modal 3D detection")
+        jpeg_bytes = enc.tobytes()
+        timings["mono3d_jpeg_encode_ms"] = (time.perf_counter() - t) * 1000.0
+        timings["mono3d_jpeg_bytes"] = float(len(jpeg_bytes))
+
+        t = time.perf_counter()
+        try:
+            result = self.fn.remote(
+                jpeg_bytes,
+                self.fx,
+                self.fy,
+                self.cx,
+                self.cy,
+                self.score_thr,
+            )
+        except Exception as exc:
+            self.last_ok = False
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.last_latency_ms = (time.perf_counter() - t) * 1000.0
+            timings["mono3d_roundtrip_ms"] = self.last_latency_ms
+            return None, [], timings
+        self.last_latency_ms = (time.perf_counter() - t) * 1000.0
+        timings["mono3d_roundtrip_ms"] = self.last_latency_ms
+
+        for k, v in (result.get("timings_ms") or {}).items():
+            try:
+                timings[f"mono3d_{k}"] = float(v)
+            except (TypeError, ValueError):
+                pass
+
+        viz_bgr = None
+        jpeg_b64 = result.get("viz_jpeg_b64")
+        if isinstance(jpeg_b64, str) and jpeg_b64:
+            raw = base64.b64decode(jpeg_b64)
+            arr = np.frombuffer(raw, dtype=np.uint8)
+            viz_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        objects = result.get("objects") if isinstance(result.get("objects"), list) else []
+        provider = str(result.get("provider") or self.provider)
+        for obj in objects:
+            if isinstance(obj, dict):
+                obj["provider"] = provider
+        self.provider = provider
+        self.last_ok = viz_bgr is not None
+        self.last_error = "" if self.last_ok else "no_visualization_returned"
+        return viz_bgr, objects, timings
+
+    def status(self) -> dict:
+        return {
+            "type": "modal_mmdet3d_fcos3d",
+            "provider": self.provider,
+            "ok": bool(self.last_ok),
+            "error": self.last_error,
+            "latency_ms": round(float(self.last_latency_ms), 3),
+            "score_threshold": float(self.score_thr),
+        }
+
+
+class SegmentationMapCache:
+    def __init__(self, meta_path: Path):
+        with meta_path.open() as f:
+            meta = json.load(f)
+        self.meta_path = meta_path
+        self.meta = meta
+        self.frame_count = int(meta["frame_count"])
+        self.height = int(meta["height"])
+        self.width = int(meta["width"])
+        self.model = str(meta.get("model", ""))
+        data_path = Path(meta["data_path"])
+        if not data_path.is_absolute():
+            data_path = meta_path.parent / data_path
+        self.data_path = data_path
+        self.maps = np.memmap(
+            self.data_path,
+            dtype=np.uint8,
+            mode="r",
+            shape=(self.frame_count, self.height, self.width),
+        )
+
+    def get(self, frame_index: int) -> np.ndarray:
+        idx = int(np.clip(frame_index, 0, self.frame_count - 1))
+        return np.asarray(self.maps[idx], dtype=np.uint8).copy()
+
+
+class GroundPlaneProjector:
+    def __init__(self, calib: dict):
+        intr = calib["intrinsics"]
+        self.model = (intr.get("model") or "equidistant_fisheye").lower()
+        self.fx = float(intr.get("fx", intr.get("focal_length")))
+        self.fy = float(intr.get("fy", intr.get("focal_length", self.fx)))
+        self.cx = float(intr["cx"])
+        self.cy = float(intr["cy"])
+        self.k1 = float(intr.get("k1", 0.0))
+        self.k2 = float(intr.get("k2", 0.0))
+        self.height_m = float(calib["extrinsics"]["height_m"])
+        pitch = math.radians(calib["extrinsics"].get("pitch_deg", 0.0))
+        roll = math.radians(calib["extrinsics"].get("roll_deg", 0.0))
+        yaw = math.radians(calib["extrinsics"].get("yaw_deg", 0.0))
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cr, sr = math.cos(roll), math.sin(roll)
+        cyw, syw = math.cos(yaw), math.sin(yaw)
+        ryaw = np.array([[cyw, -syw, 0], [syw, cyw, 0], [0, 0, 1]], dtype=np.float64)
+        rbase = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float64)
+        rpitch = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]], dtype=np.float64)
+        rroll = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]], dtype=np.float64)
+        self.r_cam_from_ground = rroll @ rpitch @ rbase @ ryaw
+        self.r_ground_from_cam = np.linalg.inv(self.r_cam_from_ground)
+        bev_range = calib.get("bev_range", {})
+        self.range_fwd_m = float(bev_range.get("forward_ft", 100.0)) * 0.3048
+        self.range_side_m = float(bev_range.get("side_ft", 50.0)) * 0.3048
+
+    def _ray_cam(self, u: float, v: float) -> np.ndarray:
+        dx = float(u) - self.cx
+        dy = float(v) - self.cy
+        if self.model in ("pinhole", "brown_conrady", "inverse_brown_conrady",
+                          "modified_brown_conrady", "rectilinear"):
+            ray = np.array([dx / self.fx, dy / self.fy, 1.0], dtype=np.float64)
+            return ray / max(np.linalg.norm(ray), 1e-9)
+        r = math.hypot(dx, dy)
+        if r < 1e-9:
+            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        theta = r / max(self.fx, 1e-9)
+        # k1/k2 are zero for the drive-by calibration, but keep one Newton
+        # correction for fisheye files that include distortion.
+        for _ in range(5):
+            t2 = theta * theta
+            f = self.fx * theta * (1.0 + self.k1 * t2 + self.k2 * t2 * t2) - r
+            df = self.fx * (1.0 + 3.0 * self.k1 * t2 + 5.0 * self.k2 * t2 * t2)
+            if abs(df) < 1e-9:
+                break
+            theta -= f / df
+        s = math.sin(theta)
+        return np.array([s * dx / r, s * dy / r, math.cos(theta)], dtype=np.float64)
+
+    def image_to_local(self, u: float, v: float) -> tuple[float, float] | None:
+        ray_ground = self.r_ground_from_cam @ self._ray_cam(u, v)
+        if ray_ground[2] >= -1e-6:
+            return None
+        scale = -self.height_m / ray_ground[2]
+        point = ray_ground * scale
+        lateral = float(point[0])
+        forward = float(point[1])
+        if forward <= 0.0 or forward > self.range_fwd_m or abs(lateral) > self.range_side_m:
+            return None
+        return forward, lateral
+
+    def local_to_image(self, forward_m: float, lateral_m: float, up_m: float = 0.0) -> tuple[float, float] | None:
+        point_ground = np.array(
+            [float(lateral_m), float(forward_m), -self.height_m + float(up_m)],
+            dtype=np.float64,
+        )
+        point_cam = self.r_cam_from_ground @ point_ground
+        if point_cam[2] <= 1e-6:
+            return None
+        x = point_cam[0] / point_cam[2]
+        y = point_cam[1] / point_cam[2]
+        if self.model in ("pinhole", "brown_conrady", "inverse_brown_conrady",
+                          "modified_brown_conrady", "rectilinear"):
+            return self.fx * x + self.cx, self.fy * y + self.cy
+        r = math.hypot(x, y)
+        if r < 1e-9:
+            return self.cx, self.cy
+        theta = math.atan(r)
+        t2 = theta * theta
+        radius = self.fx * theta * (1.0 + self.k1 * t2 + self.k2 * t2 * t2)
+        return self.cx + radius * x / r, self.cy + radius * y / r
+
+
+class GpsTrace:
+    """Recorded GPS trace for offline video replay.
+
+    Loads the caddy.gps.v1 JSON and interpolates lat/lon at a given
+    video time offset, writing the result to gps_state.json so the
+    Flask /gps endpoint serves it.
+    """
+
+    def __init__(self, path: Path):
+        with path.open() as f:
+            data = json.load(f)
+        self.path = path
+        samples = data.get("samples", [])
+        if not samples:
+            self.times: np.ndarray = np.array([])
+            self.lats: np.ndarray = np.array([])
+            self.lons: np.ndarray = np.array([])
+            self.t0 = 0.0
+            return
+        self.times = np.array([s["t_s"] for s in samples])
+        self.lats = np.array([s["lat"] for s in samples])
+        self.lons = np.array([s["lon"] for s in samples])
+        self.t0 = float(self.times[0])
+
+    def sample_at(self, video_t_s: float) -> dict | None:
+        if len(self.times) == 0:
+            return None
+        abs_t = self.t0 + video_t_s
+        lat = float(np.interp(abs_t, self.times, self.lats))
+        lon = float(np.interp(abs_t, self.times, self.lons))
+        return {"lat_deg": lat, "lon_deg": lon}
+
+    def write_state(self, video_t_s: float, state_path: Path) -> None:
+        pos = self.sample_at(video_t_s)
+        if pos is None:
+            return
+        write_json_atomic(state_path, {
+            "ts": time.time(),
+            "connected": True,
+            "host": "gps_trace",
+            "fix": {
+                "lat_deg": pos["lat_deg"],
+                "lon_deg": pos["lon_deg"],
+                "speed_mps": 0.0,
+                "course_deg": 0.0,
+                "h_acc_m": 1.0,
+                "t_unix": time.time(),
+            },
+        })
+
+
+class CLRNetLaneCache:
+    """Cached CLRNet lane detections for offline replay.
+
+    Loads the JSON output of precompute_clrnet_modal.py and returns
+    per-frame lane lists in the same format as CLRerNetRunner.infer().
+    """
+
+    def __init__(self, path: Path):
+        with path.open() as f:
+            data = json.load(f)
+        self.path = path
+        self.frame_count = int(data.get("frame_count") or 0)
+        self.fps = float(data.get("fps") or 30.0)
+        self.model = str(data.get("model") or "clrnet")
+        self._frames = data.get("frames", [])
+        self._index: dict[int, list] = {}
+        for entry in self._frames:
+            fi = int(entry.get("frame_index", -1))
+            if fi >= 0:
+                self._index[fi] = entry.get("lanes", [])
+
+    def lanes_for_frame(self, frame_index: int) -> list[dict]:
+        idx = int(np.clip(frame_index, 0, max(0, self.frame_count - 1)))
+        raw = self._index.get(idx, [])
+        out = []
+        for lane in raw:
+            pts = lane.get("points")
+            if pts is None or len(pts) < 2:
+                continue
+            out.append({
+                "points": np.array(pts, dtype=np.float32),
+                "score": float(lane.get("score", 0.0)),
+            })
+        return out
+
+
+class YoloDetectionCache:
+    def __init__(self, path: Path):
+        with path.open() as f:
+            data = json.load(f)
+        self.path = path
+        self.data = data
+        self.frames = data.get("frames", [])
+        self.frame_count = int(data.get("frame_count") or len(self.frames))
+        self.fps = float(data.get("fps") or 30.0)
+        self.model = str(data.get("model") or "")
+        self.conf = float(data.get("conf") or 0.0)
+
+    def raw_detections(self, frame_index: int) -> list[dict]:
+        if not self.frames:
+            return []
+        idx = int(np.clip(frame_index, 0, len(self.frames) - 1))
+        return list(self.frames[idx].get("detections", []))
+
+    def detection_local(
+        self,
+        det: dict,
+        projector: GroundPlaneProjector,
+    ) -> tuple[float, float, tuple[float, float]] | None:
+        xyxy = det.get("xyxy") or []
+        if len(xyxy) != 4:
+            return None
+        x1, _, x2, y2 = [float(v) for v in xyxy]
+        foot = ((x1 + x2) * 0.5, y2)
+        local = projector.image_to_local(*foot)
+        if local is None:
+            return None
+        return float(local[0]), float(local[1]), foot
+
+    def track_history(
+        self,
+        frame_index: int,
+        track_id: int | None,
+        projector: GroundPlaneProjector,
+        history_s: float = 3.2,
+    ) -> list[list[float]]:
+        if track_id is None:
+            return []
+        idx = int(np.clip(frame_index, 0, max(0, len(self.frames) - 1)))
+        start = max(0, idx - int(math.ceil(float(history_s) * self.fps)))
+        hist = []
+        for prev_idx in range(start, idx + 1):
+            match = None
+            for prev in self.raw_detections(prev_idx):
+                if prev.get("track_id") == track_id:
+                    match = prev
+                    break
+            if match is None:
+                continue
+            projected = self.detection_local(match, projector)
+            if projected is None:
+                continue
+            fwd, lat, _ = projected
+            t_s = (prev_idx - idx) / max(self.fps, 1e-6)
+            hist.append([round(float(t_s), 3), round(float(fwd), 3), round(float(lat), 3)])
+        return hist
+
+    @staticmethod
+    def constant_velocity_future(
+        fwd: float,
+        lat: float,
+        vx: float,
+        vy: float,
+        horizon_s: float,
+        step_s: float,
+    ) -> list[list[float]]:
+        future = []
+        t = step_s
+        while t <= horizon_s + 1e-6:
+            future.append([round(fwd + vx * t, 3), round(lat + vy * t, 3)])
+            t += step_s
+        return future
+
+    def objects_for_frame(
+        self,
+        frame_index: int,
+        projector: GroundPlaneProjector,
+        horizon_s: float = 4.0,
+        step_s: float = 0.5,
+        lookback_frames: int = 20,
+        history_s: float = 2.0,
+    ) -> list[dict]:
+        idx = int(np.clip(frame_index, 0, max(0, len(self.frames) - 1)))
+        objects = []
+        for det in self.raw_detections(idx):
+            xyxy = det.get("xyxy") or []
+            if len(xyxy) != 4:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in xyxy]
+            projected = self.detection_local(det, projector)
+            if projected is None:
+                continue
+            fwd, lat, foot = projected
+            track_id = det.get("track_id")
+            vx = 0.0
+            vy = 0.0
+            if track_id is not None:
+                for prev_idx in range(idx - 1, max(-1, idx - lookback_frames - 1), -1):
+                    prev_match = None
+                    for prev in self.raw_detections(prev_idx):
+                        if prev.get("track_id") == track_id:
+                            prev_match = prev
+                            break
+                    if prev_match is None:
+                        continue
+                    pxy = prev_match.get("xyxy") or []
+                    if len(pxy) != 4:
+                        continue
+                    px1, py1, px2, py2 = [float(v) for v in pxy]
+                    prev_local = projector.image_to_local((px1 + px2) * 0.5, py2)
+                    if prev_local is None:
+                        continue
+                    dt = (idx - prev_idx) / max(self.fps, 1e-6)
+                    if dt > 1e-6:
+                        vx = (fwd - prev_local[0]) / dt
+                        vy = (lat - prev_local[1]) / dt
+                    break
+            speed = float(math.hypot(vx, vy))
+            future = self.constant_velocity_future(fwd, lat, vx, vy, horizon_s, step_s)
+            objects.append({
+                "track_id": int(track_id) if track_id is not None else None,
+                "class_id": int(det.get("class_id", -1)),
+                "class_name": str(det.get("class_name", "object")),
+                "confidence": float(det.get("confidence", 0.0)),
+                "xyxy": [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
+                "footpoint": [round(foot[0], 2), round(foot[1], 2)],
+                "x_m": round(float(fwd), 3),
+                "y_m": round(float(lat), 3),
+                "distance_m": round(float(math.hypot(fwd, lat)), 3),
+                "vx_mps": round(float(vx), 3),
+                "vy_mps": round(float(vy), 3),
+                "speed_mps": round(speed, 3),
+                "future_m": future,
+                "future_modes": [{"prob": 1.0, "future_m": future, "source": "constant_velocity"}],
+                "future_source": "constant_velocity",
+                "history_m": self.track_history(idx, int(track_id) if track_id is not None else None, projector, history_s),
+            })
+        objects.sort(key=lambda o: o["distance_m"])
+        return objects
+
+
+class Mono3DDetectionCache:
+    def __init__(self, path: Path):
+        with path.open() as f:
+            data = json.load(f)
+        self.path = path
+        self.data = data
+        self.frame_count = int(data.get("frame_count") or 0)
+        self.fps = float(data.get("fps") or 30.0)
+        self.provider = str(data.get("provider") or data.get("model") or "mmdet3d_fcos3d_nuscenes")
+        self.score_threshold = float(data.get("score_threshold") or 0.0)
+        viz_dir_raw = str(data.get("viz_dir") or "")
+        self.viz_dir = (path.parent / viz_dir_raw) if viz_dir_raw else path.with_suffix(".viz")
+        self._index: dict[int, dict] = {}
+        for entry in data.get("frames", []):
+            try:
+                frame_index = int(entry.get("frame_index", -1))
+            except (TypeError, ValueError):
+                continue
+            if frame_index >= 0:
+                self._index[frame_index] = entry
+
+    def entry_for_frame(self, frame_index: int) -> dict | None:
+        if not self._index:
+            return None
+        idx = int(np.clip(frame_index, 0, max(0, self.frame_count - 1)))
+        return self._index.get(idx)
+
+    def objects_for_frame(self, frame_index: int) -> list[dict]:
+        entry = self.entry_for_frame(frame_index)
+        raw = entry.get("objects", []) if isinstance(entry, dict) else []
+        objects = []
+        for obj in raw:
+            if not isinstance(obj, dict):
+                continue
+            clean = dict(obj)
+            clean["provider"] = self.provider
+            objects.append(clean)
+        return objects
+
+    def viz_for_frame(self, frame_index: int) -> np.ndarray | None:
+        entry = self.entry_for_frame(frame_index)
+        if not isinstance(entry, dict):
+            return None
+        rel = entry.get("viz")
+        if not rel:
+            return None
+        path = self.viz_dir / str(rel)
+        if not path.exists():
+            return None
+        return cv2.imread(str(path), cv2.IMREAD_COLOR)
+
+    def status(self) -> dict:
+        return {
+            "type": "cache_mmdet3d_fcos3d",
+            "provider": self.provider,
+            "ok": bool(self._index),
+            "error": "",
+            "latency_ms": 0.0,
+            "score_threshold": self.score_threshold,
+            "cache_file": str(self.path),
+            "viz_dir": str(self.viz_dir),
+        }
+
+
+class ObjectTrajectoryPredictorClient:
+    def __init__(self, url: str | None, timeout_s: float = 0.25):
+        self.url = (url or "").strip()
+        self.timeout_s = float(timeout_s)
+        self.last_ok = False
+        self.last_error = ""
+        self.last_latency_ms = 0.0
+        self.provider = "constant_velocity"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
+
+    def _request_payload(
+        self,
+        frame_index: int,
+        fps: float,
+        objects: list[dict],
+        ego_speed_mps: float,
+        ego_path_m: list[list[float]],
+        horizon_s: float,
+        step_s: float,
+    ) -> dict:
+        agents = []
+        for obj in objects:
+            agents.append({
+                "track_id": obj.get("track_id"),
+                "class_id": obj.get("class_id"),
+                "class_name": obj.get("class_name"),
+                "confidence": obj.get("confidence"),
+                "state": {
+                    "x_m": obj.get("x_m"),
+                    "y_m": obj.get("y_m"),
+                    "vx_mps": obj.get("vx_mps"),
+                    "vy_mps": obj.get("vy_mps"),
+                    "speed_mps": obj.get("speed_mps"),
+                },
+                "history_m": obj.get("history_m", []),
+            })
+        return {
+            "schema": "caddy.object_prediction.v1",
+            "frame_index": int(frame_index),
+            "fps": float(fps),
+            "horizon_s": float(horizon_s),
+            "step_s": float(step_s),
+            "ego": {
+                "speed_mps": float(ego_speed_mps),
+                "planned_path_m": ego_path_m,
+            },
+            "agents": agents,
+        }
+
+    @staticmethod
+    def _clean_future(points: object) -> list[list[float]]:
+        if not isinstance(points, list):
+            return []
+        out = []
+        for pt in points:
+            if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                continue
+            try:
+                x = float(pt[0])
+                y = float(pt[1])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(x) and math.isfinite(y):
+                out.append([round(x, 3), round(y, 3)])
+        return out
+
+    def apply(
+        self,
+        frame_index: int,
+        fps: float,
+        objects: list[dict],
+        ego_speed_mps: float,
+        ego_path_m: list[list[float]],
+        horizon_s: float,
+        step_s: float,
+    ) -> list[dict]:
+        if not self.enabled or not objects:
+            self.last_ok = False
+            self.last_error = "" if not self.enabled else "no_objects"
+            self.provider = "constant_velocity"
+            return objects
+        payload = self._request_payload(
+            frame_index, fps, objects, ego_speed_mps, ego_path_m, horizon_s, step_s
+        )
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        t0 = time.perf_counter()
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                body = resp.read(8 * 1024 * 1024)
+            result = json.loads(body.decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
+            self.last_ok = False
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.last_latency_ms = (time.perf_counter() - t0) * 1000.0
+            self.provider = "constant_velocity"
+            return objects
+        self.last_latency_ms = (time.perf_counter() - t0) * 1000.0
+        by_id: dict[int, dict] = {}
+        for item in result.get("agents", []):
+            if not isinstance(item, dict):
+                continue
+            tid = item.get("track_id")
+            if tid is None:
+                continue
+            try:
+                by_id[int(tid)] = item
+            except (TypeError, ValueError):
+                continue
+        used = 0
+        provider = str(result.get("provider") or result.get("model") or "external")
+        for obj in objects:
+            tid = obj.get("track_id")
+            if tid is None:
+                continue
+            pred = by_id.get(int(tid))
+            if pred is None:
+                continue
+            modes = []
+            raw_modes = pred.get("modes")
+            if isinstance(raw_modes, list):
+                for mode in raw_modes:
+                    if not isinstance(mode, dict):
+                        continue
+                    future = self._clean_future(mode.get("future_m"))
+                    if not future:
+                        continue
+                    try:
+                        prob = float(mode.get("prob", 1.0))
+                    except (TypeError, ValueError):
+                        prob = 1.0
+                    modes.append({
+                        "prob": float(np.clip(prob, 0.0, 1.0)),
+                        "future_m": future,
+                        "source": provider,
+                    })
+            else:
+                future = self._clean_future(pred.get("future_m"))
+                if future:
+                    modes.append({"prob": 1.0, "future_m": future, "source": provider})
+            if not modes:
+                continue
+            modes.sort(key=lambda m: float(m.get("prob", 0.0)), reverse=True)
+            obj["future_modes"] = modes
+            obj["future_m"] = modes[0]["future_m"]
+            obj["future_source"] = provider
+            used += 1
+        self.last_ok = used > 0
+        self.last_error = "" if self.last_ok else "response_had_no_matching_tracks"
+        self.provider = provider if self.last_ok else "constant_velocity"
+        return objects
+
+    def status(self) -> dict:
+        return {
+            "type": "http_json" if self.enabled else "constant_velocity",
+            "url": self.url or None,
+            "provider": self.provider,
+            "ok": bool(self.last_ok),
+            "error": self.last_error,
+            "latency_ms": round(float(self.last_latency_ms), 3),
+        }
+
+
+class ControlTrace:
+    def __init__(self, path: Path):
+        self.path = path
+        self.times: list[float] = []
+        self.samples: list[dict] = []
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict) or "rel_t" not in row:
+                    continue
+                try:
+                    rel_t = float(row["rel_t"])
+                except (TypeError, ValueError):
+                    continue
+                self.times.append(rel_t)
+                self.samples.append(row)
+        order = sorted(range(len(self.times)), key=self.times.__getitem__)
+        self.times = [self.times[i] for i in order]
+        self.samples = [self.samples[i] for i in order]
+
+    def sample_at(self, rel_t: float | None) -> dict | None:
+        if rel_t is None or not self.samples:
+            return None
+        idx = bisect.bisect_right(self.times, max(0.0, float(rel_t))) - 1
+        idx = max(0, min(idx, len(self.samples) - 1))
+        row = self.samples[idx]
+
+        def f(key: str, default: float = 0.0) -> float:
+            try:
+                return float(row.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        steer = f("column_deg_actual", f("steer_deg", 0.0))
+        gas_frac = f("gas_frac", 0.0)
+        brake_frac = f("brake_frac", 0.0)
+        if "gas_frac" not in row:
+            gas_frac = f("gas", 0.0) / max(f("gas_cap", 1.0), 1e-6)
+        if "brake_frac" not in row:
+            brake_frac = f("brake", 0.0) / max(f("brake_max", 1.0), 1e-6)
+        return {
+            "source": str(self.path),
+            "rel_t": round(f("rel_t"), 3),
+            "steer_deg": round(steer, 3),
+            "gas": round(f("gas", 0.0), 4),
+            "brake": round(f("brake", 0.0), 4),
+            "gas_frac": round(float(np.clip(gas_frac, 0.0, 1.0)), 4),
+            "brake_frac": round(float(np.clip(brake_frac, 0.0, 1.0)), 4),
+            "mph": round(f("mph", 0.0), 3),
+            "autosteer": bool(row.get("autosteer", False)),
+            "mode": row.get("mode"),
+        }
+
+
 def read_ego_speed_mph(path: Path, fresh_s: float = 1.0) -> tuple[float, bool]:
     try:
         with path.open() as f:
@@ -583,86 +1925,437 @@ def constant_gas_for_mph(target_mph: float) -> float:
     return float(np.clip(max(target_mph * GAS_PER_MPH, ROLLING_GAS_FLOOR), 0.0, 1.0))
 
 
-class SpeedController:
-    """PI on (target_mph - ego_mph), output added to the open-loop gas."""
+class AutoSpeedController:
+    """Unified path-aware obstacle speed controller.
+
+    Replaces SpeedController + evaluate_yolo_collision + PedalCommandSmoother.
+    Computes a commanded_speed (m/s) from path geometry and obstacle predictions
+    with jerk-limited smoothing and emergency override.
+    """
 
     def __init__(self) -> None:
-        self.integral = 0.0
-        self.last_t = None
+        self.previous_accel = 0.0
         self.last_gas = 0.0
+        self.speed_limits: list[dict] = []
+        self.emergency_active = False
+        self.desired_accel = 0.0
 
     def reset(self) -> None:
-        self.integral = 0.0
-        self.last_t = None
+        self.previous_accel = 0.0
         self.last_gas = 0.0
+        self.speed_limits = []
+        self.emergency_active = False
+        self.desired_accel = 0.0
 
-    def step(self, target_mph: float, ego_mph: float, ego_ok: bool,
-             feed_forward_gas: float, gas_ceiling: float = 1.0) -> tuple[float, float, float]:
-        """Return (gas, trim, brake). Gas/brake are mutually exclusive.
+    @staticmethod
+    def _find_closest_point_on_path(
+        path: np.ndarray, point: tuple[float, float]
+    ) -> tuple[tuple[float, float], float]:
+        """Find the closest point on a polyline path to a given point.
 
-        `gas_ceiling` lets the launch ramp cap the output without winding
-        the integrator: when the ramp is clipping us low, we suppress
-        integration in the direction that would wind further into the
-        clip — classic conditional-integration anti-windup.
+        Returns (closest_point, path_distance) where path_distance is how far
+        along the path the closest point is (i.e. how far ahead of the cart).
         """
-        now = time.monotonic()
-        dt = 0.1 if self.last_t is None else max(0.0, now - self.last_t)
-        self.last_t = now
-        if not ego_ok:
-            self.integral = 0.0
-            gas_raw = float(np.clip(feed_forward_gas, 0.0, gas_ceiling))
-            gas = self.slew_gas(gas_raw, dt)
-            return gas, 0.0, 0.0
-        err = target_mph - ego_mph
+        px, py = float(point[0]), float(point[1])
+        min_dist_sq = float("inf")
+        best_point = (px, py)
+        best_path_distance = 0.0
+        accumulated = 0.0
 
-        # Trim clamp scales with feed-forward → consistent authority at any
-        # target speed. At 2 mph: ±0.10 ; at 8 mph: ±0.36.
-        trim_clamp = max(GAS_TRIM_FLOOR, GAS_TRIM_SCALE * feed_forward_gas)
+        for i in range(len(path) - 1):
+            ax, ay = float(path[i, 0]), float(path[i, 1])
+            bx, by = float(path[i + 1, 0]), float(path[i + 1, 1])
+            dx, dy = bx - ax, by - ay
+            seg_len_sq = dx * dx + dy * dy
+            if seg_len_sq < 1e-12:
+                accumulated += 0.0
+                continue
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / seg_len_sq))
+            proj_x = ax + t * dx
+            proj_y = ay + t * dy
+            d_sq = (px - proj_x) ** 2 + (py - proj_y) ** 2
+            if d_sq < min_dist_sq:
+                min_dist_sq = d_sq
+                best_point = (proj_x, proj_y)
+                seg_len = math.sqrt(seg_len_sq)
+                best_path_distance = accumulated + t * seg_len
+            accumulated += math.sqrt(seg_len_sq)
 
-        # Provisional integral, with conditional anti-windup:
-        # don't integrate further into the direction we're already saturated.
-        trial_integral = self.integral + err * dt
-        trim_unclipped = SPEED_KP * err + SPEED_KI * trial_integral
-        gas_unclipped = feed_forward_gas + trim_unclipped
-        saturated_high = gas_unclipped > gas_ceiling
-        saturated_low = gas_unclipped < 0.0
-        winding_into_clip = (
-            (saturated_high and err > 0) or (saturated_low and err < 0)
-        )
-        if not winding_into_clip:
-            self.integral = float(np.clip(
-                trial_integral,
-                -SPEED_I_CLAMP / max(SPEED_KI, 1e-6),
-                 SPEED_I_CLAMP / max(SPEED_KI, 1e-6),
-            ))
+        return best_point, best_path_distance
 
-        trim = SPEED_KP * err + SPEED_KI * self.integral
-        trim = float(np.clip(trim, -trim_clamp, trim_clamp))
-        gas_raw = float(np.clip(feed_forward_gas + trim, 0.0, gas_ceiling))
-        gas = self.slew_gas(gas_raw, dt)
+    @staticmethod
+    def _get_path_direction_at(path: np.ndarray, point: tuple[float, float]) -> tuple[float, float]:
+        """Unit vector tangent to the path at the given point."""
+        px, py = float(point[0]), float(point[1])
+        best_i = 0
+        min_dist_sq = float("inf")
+        for i in range(len(path) - 1):
+            ax, ay = float(path[i, 0]), float(path[i, 1])
+            bx, by = float(path[i + 1, 0]), float(path[i + 1, 1])
+            mx, my = (ax + bx) * 0.5, (ay + by) * 0.5
+            d_sq = (px - mx) ** 2 + (py - my) ** 2
+            if d_sq < min_dist_sq:
+                min_dist_sq = d_sq
+                best_i = i
+        ax, ay = float(path[best_i, 0]), float(path[best_i, 1])
+        bx, by = float(path[best_i + 1, 0]), float(path[best_i + 1, 1])
+        dx, dy = bx - ax, by - ay
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            return (1.0, 0.0)
+        return (dx / length, dy / length)
 
-        # Engine braking via gas-off comes "free" — only blend in pad brake
-        # when we're still over target *with gas already at zero*. This keeps
-        # cruise running on gas alone and only touches the pedal pad when
-        # gravity (downhill) wants to push us past target.
-        brake = 0.0
-        overshoot = ego_mph - target_mph - BRAKE_DEADBAND_MPH
-        if gas <= 1e-3 and overshoot > 0.0:
-            brake = float(np.clip(BRAKE_KP * overshoot, 0.0, BRAKE_MAX))
-        return gas, trim, brake
+    def compute(
+        self,
+        path: np.ndarray | None,
+        obstacles: list[dict],
+        current_speed: float,
+        max_speed: float,
+    ) -> float:
+        """Compute commanded speed (m/s) from path, obstacles, and current state."""
+        dt = AUTOSPEED_DT
+        self.speed_limits = []
+        self.emergency_active = False
 
-    def slew_gas(self, gas: float, dt: float) -> float:
-        dt = max(0.0, min(0.25, dt))
+        if path is None or len(path) < 2:
+            path_ok = False
+        else:
+            path_ok = True
+
+        speed_limits_raw: list[float] = []
+        speed_limit_details: list[dict] = []
+
+        for obj in obstacles:
+            x_m = float(obj.get("x_m", 0.0))
+            y_m = float(obj.get("y_m", 0.0))
+            vx = float(obj.get("vx_mps", 0.0))
+            vy = float(obj.get("vy_mps", 0.0))
+            cls = str(obj.get("class_name", "unknown"))
+            conf = float(obj.get("confidence", 0.0))
+            if conf < 0.20:
+                continue
+            if x_m <= 0.0:
+                continue
+
+            if not path_ok:
+                # No path — use simple forward distance
+                lateral_offset = abs(y_m)
+                conflict_path_distance = x_m
+            else:
+                closest_pt, path_distance = self._find_closest_point_on_path(
+                    path, (x_m, y_m)
+                )
+                lateral_offset = math.hypot(
+                    x_m - closest_pt[0], y_m - closest_pt[1]
+                )
+
+                min_future_lateral = lateral_offset
+                conflict_path_distance = path_distance
+
+                for t_step in (0.5, 1.0, 1.5, 2.0):
+                    fx = x_m + vx * t_step
+                    fy = y_m + vy * t_step
+                    f_closest, f_path_dist = self._find_closest_point_on_path(
+                        path, (fx, fy)
+                    )
+                    f_lateral = math.hypot(
+                        fx - f_closest[0], fy - f_closest[1]
+                    )
+                    if f_lateral < min_future_lateral:
+                        min_future_lateral = f_lateral
+                        conflict_path_distance = f_path_dist
+
+                lateral_offset = min_future_lateral
+
+            if lateral_offset > AUTOSPEED_PATH_WIDTH:
+                continue
+            if conflict_path_distance < 0:
+                continue
+
+            lateral_factor = 1.0 - (lateral_offset / AUTOSPEED_PATH_WIDTH)
+            lateral_factor = max(0.0, min(1.0, lateral_factor))
+
+            if path_ok and len(path) >= 2:
+                closest_pt_for_dir, _ = self._find_closest_point_on_path(
+                    path, (x_m, y_m)
+                )
+                path_dir = self._get_path_direction_at(path, closest_pt_for_dir)
+                obstacle_speed_along_path = vx * path_dir[0] + vy * path_dir[1]
+            else:
+                obstacle_speed_along_path = vx
+
+            closing_speed = current_speed - obstacle_speed_along_path
+
+            stopping_distance_available = max(
+                0.0, conflict_path_distance - AUTOSPEED_MIN_GAP
+            )
+
+            is_vehicle = cls in ("car", "truck", "bus", "train")
+
+            if closing_speed <= 0 and lateral_factor < 0.8:
+                safe_speed = max_speed
+            elif is_vehicle and closing_speed <= 0:
+                safe_speed = max_speed
+            else:
+                physics_limit = math.sqrt(
+                    max(0.0, 2.0 * AUTOSPEED_COMFORT_DECEL * stopping_distance_available)
+                )
+                if is_vehicle and obstacle_speed_along_path > 0:
+                    safe_speed = obstacle_speed_along_path + physics_limit * 0.5
+                else:
+                    safe_speed = physics_limit
+                safe_speed = safe_speed + (max_speed - safe_speed) * (1.0 - lateral_factor)
+
+            speed_limits_raw.append(safe_speed)
+            speed_limit_details.append({
+                "speed_mps": round(float(safe_speed), 3),
+                "speed_mph": round(float(safe_speed) * 2.23694, 1),
+                "obstacle_class": cls,
+                "distance_m": round(float(conflict_path_distance), 2),
+                "lateral_offset_m": round(float(lateral_offset), 2),
+                "lateral_factor": round(float(lateral_factor), 3),
+                "closing_speed_mps": round(float(closing_speed), 2),
+                "track_id": obj.get("track_id"),
+            })
+
+        if not speed_limits_raw:
+            desired_speed = max_speed
+        else:
+            desired_speed = min(speed_limits_raw)
+        desired_speed = max(0.0, min(max_speed, desired_speed))
+
+        # Jerk-limited smoothing
+        desired_accel = (desired_speed - current_speed) / max(dt, 1e-6)
+        if desired_accel > 0:
+            desired_accel = min(desired_accel, AUTOSPEED_COMFORT_DECEL * 0.8)
+        else:
+            desired_accel = max(desired_accel, -AUTOSPEED_COMFORT_DECEL)
+
+        accel_change = desired_accel - self.previous_accel
+        max_accel_change = AUTOSPEED_MAX_JERK * dt
+        if abs(accel_change) > max_accel_change:
+            desired_accel = self.previous_accel + math.copysign(
+                max_accel_change, accel_change
+            )
+
+        commanded_speed = current_speed + desired_accel * dt
+        commanded_speed = max(0.0, min(max_speed, commanded_speed))
+        self.previous_accel = desired_accel
+        self.desired_accel = desired_accel
+
+        # Emergency override
+        for obj in obstacles:
+            x_m = float(obj.get("x_m", 0.0))
+            y_m = float(obj.get("y_m", 0.0))
+            conf = float(obj.get("confidence", 0.0))
+            if conf < 0.20 or x_m <= 0.0:
+                continue
+            if x_m < AUTOSPEED_MIN_GAP and abs(y_m) < AUTOSPEED_PATH_WIDTH:
+                commanded_speed = 0.0
+                self.previous_accel = -AUTOSPEED_EMERGENCY_DECEL
+                self.desired_accel = -AUTOSPEED_EMERGENCY_DECEL
+                self.emergency_active = True
+                break
+
+        self.speed_limits = speed_limit_details
+        return commanded_speed
+
+    def gas_brake_from_speed(
+        self,
+        commanded_speed_mps: float,
+        current_speed_mps: float,
+        max_speed_mps: float,
+    ) -> tuple[float, float]:
+        """Convert commanded speed to gas/brake pot fractions."""
+        commanded_mph = commanded_speed_mps * 2.23694
+        current_mph = current_speed_mps * 2.23694
+
+        if self.emergency_active or commanded_speed_mps < 0.01:
+            self.last_gas = 0.0
+            brake = min(1.0, BRAKE_KP * max(current_mph, 1.0)) if self.emergency_active else 0.0
+            return 0.0, float(np.clip(brake, 0.0, BRAKE_MAX))
+
+        gas = constant_gas_for_mph(commanded_mph)
+        # Slew-rate limit gas changes
+        dt = AUTOSPEED_DT
         rise = GAS_RISE_RATE_PER_S * dt
         fall = GAS_FALL_RATE_PER_S * dt
-        lo = self.last_gas - fall
-        hi = self.last_gas + rise
-        out = float(np.clip(gas, lo, hi))
-        self.last_gas = out
-        return out
+        gas = float(np.clip(gas, self.last_gas - fall, self.last_gas + rise))
+        gas = float(np.clip(gas, 0.0, 1.0))
+        self.last_gas = gas
 
-    def sync_gas(self, gas: float) -> None:
-        self.last_gas = float(np.clip(gas, 0.0, 1.0))
+        brake = 0.0
+        overshoot = current_mph - commanded_mph - BRAKE_DEADBAND_MPH
+        if gas <= 1e-3 and overshoot > 0.0:
+            brake = float(np.clip(BRAKE_KP * overshoot, 0.0, BRAKE_MAX))
+
+        return gas, brake
+
+    def status(self) -> dict:
+        """Status dict for the state JSON."""
+        most_limiting = None
+        if self.speed_limits:
+            most_limiting = min(self.speed_limits, key=lambda s: s["speed_mps"])
+        return {
+            "speed_limits": self.speed_limits[:8],
+            "desired_accel": round(float(self.desired_accel), 3),
+            "emergency_active": bool(self.emergency_active),
+            "corridor_width_m": float(AUTOSPEED_PATH_WIDTH),
+            "most_limiting": most_limiting,
+        }
+
+
+class StopSignController:
+    """State machine for stop sign detection and smooth stop/start behavior.
+
+    Uses YOLO 'stop sign' detections projected to BEV local coordinates to
+    estimate distance.  When a sign is within APPROACH_M, the controller
+    decelerates to a smooth stop at STOP_BUFFER_M before the sign, waits
+    WAIT_S, then ramps back to cruise over DEPART_RAMP_S.
+    """
+
+    CLEAR = 0
+    APPROACHING = 1
+    STOPPED = 2
+    DEPARTING = 3
+
+    def __init__(self) -> None:
+        self.state = self.CLEAR
+        self.stop_target_m = 0.0
+        self.stopped_at: float | None = None
+        self.depart_start: float | None = None
+        self.frames_without_sign = 0
+        self.last_sign: dict | None = None
+
+    def update(
+        self,
+        yolo_objects: list[dict],
+        current_speed_mps: float,
+        max_speed_mps: float,
+        raw_stop_signs: list[dict] | None = None,
+    ) -> float:
+        """Return speed limit (m/s) based on current stop-sign state.
+
+        raw_stop_signs: YOLO detections with class 'stop sign' that may not
+        have BEV projection (x_m).  Distance is estimated from bbox height
+        using a calibrated pinhole model.
+        """
+        signs = []
+        # First try BEV-projected stop signs from yolo_objects
+        for obj in yolo_objects:
+            if obj.get("class_name") != "stop sign":
+                continue
+            if float(obj.get("confidence", 0)) < STOP_SIGN_MIN_CONF:
+                continue
+            x_m = float(obj.get("x_m", 0))
+            if x_m > 0:
+                signs.append({"x_m": x_m, "y_m": float(obj.get("y_m", 0)),
+                              "confidence": float(obj.get("confidence", 0)),
+                              "source": "bev"})
+        # Fall back to raw detections if no BEV-projected signs
+        for det in (raw_stop_signs or []):
+            if float(det.get("confidence", 0)) < STOP_SIGN_MIN_CONF:
+                continue
+            xyxy = det.get("xyxy", [])
+            if len(xyxy) != 4:
+                continue
+            bbox_h = xyxy[3] - xyxy[1]
+            bbox_w = xyxy[2] - xyxy[0]
+            area = bbox_h * bbox_w
+            if area < STOP_SIGN_MIN_BBOX_AREA:
+                continue
+            # Estimate distance from bbox height: real sign ~0.75m tall,
+            # focal length ~320px for 640-wide image.  d = (real_h * fy) / bbox_h
+            est_dist = (0.75 * 320.0) / max(bbox_h, 1.0)
+            cx = (xyxy[0] + xyxy[2]) * 0.5
+            # Lateral from image center (assume 320px center)
+            est_lat = (cx - 320.0) / 320.0 * est_dist * 0.5
+            signs.append({"x_m": est_dist, "y_m": est_lat,
+                          "confidence": float(det.get("confidence", 0)),
+                          "source": "bbox"})
+
+        signs.sort(key=lambda o: o.get("x_m", 999))
+        nearest = signs[0] if signs else None
+
+        if nearest:
+            self.frames_without_sign = 0
+            self.last_sign = nearest
+        else:
+            self.frames_without_sign += 1
+
+        now = time.monotonic()
+
+        if self.state == self.CLEAR:
+            if nearest and nearest["x_m"] < STOP_SIGN_APPROACH_M:
+                self.state = self.APPROACHING
+                self.stop_target_m = max(0.0, nearest["x_m"] - STOP_SIGN_STOP_BUFFER_M)
+            return max_speed_mps
+
+        if self.state == self.APPROACHING:
+            if self.frames_without_sign > STOP_SIGN_LOST_FRAMES:
+                self.state = self.CLEAR
+                self.last_sign = None
+                return max_speed_mps
+            dist = nearest["x_m"] if nearest else (
+                self.last_sign["x_m"] if self.last_sign else 10.0
+            )
+            self.stop_target_m = max(0.0, dist - STOP_SIGN_STOP_BUFFER_M)
+            # Transition to STOPPED when remaining distance is small.
+            # The bbox distance estimate bottoms out at ~4m, so with the
+            # buffer subtracted we may only reach ~0-1m target.  Use a
+            # generous threshold to ensure we actually stop.
+            if self.stop_target_m < 2.5:
+                self.state = self.STOPPED
+                self.stopped_at = now
+                return 0.0
+            # Smooth kinematic speed ramp: v = sqrt(2 * a * d)
+            gentle_decel = min(AUTOSPEED_COMFORT_DECEL, 0.8)
+            safe = math.sqrt(
+                max(0.0, 2.0 * gentle_decel * self.stop_target_m)
+            )
+            linear_ramp = max_speed_mps * min(1.0, self.stop_target_m / 8.0)
+            speed_limit = min(safe, linear_ramp, max_speed_mps)
+            return speed_limit
+
+        if self.state == self.STOPPED:
+            elapsed = now - self.stopped_at if self.stopped_at else 0.0
+            if elapsed >= STOP_SIGN_WAIT_S:
+                self.state = self.DEPARTING
+                self.depart_start = now
+            return 0.0
+
+        if self.state == self.DEPARTING:
+            elapsed = now - self.depart_start if self.depart_start else 0.0
+            frac = min(1.0, elapsed / STOP_SIGN_DEPART_RAMP_S)
+            if frac >= 1.0:
+                self.state = self.CLEAR
+                self.last_sign = None
+            return max_speed_mps * frac
+
+        return max_speed_mps
+
+    def status(self) -> dict:
+        state_names = {0: "clear", 1: "approaching", 2: "stopped", 3: "departing"}
+        sign_info = None
+        if self.last_sign:
+            sign_info = {
+                "x_m": round(float(self.last_sign.get("x_m", 0)), 2),
+                "y_m": round(float(self.last_sign.get("y_m", 0)), 2),
+                "confidence": round(float(self.last_sign.get("confidence", 0)), 3),
+            }
+        wait_remaining = None
+        if self.state == self.STOPPED and self.stopped_at:
+            wait_remaining = round(
+                max(0.0, STOP_SIGN_WAIT_S - (time.monotonic() - self.stopped_at)), 1
+            )
+        return {
+            "state": state_names.get(self.state, "unknown"),
+            "stop_target_m": round(self.stop_target_m, 2),
+            "sign": sign_info,
+            "wait_remaining_s": wait_remaining,
+            "min_confidence": STOP_SIGN_MIN_CONF,
+            "curr_confidence": round(float(self.last_sign.get("confidence", 0)), 3) if self.last_sign else None,
+        }
 
 
 def bev_class_map_cached(seg_map: np.ndarray, remap: seg_fast.BevRemap) -> np.ndarray:
@@ -673,43 +2366,42 @@ def bev_class_map_cached(seg_map: np.ndarray, remap: seg_fast.BevRemap) -> np.nd
     return out
 
 
-def build_environment_threat(
-    collision: dict | None,
-    image: dict | None,
-    brake_01: float,
+def build_environment_threat_from_autospeed(
+    autospeed: AutoSpeedController,
+    commanded_speed_mps: float,
+    num_objects: int,
     enabled: bool,
 ) -> dict:
-    """Summarize the brake decision (space-time collision + image proximity) for state/UI.
-
-    Mirrors the shape the web UI expects from the old protective-stop block
-    (``active`` / ``objects`` / ``threat.{label,x_m}``) and adds the graded
-    fields (``brake_target`` / ``ttc_s`` / ``image_coverage``). The threat
-    label/distance/TTC come from ``evaluate_collision_brake``'s nearest
-    collision; when the image-proximity backstop is the dominant brake the
-    reason reflects an un-navigable obstacle directly ahead."""
-    collision = collision or {}
-    image = image or {}
-    active = bool(enabled and brake_01 >= ENV_BRAKE_STOP_FRAC)
-    coll_brake = float(collision.get("brake_01", 0.0))
-    img_brake = float(image.get("brake_01", 0.0))
-    if active:
-        reason = (
-            "obstacle blocking path ahead (no room to pass)"
-            if img_brake > coll_brake
-            else str(collision.get("reason", ""))
-        )
-    else:
-        reason = ""
+    """Build protective-stop state from the autospeed controller for UI compatibility."""
+    active = bool(enabled and autospeed.emergency_active)
+    most_limiting = autospeed.status().get("most_limiting")
+    threat = None
+    reason = ""
+    if active and most_limiting:
+        reason = f"emergency stop — {most_limiting['obstacle_class']} at {most_limiting['distance_m']:.1f}m"
+        threat = {
+            "label": most_limiting["obstacle_class"],
+            "track_id": most_limiting.get("track_id"),
+            "x_m": most_limiting["distance_m"],
+        }
+    elif most_limiting and commanded_speed_mps < 0.5:
+        active = True
+        reason = f"{most_limiting['obstacle_class']} blocking path at {most_limiting['distance_m']:.1f}m"
+        threat = {
+            "label": most_limiting["obstacle_class"],
+            "track_id": most_limiting.get("track_id"),
+            "x_m": most_limiting["distance_m"],
+        }
     return {
         "enabled": bool(enabled),
         "active": active,
-        "source": "collision" if enabled else None,
+        "source": "autospeed" if enabled else None,
         "reason": reason,
-        "brake_target": round(float(brake_01), 3),
-        "ttc_s": collision.get("ttc_s"),
-        "image_coverage": image.get("coverage", 0.0),
-        "objects": int(collision.get("objects", 0)),
-        "threat": collision.get("threat"),
+        "brake_target": 1.0 if active else 0.0,
+        "ttc_s": None,
+        "image_coverage": 0.0,
+        "objects": int(num_objects),
+        "threat": threat,
     }
 
 
@@ -814,7 +2506,8 @@ def lookahead_heading_steering_deg(lane_local: np.ndarray, lookahead_m: float) -
 def make_sources(args) -> list[CameraReader | VideoReader | RealSenseReader]:
     active_slug = args.active_slug
     if args.video:
-        reader = VideoReader(args.video, loop=not args.no_loop)
+        reader = VideoReader(args.video, loop=not args.no_loop,
+                             control_file=args.video_control_file)
         reader.slug = active_slug
         return [reader]
 
@@ -848,15 +2541,17 @@ def make_sources(args) -> list[CameraReader | VideoReader | RealSenseReader]:
 
 
 def import_segmentation_stack(repo_dir: Path):
-    if not (repo_dir / "live.py").exists():
-        raise RuntimeError(f"drive-by-segmentation repo not found at {repo_dir}")
-    sys.path.insert(0, str(repo_dir))
-    import live as seg_live
-    import render_trajectories as rt
-    from path_planning import lane_aware_centerline_path
-    from render import CITYSCAPES_COLORS, create_bev, create_overlay
-
-    return seg_live, rt, lane_aware_centerline_path, create_bev, create_overlay, CITYSCAPES_COLORS
+    # Keep this branch self-contained: the external drive-by-segmentation repo
+    # supplies only camera_calibration.json homography values, never runtime code.
+    seg_live = SimpleNamespace(load_segformer=load_segformer)
+    return (
+        seg_live,
+        SegRuntime(),
+        seg_fast.lane_aware_centerline_path_fast,
+        create_bev,
+        create_overlay,
+        CITYSCAPES_COLORS,
+    )
 
 
 def import_clrnet_stack():
@@ -1211,9 +2906,53 @@ def gps_route_bias_deg(seg_steer_deg: float, args) -> tuple[float, dict]:
     return bias, diag
 
 
+def gps_route_bearing_rad(args) -> float | None:
+    """Return the GPS route target bearing in BEV coords (0 = forward, + = right).
+
+    Returns None if GPS or route data is unavailable / stale.
+    """
+    route = read_json_if_fresh(args.route_file, None)
+    if route is None or not route.get("active"):
+        return None
+    gps = read_json_if_fresh(args.gps_state_file, GPS_ROUTE_FRESH_S)
+    if gps is None or not gps.get("connected", False):
+        return None
+    fix = gps.get("fix")
+    if not isinstance(fix, dict):
+        return None
+    try:
+        lat = float(fix["lat_deg"])
+        lon = float(fix["lon_deg"])
+        course_deg = float(fix["course_deg"])
+        speed_mps = float(fix.get("speed_mps", 0.0) or 0.0)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not math.isfinite(course_deg) or course_deg < 0.0:
+        return None
+    if speed_mps < GPS_ROUTE_MIN_SPEED_MPS:
+        return None
+    route_ll = route.get("geometry")
+    if not isinstance(route_ll, list) or len(route_ll) < 2:
+        return None
+    target = route_target_enu(route_ll, lat, lon, args.gps_route_lookahead_m)
+    if target is None:
+        return None
+    east, north, remaining_m = target
+    if remaining_m < GPS_ROUTE_DONE_M:
+        return None
+    course = math.radians(course_deg)
+    x_fwd = east * math.sin(course) + north * math.cos(course)
+    y_right = east * math.cos(course) - north * math.sin(course)
+    if x_fwd < 0.5:
+        return None
+    return math.atan2(y_right, x_fwd)
+
+
 def clrnet_device_from_seg_device(device: str) -> str:
     if device == "cuda":
         return "cuda:0"
+    if device == "modal":
+        return "cpu"
     return device
 
 
@@ -1481,6 +3220,240 @@ def draw_bev_viz(bev_rgb: np.ndarray, lane_traj: np.ndarray | None,
     return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
 
 
+def draw_object_viz(
+    bev_rgb: np.ndarray,
+    bev_geom: "seg_occupancy.BevGeometry | None",
+    collision: dict | None,
+    yolo_objects: list[dict] | None = None,
+    autospeed_status: dict | None = None,
+    stop_sign_status: dict | None = None,
+    bev_cls_map: np.ndarray | None = None,
+    clrnet_lanes: list[dict] | None = None,
+    ground_projector: "GroundPlaneProjector | None" = None,
+    clrnet_conf_threshold: float = CLRNET_CONF_THRESHOLD,
+) -> np.ndarray:
+    h, w = bev_rgb.shape[:2]
+    out = np.full((h, w, 3), 255, dtype=np.uint8)
+    if bev_cls_map is not None and bev_cls_map.shape[:2] == (h, w):
+        road_mask = bev_cls_map == 0
+    else:
+        road_color = np.array(CITYSCAPES_COLORS[0], dtype=np.uint8)
+        road_mask = np.all(bev_rgb == road_color, axis=-1)
+    if road_mask.any():
+        out[road_mask] = (205, 205, 205)
+
+    h, w = out.shape[:2]
+    if bev_geom is None:
+        return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+
+    def lane_side(lane: dict) -> str:
+        pts = lane.get("points")
+        if pts is None or len(pts) < 2:
+            return "right"
+        arr = np.asarray(pts, dtype=np.float32)
+        bottom = arr[arr[:, 1] >= 0.5, 0] if np.count_nonzero(arr[:, 1] >= 0.5) >= 2 else arr[:, 0]
+        return "left" if float(np.mean(bottom)) < 0.5 else "right"
+
+    def draw_clrnet_lanes() -> None:
+        if ground_projector is None or not clrnet_lanes:
+            return
+        lane_colors = {
+            "left": (38, 135, 210),
+            "right": (45, 172, 155),
+        }
+        frame_w = float(CAM_W)
+        frame_h = float(CAM_H)
+        for lane in sorted(clrnet_lanes, key=lambda l: float(l.get("score", 0.0))):
+            try:
+                score = float(lane.get("score", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if score < float(clrnet_conf_threshold):
+                continue
+            pts_norm = np.asarray(lane.get("points"), dtype=np.float32)
+            if pts_norm.ndim != 2 or pts_norm.shape[0] < 2 or pts_norm.shape[1] < 2:
+                continue
+            side = lane_side(lane)
+            line_color = lane_colors.get(side, (38, 135, 210))
+            segments: list[list[tuple[int, int]]] = []
+            current: list[tuple[int, int]] = []
+            for x_norm, y_norm in pts_norm:
+                u = float(x_norm) * frame_w
+                v = float(y_norm) * frame_h
+                local = ground_projector.image_to_local(u, v)
+                if local is None:
+                    if len(current) >= 2:
+                        segments.append(current)
+                    current = []
+                    continue
+                bx, by = bev_geom.local_to_bev(local[0], local[1])
+                bxi, byi = int(round(float(bx))), int(round(float(by)))
+                if 0 <= bxi < w and 0 <= byi < h:
+                    current.append((bxi, byi))
+                elif len(current) >= 2:
+                    segments.append(current)
+                    current = []
+            if len(current) >= 2:
+                segments.append(current)
+            for seg in segments:
+                arr = np.array(seg, dtype=np.int32)
+                cv2.polylines(out, [arr], False, line_color, 3, cv2.LINE_AA)
+
+    draw_clrnet_lanes()
+
+    def dashed_polyline(img: np.ndarray, pts: list[tuple[int, int]], color: tuple[int, int, int],
+                        thickness: int = 2, dash_px: float = 9.0, gap_px: float = 7.0) -> None:
+        if len(pts) < 2:
+            return
+        for p0, p1 in zip(pts[:-1], pts[1:]):
+            x0, y0 = p0
+            x1, y1 = p1
+            dx = float(x1 - x0)
+            dy = float(y1 - y0)
+            dist = float(math.hypot(dx, dy))
+            if dist <= 1e-3:
+                continue
+            ux = dx / dist
+            uy = dy / dist
+            pos = 0.0
+            while pos < dist:
+                end = min(pos + dash_px, dist)
+                a = (int(round(x0 + ux * pos)), int(round(y0 + uy * pos)))
+                b = (int(round(x0 + ux * end)), int(round(y0 + uy * end)))
+                cv2.line(img, a, b, color, thickness, cv2.LINE_AA)
+                pos += dash_px + gap_px
+
+    def object_dimensions_m(class_name: object) -> tuple[float, float]:
+        name = str(class_name or "").lower()
+        if "bus" in name or "truck" in name:
+            return 7.0, 2.5
+        if "car" in name or "vehicle" in name:
+            return 4.4, 2.0
+        if "motorcycle" in name or "bicycle" in name or "bike" in name:
+            return 1.9, 0.7
+        if "person" in name or "rider" in name:
+            return 0.8, 0.6
+        if "stop sign" in name or "sign" in name or "light" in name:
+            return 0.55, 0.55
+        return 1.2, 0.9
+
+    def heading_from_track(tk: dict) -> float:
+        try:
+            yaw = float(tk.get("yaw_rad"))
+            if math.isfinite(yaw):
+                return yaw
+        except (TypeError, ValueError):
+            pass
+        vx = float(tk.get("vx_mps", 0.0) or 0.0)
+        vy = float(tk.get("vy_mps", 0.0) or 0.0)
+        if math.hypot(vx, vy) > 0.05:
+            return math.atan2(vy, vx)
+        future = tk.get("future_m") if isinstance(tk.get("future_m"), list) else []
+        if future:
+            try:
+                fx, fy = float(future[-1][0]), float(future[-1][1])
+                x = float(tk["x_m"])
+                y = float(tk["y_m"])
+                if math.hypot(fx - x, fy - y) > 0.05:
+                    return math.atan2(fy - y, fx - x)
+            except (KeyError, TypeError, ValueError, IndexError):
+                pass
+        return 0.0
+
+    def box_points(tk: dict) -> np.ndarray | None:
+        try:
+            x = float(tk["x_m"])
+            y = float(tk["y_m"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        try:
+            length_m = float(tk.get("length_m"))
+            width_m = float(tk.get("width_m"))
+            if not (math.isfinite(length_m) and math.isfinite(width_m) and length_m > 0 and width_m > 0):
+                raise ValueError
+        except (TypeError, ValueError):
+            length_m, width_m = object_dimensions_m(tk.get("class_name"))
+        theta = heading_from_track(tk)
+        forward = np.array([math.cos(theta), math.sin(theta)], dtype=np.float32)
+        left = np.array([-math.sin(theta), math.cos(theta)], dtype=np.float32)
+        center = np.array([x, y], dtype=np.float32)
+        corners = []
+        for lf, wl in ((1, 1), (1, -1), (-1, -1), (-1, 1)):
+            local = center + forward * (lf * length_m * 0.5) + left * (wl * width_m * 0.5)
+            bx, by = bev_geom.local_to_bev(float(local[0]), float(local[1]))
+            corners.append((int(round(float(bx))), int(round(float(by)))))
+        return np.array(corners, dtype=np.int32)
+
+    def draw_object_box(tk: dict, fill: tuple[int, int, int]) -> None:
+        poly = box_points(tk)
+        if poly is None:
+            return
+        edge = tuple(int(max(0, c * 0.55)) for c in fill)
+        cv2.fillPoly(out, [poly], fill, cv2.LINE_AA)
+        cv2.polylines(out, [poly], True, edge, 2, cv2.LINE_AA)
+        p0 = tuple(poly[2])
+        p1 = tuple(poly[3])
+        cv2.line(out, p0, p1, edge, 2, cv2.LINE_AA)
+
+    def draw_short_object_trajectory(tk: dict, start_px: tuple[int, int], modes: list[dict]) -> None:
+        name = str(tk.get("class_name", "")).lower()
+        if "stop sign" in name or "sign" in name or "light" in name:
+            return
+        try:
+            x0 = float(tk["x_m"])
+            y0 = float(tk["y_m"])
+        except (KeyError, TypeError, ValueError):
+            return
+        future = []
+        if modes:
+            future = modes[0].get("future_m", [])
+        if not future:
+            future = tk.get("future_m", [])
+        pts = [start_px]
+        max_len_m = 2.25
+        for fwd_m, left_m in future:
+            try:
+                fx_m = float(fwd_m)
+                fy_m = float(left_m)
+            except (TypeError, ValueError):
+                continue
+            if math.hypot(fx_m - x0, fy_m - y0) > max_len_m and len(pts) >= 2:
+                break
+            fx, fy = bev_geom.local_to_bev(fx_m, fy_m)
+            fxi, fyi = int(round(float(fx))), int(round(float(fy)))
+            if 0 <= fxi < w and 0 <= fyi < h:
+                pts.append((fxi, fyi))
+            if len(pts) >= 5:
+                break
+        if len(pts) < 2:
+            return
+        arr = np.array(pts, dtype=np.int32)
+        cv2.polylines(out, [arr], False, (46, 174, 92), 3, cv2.LINE_AA)
+
+    tracks = yolo_objects or []
+    for i, tk in enumerate(tracks[:12]):
+        try:
+            x = float(tk["x_m"])
+            y = float(tk["y_m"])
+            bx, by = bev_geom.local_to_bev(x, y)
+            bxi, byi = int(round(float(bx))), int(round(float(by)))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (-w <= bxi <= 2 * w and -h <= byi <= 2 * h):
+            continue
+        modes = tk.get("future_modes") if isinstance(tk.get("future_modes"), list) else []
+        if not modes:
+            modes = [{"prob": 1.0, "future_m": tk.get("future_m", [])}]
+        draw_short_object_trajectory(tk, (bxi, byi), modes)
+
+    for tk in reversed(tracks[:12]):
+        draw_object_box(tk, object_viz_color_rgb(tk.get("class_name")))
+
+    return cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+
+
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="drive-by-segmentation WebUI sidecar")
     p.add_argument("--frames-dir", type=Path, default=FRAMES_DIR_DEFAULT)
@@ -1502,10 +3475,36 @@ def main() -> None:
                    help="Ground height for E2E BEV projection when the E2E origin is camera-center.")
     p.add_argument("--model", default="b0", choices=("b0", "b2", "b5"))
     p.add_argument("--device", default=None)
+    p.add_argument("--remote-segmentation-modal", action="store_true",
+                   help="Run SegFormer inference on Modal and keep BEV/planning local.")
+    p.add_argument("--modal-app-name", default="caddy-segformer-remote")
+    p.add_argument("--modal-function-name", default="segment_jpeg")
+    p.add_argument("--mono3d-remote-modal", action="store_true",
+                   help="Run learned monocular 3D detection on Modal and publish mono3d.jpg.")
+    p.add_argument("--mono3d-cache-file", type=Path, default=None,
+                   help="Precomputed FCOS3D cache JSON produced by precompute_mono3d_modal.py.")
+    p.add_argument("--mono3d-modal-app-name", default="caddy-monocular3d-fcos3d")
+    p.add_argument("--mono3d-modal-function-name", default="detect_jpeg")
+    p.add_argument("--mono3d-score-threshold", type=float, default=0.05)
+    p.add_argument("--segmentation-cache-meta", type=Path, default=None,
+                   help="Precomputed uint8 segmentation cache metadata for offline video.")
+    p.add_argument("--yolo-cache-file", type=Path, default=None,
+                   help="Precomputed YOLO11+ByteTrack detection JSON for offline video.")
+    p.add_argument("--yolo-min-conf", type=float, default=0.20)
+    p.add_argument("--object-predictor-url", default=None,
+                   help="Optional HTTP endpoint for model-based object futures. "
+                        "Receives caddy.object_prediction.v1 JSON and returns "
+                        "per-track multimodal futures. Falls back to constant "
+                        "velocity on errors.")
+    p.add_argument("--object-predictor-timeout-ms", type=float, default=250.0)
     p.add_argument("--publish-hz", type=float, default=PUBLISH_HZ_DEFAULT)
     p.add_argument("--infer-hz", type=float, default=INFER_HZ_DEFAULT)
     p.add_argument("--video", default=None)
     p.add_argument("--no-loop", action="store_true")
+    p.add_argument("--video-control-file", type=Path, default=VIDEO_CONTROL_FILE_DEFAULT,
+                   help="JSON control file for offline video seek/pause.")
+    p.add_argument("--control-log-file", type=Path, default=None,
+                   help="Recorded control.jsonl to synchronize ground-truth steering/gas/brake in offline mode.")
     p.add_argument("--max-scan", type=int, default=16)
     p.add_argument("--source", default="uvc", choices=("uvc", "realsense"),
                    help="Active camera source.")
@@ -1513,6 +3512,8 @@ def main() -> None:
                    help="BEV projection mode. 'homography' is the original "
                         "drive-by-segmentation calibrated ground-plane projection; "
                         "'depth' uses RealSense depth unprojection.")
+    p.add_argument("--bev-size", type=int, default=500,
+                   help="Square BEV raster size in pixels.")
     p.add_argument("--rs-width", type=int, default=640)
     p.add_argument("--rs-height", type=int, default=480)
     p.add_argument("--rs-fps", type=int, default=30)
@@ -1550,7 +3551,7 @@ def main() -> None:
     p.add_argument("--gps-route-gain", type=float, default=GPS_ROUTE_GAIN)
     p.add_argument("--gps-route-max-bias-deg", type=float, default=GPS_ROUTE_MAX_BIAS_DEG)
     p.add_argument("--no-protective-stop", action="store_true",
-                   help="Disable predicted-occupancy environment braking. "
+                   help="Disable YOLO object time-to-collision braking. "
                         "Intended only for bench tests.")
     p.add_argument(
         "--target-mph",
@@ -1570,6 +3571,8 @@ def main() -> None:
     p.add_argument("--clrnet-config", default=None)
     p.add_argument("--clrnet-ckpt", default=None)
     p.add_argument("--clrnet-device", default=None)
+    p.add_argument("--clrnet-cache-file", type=Path, default=None,
+                   help="Precomputed CLRNet lane cache JSON for offline video.")
     args = p.parse_args()
     if args.segmentation_map_file is None:
         args.segmentation_map_file = SEGMENTATION_MAP_FILE_DEFAULT
@@ -1578,33 +3581,35 @@ def main() -> None:
     args.target_mph = max(0.0, float(args.target_mph))
     args.gps_route_lookahead_m = float(np.clip(args.gps_route_lookahead_m, 2.0, 20.0))
     args.gps_route_gain = float(np.clip(args.gps_route_gain, 0.0, 1.0))
+    args.bev_size = int(np.clip(args.bev_size, 256, 800))
     # Ceiling is the steering-column travel limit, not 90°, so a strong route
     # authority can actually pull the cart through a turn instead of saturating.
     args.gps_route_max_bias_deg = float(np.clip(args.gps_route_max_bias_deg, 0.0, 270.0))
     target_gas_ff = constant_gas_for_mph(args.target_mph)
-    speed_ctrl = SpeedController()
-    # Predicted future-occupancy obstacle tracker + brake smoother (replaces the
-    # old corridor protective-stop + UniAD merge). bev_geom is built once the BEV
-    # ranges are resolved from the calibration below.
-    occupancy_tracker = seg_occupancy.PredictedOccupancyTracker()
-    brake_smoother = seg_occupancy.PedalCommandSmoother()
+    autospeed_ctrl = AutoSpeedController()
+    stop_sign_ctrl = StopSignController()
     bev_geom: seg_occupancy.BevGeometry | None = None
-    last_occ_update_s = time.monotonic()
     launch_start_t: float | None = None
-    stuck_since: float | None = None
 
     seg_live, rt, plan_path, create_bev, create_overlay, colors = (
         import_segmentation_stack(args.seg_repo)
     )
+    rt.BEV_SIZE = args.bev_size
 
-    import torch
-
-    if args.device:
-        device = args.device
-    elif torch.cuda.is_available():
-        device = "cuda"
+    remote_segmentation = bool(args.remote_segmentation_modal)
+    if remote_segmentation:
+        device = "modal"
     else:
-        device = "cpu"
+        import torch
+
+        if args.device:
+            device = args.device
+        elif torch.cuda.is_available():
+            device = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     calib, e2e_slot = load_bev_calibration(args)
     if e2e_slot is not None:
@@ -1622,11 +3627,78 @@ def main() -> None:
     rt.RANGE_FWD = bev_range.get("forward_ft", 50) * rt.FT_TO_M
     rt.RANGE_SIDE = bev_range.get("side_ft", 25) * rt.FT_TO_M
     road_width_ft = float(calib.get("road_width_ft", 20.0))
-    # Occupancy geometry matches the BEV the planner draws into, so the risk
-    # mask lines up 1:1 with the planned-trajectory polyline.
+    # Metric geometry matches the BEV the planner draws into, so YOLO-projected
+    # object positions line up with the planned-trajectory polyline.
     bev_geom = seg_occupancy.BevGeometry.from_ranges(
         rt.BEV_SIZE, rt.RANGE_FWD, rt.RANGE_SIDE
     )
+    yolo_cache = YoloDetectionCache(args.yolo_cache_file) if args.yolo_cache_file else None
+    ground_projector = GroundPlaneProjector(calib)
+    mono3d_cache = Mono3DDetectionCache(args.mono3d_cache_file) if args.mono3d_cache_file else None
+    mono3d_client: ModalMonocular3DClient | None = None
+    latest_mono3d_status: dict = {"type": "disabled", "ok": False}
+    if mono3d_cache is not None:
+        latest_mono3d_status = mono3d_cache.status()
+        print(
+            f"[mono3d] using cache {mono3d_cache.path} "
+            f"provider={mono3d_cache.provider} frames={mono3d_cache.frame_count} "
+            f"score_thr={mono3d_cache.score_threshold:.2f}",
+            flush=True,
+        )
+    elif args.mono3d_remote_modal:
+        print(
+            f"[mono3d] using Modal learned 3D detector "
+            f"app={args.mono3d_modal_app_name} function={args.mono3d_modal_function_name} "
+            f"score_thr={args.mono3d_score_threshold:.2f}",
+            flush=True,
+        )
+        mono3d_client = ModalMonocular3DClient(
+            args.mono3d_modal_app_name,
+            args.mono3d_modal_function_name,
+            calib,
+            args.mono3d_score_threshold,
+        )
+        latest_mono3d_status = mono3d_client.status()
+    object_predictor = ObjectTrajectoryPredictorClient(
+        args.object_predictor_url,
+        timeout_s=max(1.0, float(args.object_predictor_timeout_ms)) / 1000.0,
+    )
+    if yolo_cache is not None:
+        print(
+            f"[yolo] using cache {yolo_cache.path} model={yolo_cache.model} "
+            f"frames={yolo_cache.frame_count} conf={yolo_cache.conf}",
+            flush=True,
+        )
+        if object_predictor.enabled:
+            print(
+                f"[predictor] object futures via {object_predictor.url} "
+                f"timeout_ms={args.object_predictor_timeout_ms:.0f}",
+                flush=True,
+            )
+    control_log_file = args.control_log_file
+    if control_log_file is None and args.video:
+        candidate = Path(args.video).resolve().parent / "control.jsonl"
+        if candidate.exists():
+            control_log_file = candidate
+    control_trace = None
+    if control_log_file is not None and control_log_file.exists():
+        control_trace = ControlTrace(control_log_file)
+        print(
+            f"[controls] using recorded controls {control_trace.path} "
+            f"samples={len(control_trace.samples)}",
+            flush=True,
+        )
+
+    gps_trace: GpsTrace | None = None
+    if args.video:
+        gps_candidate = Path(args.video).resolve().parent / "gps.json"
+        if gps_candidate.exists():
+            gps_trace = GpsTrace(gps_candidate)
+            print(
+                f"[gps] using recorded trace {gps_trace.path} "
+                f"samples={len(gps_trace.times)}",
+                flush=True,
+            )
 
     readers = make_sources(args)
     for r in readers:
@@ -1638,11 +3710,51 @@ def main() -> None:
     if active_reader is None:
         raise RuntimeError(f"active camera {active_slug} not available")
 
-    proc, model = seg_live.load_segformer(args.model, device)
+    proc = None
+    model = None
+    modal_client: ModalSegmentationClient | None = None
+    seg_cache: SegmentationMapCache | None = None
+    seg_model_full = f"drive-by-segmentation-segformer-{args.model}"
+    if args.segmentation_cache_meta is not None:
+        seg_cache = SegmentationMapCache(args.segmentation_cache_meta)
+        seg_model_full = f"{seg_model_full}-cache:{seg_cache.meta_path.name}"
+        print(
+            f"[seg] using segmentation cache {seg_cache.data_path} "
+            f"frames={seg_cache.frame_count} shape={seg_cache.height}x{seg_cache.width}",
+            flush=True,
+        )
+    if remote_segmentation:
+        if seg_cache is None:
+            print(
+                f"[seg] using Modal segmentation app={args.modal_app_name} "
+                f"function={args.modal_function_name} variant={args.model}",
+                flush=True,
+            )
+            modal_client = ModalSegmentationClient(
+                args.modal_app_name,
+                args.modal_function_name,
+                args.model,
+            )
+            seg_model_full = f"{seg_model_full}-modal:{args.modal_app_name}/{args.modal_function_name}"
+    else:
+        if seg_cache is None:
+            proc, model = seg_live.load_segformer(args.model, device)
     steer_est = rt.SteeringEstimator()
     clrnet = None
     clrnet_runner = None
-    if not args.no_clrnet:
+    clrnet_lane_cache: CLRNetLaneCache | None = None
+    if args.clrnet_cache_file and args.clrnet_cache_file.exists():
+        clrnet_lane_cache = CLRNetLaneCache(args.clrnet_cache_file)
+        try:
+            clrnet = import_clrnet_stack()
+        except Exception:
+            clrnet = None
+        print(
+            f"[clrnet] using lane cache {clrnet_lane_cache.path} "
+            f"frames={clrnet_lane_cache.frame_count}",
+            flush=True,
+        )
+    if not args.no_clrnet and clrnet_lane_cache is None:
         try:
             clrnet = import_clrnet_stack()
             clrnet_config = args.clrnet_config or clrnet.CLRNET_CONFIG
@@ -1675,11 +3787,16 @@ def main() -> None:
 
     latest_overlay_bgr: np.ndarray | None = None
     latest_bev_bgr: np.ndarray | None = None
+    latest_objects_bgr: np.ndarray | None = None
+    latest_yolo_bgr: np.ndarray | None = None
+    latest_mono3d_bgr: np.ndarray | None = None
     latest_seg_map: np.ndarray | None = None
     latest_path: list[list[float]] = []
     latest_steer_raw = 0.0
     latest_steer_base = 0.0
     latest_steer_filtered = 0.0
+    lane_traj = None
+    lane_local = None
     latest_lookahead_m = 0.0
     latest_ego_speed_mph = 0.0
     latest_ego_speed_ok = False
@@ -1707,9 +3824,17 @@ def main() -> None:
     latest_collision: dict | None = None
     latest_image_brake: dict | None = None
     latest_brake_corridor: np.ndarray | None = None
-    latest_protective_stop: dict = build_environment_threat(
-        None, None, 0.0, enabled=not args.no_protective_stop
+    latest_protective_stop: dict = build_environment_threat_from_autospeed(
+        autospeed_ctrl, 0.0, 0, enabled=not args.no_protective_stop
     )
+    latest_yolo_objects: list[dict] = []
+    latest_mono3d_objects: list[dict] = []
+    latest_mono3d_tracks: list[dict] = []
+    latest_object_tracks: list[dict] = []
+    latest_commanded_speed_mps = 0.0
+    latest_autospeed_status: dict = autospeed_ctrl.status()
+    latest_stop_sign_status: dict = stop_sign_ctrl.status()
+    protective_enabled = not args.no_protective_stop
     inference_ok = False
     latest_latency_ms: dict[str, float] = {}
     infer_count = 0
@@ -1757,7 +3882,28 @@ def main() -> None:
                     t0 = time.perf_counter()
                     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                     mark("bgr_to_rgb_ms")
-                    seg_map, seg_stage_ms = timed_segment_frame(frame_rgb, proc, model, device)
+                    source_frame_index = max(0, latest_camera_frame_count - 1)
+                    if args.video and hasattr(active_reader, "status"):
+                        try:
+                            source_frame_index = max(
+                                0,
+                                int(active_reader.status().get("frame_index", source_frame_index)),
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                    if seg_cache is not None and args.video:
+                        t_cache = time.perf_counter()
+                        seg_map = seg_cache.get(source_frame_index)
+                        seg_stage_ms = {
+                            "seg_cache_lookup_ms": (time.perf_counter() - t_cache) * 1000.0,
+                            "seg_cache_frame_index": float(source_frame_index),
+                        }
+                    elif remote_segmentation:
+                        if modal_client is None:
+                            raise RuntimeError("Modal segmentation client was not initialized")
+                        seg_map, seg_stage_ms = timed_segment_frame_modal(frame_rgb, modal_client)
+                    else:
+                        seg_map, seg_stage_ms = timed_segment_frame(frame_rgb, proc, model, device)
                     latest_seg_map = seg_map
                     stage_ms.update(seg_stage_ms)
                     stage_last = time.perf_counter()
@@ -1801,29 +3947,37 @@ def main() -> None:
                             )
                             bev_rgb, bev_cls_map = bev_out
                     mark("bev_ms")
-                    road_mask = (
-                        np.all(bev_rgb == road_color, axis=-1)
-                        | np.all(bev_rgb == grid_color, axis=-1)
-                        | np.all(bev_rgb == grid2_color, axis=-1)
-                    )
-                    mark("road_mask_ms")
-                    if use_fast:
-                        lane_traj, lane_local = seg_fast.lane_aware_centerline_path_fast(
-                            road_mask,
-                            bev_size=rt.BEV_SIZE,
-                            range_fwd=rt.RANGE_FWD,
-                            range_side=rt.RANGE_SIDE,
-                            road_width_ft=road_width_ft,
-                        )
-                    else:
-                        lane_traj, lane_local = plan_path(
-                            road_mask,
-                            bev_size=rt.BEV_SIZE,
-                            range_fwd=rt.RANGE_FWD,
-                            range_side=rt.RANGE_SIDE,
-                            road_mask=road_mask,
-                            road_width_ft=road_width_ft,
-                        )
+                    # Run the expensive path planner every 3rd frame; reuse
+                    # lane_traj/lane_local on the frames in between.
+                    run_planner = (infer_count % 3 == 0) or lane_local is None
+                    if run_planner:
+                        if bev_cls_map is not None:
+                            road_mask = bev_cls_map == 0
+                        else:
+                            road_mask = (
+                                np.all(bev_rgb == road_color, axis=-1)
+                                | np.all(bev_rgb == grid_color, axis=-1)
+                                | np.all(bev_rgb == grid2_color, axis=-1)
+                            )
+                        if use_fast:
+                            _gps_bearing = gps_route_bearing_rad(args)
+                            lane_traj, lane_local = seg_fast.lane_aware_centerline_path_fast(
+                                road_mask,
+                                bev_size=rt.BEV_SIZE,
+                                range_fwd=rt.RANGE_FWD,
+                                range_side=rt.RANGE_SIDE,
+                                road_width_ft=road_width_ft,
+                                gps_bearing_rad=_gps_bearing,
+                            )
+                        else:
+                            lane_traj, lane_local = plan_path(
+                                road_mask,
+                                bev_size=rt.BEV_SIZE,
+                                range_fwd=rt.RANGE_FWD,
+                                range_side=rt.RANGE_SIDE,
+                                road_mask=road_mask,
+                                road_width_ft=road_width_ft,
+                            )
                     mark("path_plan_ms")
 
                     path_ok = lane_local is not None and len(lane_local) >= 4
@@ -1844,85 +3998,110 @@ def main() -> None:
                         args.ego_state_file
                     )
                     latest_lookahead_m = adaptive_lookahead_m(latest_ego_speed_mph, latest_ego_speed_ok)
-                    # Per-object SPACE-TIME collision braking. Obstacles in the
-                    # BEV class map are tracked (position + velocity); we brake
-                    # only if the cart and an object are predicted to occupy the
-                    # same place at the same time — a person off to the side or a
-                    # fast crosser that clears the path does NOT stop the cart.
-                    # Graded by time-to-collision, with a hard-stop floor for
-                    # anything close and dead-ahead. (seg_occupancy.py, ported
-                    # from drive-by-segmentation's unified-planner live.py.)
-                    env_brake_target = 0.0
+                    # Autospeed: unified path-aware obstacle speed control.
+                    # When the Modal 3D detector is enabled, learned 3D boxes
+                    # are the object source. YOLO remains only as a fallback for
+                    # launches that do not enable mono3d.
                     latest_collision = None
                     latest_brake_corridor = None
                     protective_enabled = not args.no_protective_stop
-                    if protective_enabled and bev_cls_map is not None and bev_geom is not None:
-                        occ_now = time.monotonic()
-                        occ_dt = float(np.clip(occ_now - last_occ_update_s, 0.02, 0.5))
-                        last_occ_update_s = occ_now
-                        ego_mps = (
-                            latest_ego_speed_mph * 0.44704 if latest_ego_speed_ok else 0.0
+                    latest_yolo_objects = []
+                    latest_mono3d_tracks = []
+                    latest_object_tracks = []
+                    mono3d_enabled = mono3d_cache is not None or mono3d_client is not None
+                    if not mono3d_enabled and yolo_cache is not None and ground_projector is not None:
+                        latest_yolo_objects = yolo_cache.objects_for_frame(
+                            source_frame_index,
+                            ground_projector,
+                            horizon_s=AUTOSPEED_LOOKAHEAD_TIME,
                         )
-                        latest_occupancy = occupancy_tracker.update(
-                            bev_cls_map,
-                            bev_geom,
-                            dt_s=occ_dt,
-                            ego_speed_mps=ego_mps,
-                            use_segmentation_obstacles=True,
+                        latest_yolo_objects = object_predictor.apply(
+                            source_frame_index,
+                            yolo_cache.fps,
+                            latest_yolo_objects,
+                            latest_ego_speed_mph * 0.44704 if latest_ego_speed_ok else args.target_mph * 0.44704,
+                            latest_path,
+                            horizon_s=AUTOSPEED_LOOKAHEAD_TIME,
+                            step_s=0.5,
                         )
-                        # Assume the cart will reach its target speed even if
-                        # currently stopped, so it won't launch into a predicted
-                        # collision while parked.
-                        plan_mps = max(ego_mps, args.target_mph * 0.44704)
-                        latest_collision = seg_occupancy.evaluate_collision_brake(
-                            latest_occupancy.all_tracks,
-                            plan_mps,
-                            horizon_s=ENV_BRAKE_HORIZON_S,
-                            hard_ttc_s=ENV_BRAKE_HARD_TTC_S,
-                            near_stop_m=ENV_BRAKE_NEAR_STOP_M,
-                            corridor_half_m=ENV_BRAKE_CORRIDOR_HALF_M,
-                            object_radius_m=ENV_BRAKE_OBJECT_RADIUS_M,
+                    latest_yolo_bgr = (
+                        draw_yolo_overlay(frame_bgr, latest_yolo_objects, None)
+                        if not mono3d_enabled and latest_yolo_objects
+                        else None
+                    )
+                    if mono3d_cache is not None:
+                        latest_mono3d_objects = mono3d_cache.objects_for_frame(source_frame_index)
+                        latest_mono3d_tracks = mono3d_objects_to_tracks(latest_mono3d_objects)
+                        latest_mono3d_bgr = draw_mono3d_overlay(frame_bgr, latest_mono3d_objects, calib)
+                        latest_mono3d_status = mono3d_cache.status()
+                    elif mono3d_client is not None:
+                        mono3d_bgr, mono3d_objects, mono3d_ms = mono3d_client.detect(frame_bgr)
+                        stage_ms.update(mono3d_ms)
+                        latest_mono3d_objects = mono3d_objects
+                        latest_mono3d_tracks = mono3d_objects_to_tracks(mono3d_objects)
+                        latest_mono3d_bgr = draw_mono3d_overlay(
+                            frame_bgr,
+                            latest_mono3d_objects,
+                            calib,
+                        ) if mono3d_objects else mono3d_bgr
+                        latest_mono3d_status = mono3d_client.status()
+                        mark("mono3d_ms")
+                    latest_object_tracks = (
+                        latest_mono3d_tracks if mono3d_enabled else latest_yolo_objects
+                    )
+                    latest_occupancy = None
+                    latest_image_brake = None
+                    ego_mps = (
+                        latest_ego_speed_mph * 0.44704
+                        if latest_ego_speed_ok
+                        else args.target_mph * 0.44704
+                    )
+                    max_speed_mps = args.target_mph * 0.44704
+                    if protective_enabled:
+                        latest_commanded_speed_mps = autospeed_ctrl.compute(
+                            path=lane_local if path_ok else None,
+                            obstacles=latest_object_tracks,
+                            current_speed=ego_mps,
+                            max_speed=max_speed_mps,
                         )
-                        # Image-space caution backstop: brake hard when an
-                        # obstacle fills the lower-centre view (close / no room to
-                        # pass) — robust where the BEV projection fails up close.
-                        latest_image_brake = seg_occupancy.imminent_obstacle_brake(
-                            seg_map,
-                            bottom_frac=ENV_BRAKE_IMG_BOTTOM_FRAC,
-                            center_lo=ENV_BRAKE_IMG_CENTER_LO,
-                            center_hi=ENV_BRAKE_IMG_CENTER_HI,
-                            cover_lo=ENV_BRAKE_IMG_COVER_LO,
-                            cover_hi=ENV_BRAKE_IMG_COVER_HI,
-                        )
-                        env_brake_target = max(
-                            float(latest_collision["brake_01"]),
-                            float(latest_image_brake["brake_01"]),
-                        )
-                        # Drawn on the BEV tile to show the hard-stop near zone.
                         latest_brake_corridor = forward_stop_corridor_bev(
-                            bev_geom, ENV_BRAKE_NEAR_STOP_M
+                            bev_geom, AUTOSPEED_MIN_GAP
                         )
                     else:
-                        latest_occupancy = None
-                        latest_collision = None
-                        latest_image_brake = None
-                        if not protective_enabled:
-                            occupancy_tracker.reset()
-                    brake_smoother.step(env_brake_target)
-                    _, latest_env_brake_01 = brake_smoother.snapshot()
-                    latest_protective_stop = build_environment_threat(
-                        latest_collision,
-                        latest_image_brake,
-                        latest_env_brake_01,
+                        latest_commanded_speed_mps = max_speed_mps
+                    raw_stop_signs = []
+                    if not mono3d_enabled and yolo_cache is not None:
+                        for det in yolo_cache.raw_detections(source_frame_index):
+                            if str(det.get("class_name", "")) == "stop sign":
+                                raw_stop_signs.append(det)
+                    stop_sign_limit = stop_sign_ctrl.update(
+                        latest_object_tracks, ego_mps, max_speed_mps,
+                        raw_stop_signs=raw_stop_signs,
+                    )
+                    pre_stop_speed = latest_commanded_speed_mps
+                    latest_commanded_speed_mps = min(
+                        latest_commanded_speed_mps, stop_sign_limit,
+                    )
+                    latest_stop_sign_status = stop_sign_ctrl.status()
+                    # Update desired_accel to reflect stop sign deceleration
+                    if latest_commanded_speed_mps < pre_stop_speed - 0.01:
+                        effective_accel = (latest_commanded_speed_mps - ego_mps) / max(AUTOSPEED_DT, 1e-6)
+                        autospeed_ctrl.desired_accel = max(effective_accel, -AUTOSPEED_EMERGENCY_DECEL)
+                    latest_autospeed_status = autospeed_ctrl.status()
+                    latest_env_brake_01 = (
+                        1.0 if autospeed_ctrl.emergency_active
+                        else max(0.0, 1.0 - latest_commanded_speed_mps / max(max_speed_mps, 1e-6))
+                    )
+                    latest_protective_stop = build_environment_threat_from_autospeed(
+                        autospeed_ctrl,
+                        latest_commanded_speed_mps,
+                        len(latest_object_tracks),
                         enabled=protective_enabled,
                     )
                     mark("protective_stop_ms")
+                    # Map commanded speed to gas/brake pot values
+                    latest_speed_setpoint_mph = latest_commanded_speed_mps * 2.23694
                     if args.constant_speed:
-                        # Adaptive speed disabled: hold a fixed open-loop pedal
-                        # pot at the target-mph feed-forward gas. No launch ramp,
-                        # no PI trim, no stiction punch, no brake — whatever
-                        # constant_gas_for_mph(target) maps to, applied flat.
-                        latest_speed_setpoint_mph = args.target_mph
                         latest_target_gas = target_gas_ff
                         latest_gas_trim = 0.0
                         latest_target_brake = 0.0
@@ -1930,62 +4109,16 @@ def main() -> None:
                         if launch_start_t is None:
                             launch_start_t = time.monotonic()
                         ramp_age = time.monotonic() - launch_start_t
-                        if args.target_mph > 1e-3 and SPEED_SETPOINT_RAMP_MPH_S > 0.0:
-                            latest_speed_setpoint_mph = min(
-                                args.target_mph,
-                                ramp_age * SPEED_SETPOINT_RAMP_MPH_S,
-                            )
-                        else:
-                            latest_speed_setpoint_mph = args.target_mph
-                        speed_setpoint_gas_ff = constant_gas_for_mph(
-                            latest_speed_setpoint_mph
-                        )
                         if LAUNCH_RAMP_S > 0.0 and ramp_age < LAUNCH_RAMP_S:
                             frac = max(0.0, ramp_age / LAUNCH_RAMP_S)
-                            gas_ceiling = LAUNCH_GAS_MIN + frac * max(
-                                0.0, target_gas_ff - LAUNCH_GAS_MIN
-                            )
+                            ramp_max_speed = max_speed_mps * frac
+                            clamped_cmd = min(latest_commanded_speed_mps, ramp_max_speed)
                         else:
-                            gas_ceiling = 1.0
-                        latest_target_gas, latest_gas_trim, latest_target_brake = speed_ctrl.step(
-                            latest_speed_setpoint_mph,
-                            latest_ego_speed_mph,
-                            latest_ego_speed_ok,
-                            speed_setpoint_gas_ff,
-                            gas_ceiling=gas_ceiling,
+                            clamped_cmd = latest_commanded_speed_mps
+                        latest_target_gas, latest_target_brake = autospeed_ctrl.gas_brake_from_speed(
+                            clamped_cmd, ego_mps, max_speed_mps,
                         )
-                        # Stuck-detector: if we're still essentially parked after
-                        # the launch ramp ends, override the controller with
-                        # stiction-break gas to get the wheels rolling. Once ego
-                        # > STICTION_EGO_MPH the PI takes over and pulls back.
-                        now_mono = time.monotonic()
-                        if (latest_ego_speed_ok
-                                and ramp_age > LAUNCH_RAMP_S
-                                and args.target_mph > STICTION_EGO_MPH
-                                and latest_ego_speed_mph < STICTION_EGO_MPH):
-                            if stuck_since is None:
-                                stuck_since = now_mono
-                            elif now_mono - stuck_since > STICTION_STUCK_S:
-                                latest_target_gas = speed_ctrl.slew_gas(
-                                    max(latest_target_gas, STICTION_GAS_BREAK),
-                                    1.0 / max(1.0, args.publish_hz),
-                                )
-                                latest_target_brake = 0.0
-                        else:
-                            stuck_since = None
-                    # Environment brake overrides cruise: blend the smoothed
-                    # occupancy/VRU brake fraction into the pedal pot (max with
-                    # any overspeed brake) and cut gas once it's meaningfully
-                    # engaged (coast-then-brake).
-                    if latest_env_brake_01 > 1e-3:
-                        latest_target_brake = max(
-                            float(latest_target_brake),
-                            latest_env_brake_01 * float(BRAKE_POT_MAX),
-                        )
-                        if latest_env_brake_01 >= ENV_BRAKE_GAS_CUT_FRAC:
-                            latest_target_gas = 0.0
-                            latest_gas_trim = 0.0
-                            speed_ctrl.sync_gas(0.0)
+                        latest_gas_trim = 0.0
                     # Hard protective stop: hold the last steering command — don't
                     # let the road-mask centerline swerve around the obstacle while
                     # we brake to a stop.
@@ -2022,7 +4155,9 @@ def main() -> None:
                         latest_gps_route = {"active": False}
                     # else: no path — hold latest_steer_* at their previous values.
 
-                    if clrnet_runner is not None:
+                    if clrnet_lane_cache is not None:
+                        lanes = clrnet_lane_cache.lanes_for_frame(source_frame_index)
+                    elif clrnet_runner is not None:
                         try:
                             lanes = clrnet_runner.infer(frame_bgr)
                         except Exception as e:
@@ -2031,6 +4166,9 @@ def main() -> None:
                                 flush=True,
                             )
                             lanes = []
+                    else:
+                        lanes = None
+                    if lanes is not None:
                         latest_clrnet_lanes = lanes
                         latest_clrnet_confidences = sorted(
                             [float(l.get("score", 0.0)) for l in lanes],
@@ -2073,28 +4211,43 @@ def main() -> None:
                                 latest_clrnet_override = True
                         mark("clrnet_ms")
                     mark("steer_ms")
-                    overlay_rgb = create_overlay(frame_rgb, seg_map)
-                    latest_overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
+                    render_viz = (infer_count % 2 == 0)
+                    if render_viz:
+                        overlay_rgb = create_overlay(frame_rgb, seg_map)
+                        latest_overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
                     mark("overlay_ms")
-                    latest_bev_bgr = draw_bev_viz(
-                        bev_rgb, lane_traj, lane_local, rt,
-                        occ=latest_occupancy, bev_geom=bev_geom,
-                        brake_corridor=latest_brake_corridor,
-                        brake_01=latest_env_brake_01,
-                        stop_active=bool(latest_protective_stop.get("active")),
-                    )
-                    if clrnet is not None and latest_clrnet_lanes:
-                        latest_clrnet_overlay_bgr = clrnet.render_overlay(
-                            frame_bgr,
-                            latest_clrnet_lanes,
-                            latest_clrnet_steer_state,
-                            fresh=latest_clrnet_override,
-                            mph_target=args.target_mph,
-                            mph_actual=latest_ego_speed_mph if latest_ego_speed_ok else None,
-                            column_deg=latest_steer_raw,
+                    if render_viz:
+                        latest_bev_bgr = draw_bev_viz(
+                            bev_rgb, lane_traj, lane_local, rt,
+                            occ=latest_occupancy, bev_geom=bev_geom,
+                            brake_corridor=latest_brake_corridor,
+                            brake_01=latest_env_brake_01,
+                            stop_active=bool(latest_protective_stop.get("active")),
                         )
-                    elif clrnet is not None:
-                        latest_clrnet_overlay_bgr = frame_bgr.copy()
+                        latest_objects_bgr = draw_object_viz(
+                            bev_rgb,
+                            bev_geom,
+                            None,
+                            yolo_objects=latest_object_tracks,
+                            autospeed_status=latest_autospeed_status,
+                            stop_sign_status=latest_stop_sign_status,
+                            bev_cls_map=bev_cls_map,
+                            clrnet_lanes=latest_clrnet_lanes,
+                            ground_projector=ground_projector,
+                            clrnet_conf_threshold=CLRNET_CONF_THRESHOLD,
+                        )
+                        if clrnet is not None and latest_clrnet_lanes:
+                            latest_clrnet_overlay_bgr = clrnet.render_overlay(
+                                frame_bgr,
+                                latest_clrnet_lanes,
+                                latest_clrnet_steer_state,
+                                fresh=latest_clrnet_override,
+                                mph_target=args.target_mph,
+                                mph_actual=latest_ego_speed_mph if latest_ego_speed_ok else None,
+                                column_deg=latest_steer_raw,
+                            )
+                        elif clrnet is not None:
+                            latest_clrnet_overlay_bgr = frame_bgr.copy()
                     mark("bev_viz_ms")
 
                     infer_times.append(time.perf_counter() - t0)
@@ -2129,6 +4282,18 @@ def main() -> None:
                     t = time.perf_counter()
                     write_jpeg_atomic(args.frames_dir / "bev.jpg", latest_bev_bgr, quality=85)
                     jpeg_ms["jpeg_bev_ms"] = (time.perf_counter() - t) * 1000.0
+                if latest_objects_bgr is not None:
+                    t = time.perf_counter()
+                    write_jpeg_atomic(args.frames_dir / "objects.jpg", latest_objects_bgr, quality=85)
+                    jpeg_ms["jpeg_objects_ms"] = (time.perf_counter() - t) * 1000.0
+                if latest_yolo_bgr is not None:
+                    t = time.perf_counter()
+                    write_jpeg_atomic(args.frames_dir / "yolo.jpg", latest_yolo_bgr, quality=82)
+                    jpeg_ms["jpeg_yolo_ms"] = (time.perf_counter() - t) * 1000.0
+                if latest_mono3d_bgr is not None:
+                    t = time.perf_counter()
+                    write_jpeg_atomic(args.frames_dir / "mono3d.jpg", latest_mono3d_bgr, quality=82)
+                    jpeg_ms["jpeg_mono3d_ms"] = (time.perf_counter() - t) * 1000.0
                 if latest_clrnet_overlay_bgr is not None:
                     t = time.perf_counter()
                     write_jpeg_atomic(args.frames_dir / "lanes.jpg", latest_clrnet_overlay_bgr, quality=80)
@@ -2142,7 +4307,7 @@ def main() -> None:
                             colors,
                             active_slug,
                             infer_count,
-                            f"drive-by-segmentation-segformer-{args.model}",
+                            seg_model_full,
                         ),
                     )
                     jpeg_ms["json_segmentation_map_ms"] = (time.perf_counter() - t) * 1000.0
@@ -2159,11 +4324,30 @@ def main() -> None:
                     cam_now - latest_camera_last_ok_s
                     if latest_camera_last_ok_s > 0.0 else float("inf")
                 )
-                camera_stale = camera_age_s > 0.5
-                inference_stale = (cam_now - latest_infer_ok_s) > 0.5 if latest_infer_ok_s else True
+                video_status = (
+                    active_reader.status()
+                    if args.video and hasattr(active_reader, "status")
+                    else None
+                )
+                video_paused = bool(video_status and video_status.get("paused"))
+                video_position_s = (
+                    float(video_status.get("position_s"))
+                    if isinstance(video_status, dict) and video_status.get("position_s") is not None
+                    else None
+                )
+                ground_truth_control = (
+                    control_trace.sample_at(video_position_s)
+                    if control_trace is not None else None
+                )
+                camera_stale = (camera_age_s > 0.5) and not video_paused
+                inference_stale = (
+                    ((cam_now - latest_infer_ok_s) > 0.5) and not video_paused
+                    if latest_infer_ok_s else True
+                )
 
                 mean_dt = sum(infer_times) / len(infer_times) if infer_times else 0.0
                 fps = 0.0 if camera_stale or inference_stale else (1.0 / mean_dt if mean_dt > 0 else 0.0)
+                collision_speed_mph = float(latest_commanded_speed_mps * 2.23694) if inference_ok else 0.0
                 state = {
                     "steer_deg": latest_steer_raw,
                     "steer_deg_raw": latest_steer_raw,
@@ -2172,12 +4356,18 @@ def main() -> None:
                     "viz": (
                         latest_overlay_bgr is not None
                         or latest_bev_bgr is not None
+                        or latest_objects_bgr is not None
+                        or latest_yolo_bgr is not None
+                        or latest_mono3d_bgr is not None
                         or latest_clrnet_overlay_bgr is not None
                     ),
                     "viz_streams": [
                         slug for slug, img in (
                             ("seg", latest_overlay_bgr),
                             ("bev", latest_bev_bgr),
+                            ("objects", latest_objects_bgr),
+                            ("yolo", latest_yolo_bgr),
+                            ("mono3d", latest_mono3d_bgr),
                             ("lanes", latest_clrnet_overlay_bgr),
                         )
                         if img is not None
@@ -2192,10 +4382,12 @@ def main() -> None:
                     "camera_stale": bool(camera_stale),
                     "cams": [r.slug for r in readers],
                     "source": "video" if args.video else "camera",
+                    "video": video_status,
                     "model": MODEL_NAME,
-                    "model_full": f"drive-by-segmentation-segformer-{args.model}",
+                    "model_full": seg_model_full,
                     "target_speed_mph": args.target_mph if inference_ok else 0.0,
                     "speed_setpoint_mph": latest_speed_setpoint_mph if inference_ok else 0.0,
+                    "collision_speed_mph": collision_speed_mph if inference_ok else 0.0,
                     "ego_speed_mph": latest_ego_speed_mph,
                     "ego_speed_ok": latest_ego_speed_ok,
                     "steer_deg_base": latest_steer_base,
@@ -2205,11 +4397,13 @@ def main() -> None:
                     "target_gas_ff": target_gas_ff,
                     "target_gas_trim": latest_gas_trim,
                     "speed_mode": (
-                        "protective_stop" if latest_protective_stop.get("active")
+                        "emergency_stop" if autospeed_ctrl.emergency_active
+                        else "autospeed" if protective_enabled
                         else "constant" if args.constant_speed
-                        else ("arkit_pi" if latest_ego_speed_ok else "feedforward_pot")
+                        else "feedforward_pot"
                     ),
                     "target_brake": latest_target_brake if inference_ok else 0.0,
+                    "ground_truth_control": ground_truth_control,
                     "predicted_path": (
                         []
                         if latest_clrnet_override
@@ -2217,6 +4411,11 @@ def main() -> None:
                     ),
                     "segmentation": {
                         "bev_mode": args.bev_mode,
+                        "remote_modal": bool(remote_segmentation),
+                        "modal_app_name": args.modal_app_name if remote_segmentation else None,
+                        "modal_function_name": (
+                            args.modal_function_name if remote_segmentation else None
+                        ),
                         "latency_ms": latest_latency_ms,
                         "jpeg_ms": {k: round(float(v), 3) for k, v in jpeg_ms.items()},
                         "publish_jpeg_total_ms": round(float(publish_jpeg_total_ms), 3),
@@ -2240,33 +4439,85 @@ def main() -> None:
                         "clrnet_steer_deg": float(latest_clrnet_steer_filtered),
                         "clrnet_steer_deg_raw": float(latest_clrnet_steer_raw),
                         "protective_stop": latest_protective_stop,
+                        "object_detector": {
+                            "type": (
+                                latest_mono3d_status.get("type", "modal_mmdet3d_fcos3d")
+                                if (mono3d_cache is not None or mono3d_client is not None)
+                                else "yolo11+bytetrack" if yolo_cache is not None
+                                else "none"
+                            ),
+                            "model": (
+                                latest_mono3d_status.get("provider")
+                                if (mono3d_cache is not None or mono3d_client is not None)
+                                else yolo_cache.model if yolo_cache is not None
+                                else None
+                            ),
+                            "cache_file": (
+                                str(mono3d_cache.path) if mono3d_cache is not None
+                                else None if mono3d_client is not None
+                                else str(yolo_cache.path) if yolo_cache is not None
+                                else None
+                            ),
+                            "min_confidence": (
+                                float(latest_mono3d_status.get("score_threshold", args.mono3d_score_threshold))
+                                if (mono3d_cache is not None or mono3d_client is not None)
+                                else float(args.yolo_min_conf)
+                            ),
+                            "trajectory_predictor": (
+                                {"type": "mono3d_velocity", "provider": "mmdet3d_fcos3d_nuscenes"}
+                                if (mono3d_cache is not None or mono3d_client is not None)
+                                else object_predictor.status()
+                            ),
+                        },
+                        "object_tracks": latest_object_tracks,
+                        "learned_3d_detector": latest_mono3d_status,
+                        "learned_3d_objects": latest_mono3d_objects,
                         "gps_route": latest_gps_route,
                         "map_file": str(args.segmentation_map_file),
                         "map_schema": "caddy.segmentation_map.v1",
                     },
+                    "autospeed": {
+                        "commanded_speed_mph": round(float(latest_commanded_speed_mps * 2.23694), 2),
+                        "commanded_speed_mps": round(float(latest_commanded_speed_mps), 3),
+                        "max_speed_mph": round(float(args.target_mph), 1),
+                        **latest_autospeed_status,
+                    },
+                    "stop_sign": latest_stop_sign_status,
                     "ts": time.time(),
                 }
                 t = time.perf_counter()
                 write_json_atomic(args.state_file, state)
                 latest_latency_ms["json_state_ms"] = round((time.perf_counter() - t) * 1000.0, 3)
+                if gps_trace is not None and video_position_s is not None:
+                    gps_trace.write_state(video_position_s, args.gps_state_file)
                 next_publish_t = now + publish_period
 
             if now - last_log_t >= 1.0:
+                log_fps = infer_count - getattr(main, '_last_log_count', 0)
+                main._last_log_count = infer_count
                 last_log_t = now
                 confs = " ".join(f"{s:.2f}" for s in latest_clrnet_confidences[:6])
                 if not confs:
                     confs = "none"
+                cmd_mph = latest_commanded_speed_mps * 2.23694
+                n_limits = len(autospeed_ctrl.speed_limits)
+                lat = latest_latency_ms
                 print(
-                    f"[run] frame={infer_count} steer_source={latest_steer_source} "
-                    f"clrnet_override={'Y' if latest_clrnet_override else 'N'} "
-                    f"lanes={len(latest_clrnet_lanes)} "
-                    f"above_{CLRNET_CONF_THRESHOLD:.2f}={latest_clrnet_fresh_count} "
+                    f"[run] {log_fps}fps "
+                    f"total={lat.get('infer_total_ms',0):.0f}ms "
+                    f"plan={lat.get('path_plan_ms',0):.0f}ms "
+                    f"bev={lat.get('bev_ms',0):.0f}ms "
+                    f"viz={lat.get('bev_viz_ms',0):.0f}ms "
+                    f"ovl={lat.get('overlay_ms',0):.0f}ms "
+                    f"frame={infer_count} "
+                    f"src={latest_steer_source or 'seg'} "
+                    f"clr={'Y' if latest_clrnet_override else 'N'} "
                     f"conf=[{confs}] "
-                    f"protective_stop={'Y' if latest_protective_stop.get('active') else 'N'} "
-                    f"brake={latest_env_brake_01:.2f} "
-                    f"ttc={latest_protective_stop.get('ttc_s')} "
-                    f"cov={latest_protective_stop.get('image_coverage', 0.0)} "
-                    f"objects={int(latest_protective_stop.get('objects', 0))} "
+                    f"autospeed={cmd_mph:.1f}mph "
+                    f"accel={autospeed_ctrl.desired_accel:+.2f} "
+                    f"emergency={'Y' if autospeed_ctrl.emergency_active else 'N'} "
+                    f"limits={n_limits} "
+                    f"objects={len(latest_object_tracks)} "
                     f"gps_bias={float(latest_gps_route.get('bias_deg', 0.0)):+5.1f} "
                     f"turn={latest_gps_route.get('turn_text') or '-'} "
                     f"steer={latest_steer_raw:+6.1f}",
