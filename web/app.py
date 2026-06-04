@@ -5,9 +5,11 @@ import subprocess
 import glob
 import threading
 import time
+from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, render_template, request
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
 STATE_FILE = os.environ.get("CART_STATE_FILE", "/tmp/cart_state.json")
 AUTOWARE_STATE_FILE = os.environ.get(
     "AUTOWARE_STATE_FILE", "/tmp/autoware_state.json"
@@ -22,6 +24,40 @@ TELEOP_TUNNEL_URL = "https://caddy.ethandgoodhart.com"
 STATE_FRESH_S = 1.0
 AUTOWARE_FRESH_S = 0.5  # autoware_infer writes at ~15 Hz; >500 ms = stale
 EGO_FRESH_S = 1.0       # ego_state_writer writes at 10 Hz; >1 s = writer died
+ADVANCED_SETTINGS_FILE = Path(os.environ.get(
+    "ADVANCED_DRIVE_BY_SEGMENTATION_CONFIG",
+    str(ROOT_DIR / "config" / "advanced_drive_by_segmentation.json"),
+))
+ADVANCED_SETTINGS_DEFAULTS = {
+    "start_usbmuxd": True,
+    "open_browser": True,
+    "mph": 4.0,
+    "actor_detector_hz": 4.0,
+    "actor_detector_imgsz": 512,
+    "with_clrnet": False,
+    "env_brake_horizon_s": 2.3,
+    "env_brake_hard_ttc_s": 1.0,
+    "env_brake_near_stop_m": 1.8,
+    "env_brake_corridor_half_m": 0.60,
+    "env_brake_object_radius_m": 0.22,
+    "env_brake_gas_cut_frac": 0.22,
+    "env_brake_stop_frac": 0.65,
+}
+ADVANCED_SETTINGS_SCHEMA = {
+    "start_usbmuxd": ("bool", None, None),
+    "open_browser": ("bool", None, None),
+    "with_clrnet": ("bool", None, None),
+    "mph": ("float", 1.0, 8.0),
+    "actor_detector_hz": ("float", 0.0, 10.0),
+    "actor_detector_imgsz": ("int", 256, 1024),
+    "env_brake_horizon_s": ("float", 0.5, 6.0),
+    "env_brake_hard_ttc_s": ("float", 0.2, 3.0),
+    "env_brake_near_stop_m": ("float", 0.5, 5.0),
+    "env_brake_corridor_half_m": ("float", 0.25, 1.5),
+    "env_brake_object_radius_m": ("float", 0.05, 0.75),
+    "env_brake_gas_cut_frac": ("float", 0.0, 1.0),
+    "env_brake_stop_frac": ("float", 0.0, 1.0),
+}
 
 # Must match scripts/autoware_infer.py::ALL_STREAM_SLUGS. A request for
 # any other slug returns 404 — never stream arbitrary paths off the
@@ -267,6 +303,44 @@ def _atomic_json_write(path: str, payload: dict) -> None:
     os.replace(tmp, path)
 
 
+def _coerce_setting(key: str, value):
+    kind, lo, hi = ADVANCED_SETTINGS_SCHEMA[key]
+    if kind == "bool":
+        return bool(value)
+    if kind == "int":
+        out = int(round(float(value)))
+        return max(int(lo), min(int(hi), out))
+    out = float(value)
+    return max(float(lo), min(float(hi), out))
+
+
+def _load_advanced_settings() -> dict:
+    try:
+        with ADVANCED_SETTINGS_FILE.open() as f:
+            loaded = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        loaded = {}
+    out = dict(ADVANCED_SETTINGS_DEFAULTS)
+    if isinstance(loaded, dict):
+        for key in ADVANCED_SETTINGS_DEFAULTS:
+            if key not in loaded:
+                continue
+            try:
+                out[key] = _coerce_setting(key, loaded[key])
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _save_advanced_settings(settings: dict) -> None:
+    ADVANCED_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ADVANCED_SETTINGS_FILE.with_suffix(ADVANCED_SETTINGS_FILE.suffix + ".tmp")
+    with tmp.open("w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, ADVANCED_SETTINGS_FILE)
+
+
 MPH_PER_MPS = 2.2369362920544
 
 
@@ -419,6 +493,35 @@ def state():
         data["teleop_url"] = TELEOP_TUNNEL_URL + "/teleop"
 
     return jsonify(data)
+
+
+@app.route("/settings", methods=["GET", "POST"])
+def advanced_settings():
+    if request.method == "GET":
+        return jsonify({
+            "settings": _load_advanced_settings(),
+            "path": str(ADVANCED_SETTINGS_FILE),
+        })
+
+    incoming = request.get_json(silent=True)
+    if not isinstance(incoming, dict):
+        abort(400)
+    if "settings" in incoming and isinstance(incoming["settings"], dict):
+        incoming = incoming["settings"]
+
+    current = _load_advanced_settings()
+    for key in ADVANCED_SETTINGS_DEFAULTS:
+        if key not in incoming:
+            continue
+        try:
+            current[key] = _coerce_setting(key, incoming[key])
+        except (TypeError, ValueError):
+            abort(400)
+    _save_advanced_settings(current)
+    return jsonify({
+        "settings": current,
+        "path": str(ADVANCED_SETTINGS_FILE),
+    })
 
 
 def _frame_path(slug: str) -> str | None:

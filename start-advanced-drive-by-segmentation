@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_PATH="$(readlink -f "$0")"
+cd "$(dirname "$SCRIPT_PATH")"
+
+CONFIG_FILE="${ADVANCED_DRIVE_BY_SEGMENTATION_CONFIG:-config/advanced_drive_by_segmentation.json}"
+
+eval "$(/home/caddy/PRODUCTION/.venv/bin/python - "$CONFIG_FILE" <<'PY'
+import json
+import shlex
+import sys
+from pathlib import Path
+
+defaults = {
+    "start_usbmuxd": True,
+    "open_browser": True,
+    "mph": 4.0,
+    "actor_detector_hz": 4.0,
+    "actor_detector_imgsz": 512,
+    "with_clrnet": False,
+    "env_brake_horizon_s": 2.3,
+    "env_brake_hard_ttc_s": 1.0,
+    "env_brake_near_stop_m": 1.8,
+    "env_brake_corridor_half_m": 0.60,
+    "env_brake_object_radius_m": 0.22,
+    "env_brake_gas_cut_frac": 0.22,
+    "env_brake_stop_frac": 0.65,
+}
+
+path = Path(sys.argv[1])
+try:
+    loaded = json.loads(path.read_text())
+except (OSError, json.JSONDecodeError):
+    loaded = {}
+cfg = {**defaults, **loaded}
+
+def boolish(value):
+    return "1" if bool(value) else "0"
+
+exports = {
+    "START_USBMUXD": boolish(cfg["start_usbmuxd"]),
+    "OPEN_BROWSER": boolish(cfg["open_browser"]),
+    "SEGMENTATION_MPH_CFG": cfg["mph"],
+    "ACTOR_DETECTOR_HZ_CFG": cfg["actor_detector_hz"],
+    "ACTOR_DETECTOR_IMGSZ_CFG": int(cfg["actor_detector_imgsz"]),
+    "WITH_CLRNET_CFG": boolish(cfg["with_clrnet"]),
+    "ENV_BRAKE_HORIZON_S": cfg["env_brake_horizon_s"],
+    "ENV_BRAKE_HARD_TTC_S": cfg["env_brake_hard_ttc_s"],
+    "ENV_BRAKE_NEAR_STOP_M": cfg["env_brake_near_stop_m"],
+    "ENV_BRAKE_CORRIDOR_HALF_M": cfg["env_brake_corridor_half_m"],
+    "ENV_BRAKE_OBJECT_RADIUS_M": cfg["env_brake_object_radius_m"],
+    "ENV_BRAKE_GAS_CUT_FRAC": cfg["env_brake_gas_cut_frac"],
+    "ENV_BRAKE_STOP_FRAC": cfg["env_brake_stop_frac"],
+}
+
+for key, value in exports.items():
+    print(f"{key}={shlex.quote(str(value))}")
+PY
+)"
+
+if [[ "${START_USBMUXD}" == "1" ]]; then
+    systemctl is-active --quiet usbmuxd 2>/dev/null \
+        || systemctl --no-ask-password start usbmuxd 2>/dev/null \
+        || true
+fi
+
+ARGS=(
+    --model segmentation
+    --mph "${SEGMENTATION_MPH_CFG}"
+    --actor-detector-hz "${ACTOR_DETECTOR_HZ_CFG}"
+    --actor-detector-imgsz "${ACTOR_DETECTOR_IMGSZ_CFG}"
+)
+if [[ "${WITH_CLRNET_CFG}" == "1" ]]; then
+    ARGS+=(--with-clrnet)
+fi
+if [[ "${OPEN_BROWSER}" != "1" ]]; then
+    ARGS+=(--no-browser)
+fi
+
+UV_NO_SYNC=1 \
+PYTHON_BIN=/home/caddy/PRODUCTION/.venv/bin/python \
+WEB_PYTHON=/home/caddy/PRODUCTION/.venv/bin/python \
+EGO_PYTHON=/home/caddy/PRODUCTION/.venv/bin/python \
+ENV_BRAKE_HORIZON_S="${ENV_BRAKE_HORIZON_S}" \
+ENV_BRAKE_HARD_TTC_S="${ENV_BRAKE_HARD_TTC_S}" \
+ENV_BRAKE_NEAR_STOP_M="${ENV_BRAKE_NEAR_STOP_M}" \
+ENV_BRAKE_CORRIDOR_HALF_M="${ENV_BRAKE_CORRIDOR_HALF_M}" \
+ENV_BRAKE_OBJECT_RADIUS_M="${ENV_BRAKE_OBJECT_RADIUS_M}" \
+ENV_BRAKE_GAS_CUT_FRAC="${ENV_BRAKE_GAS_CUT_FRAC}" \
+ENV_BRAKE_STOP_FRAC="${ENV_BRAKE_STOP_FRAC}" \
+SEGMENTATION_CAMERA_INDEX=0 \
+./start.sh "${ARGS[@]}"

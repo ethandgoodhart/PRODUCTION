@@ -128,6 +128,77 @@
         <div class="pedal-stack" id="pedal-stack" aria-hidden="true"></div>
     </div>
 
+    <button class="settings-button" id="settings-button" type="button" aria-label="Settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6Zm8.4 4.7v-1.8l-2.1-.7a7.6 7.6 0 0 0-.6-1.5l1-2-1.3-1.3-2 .9a7.8 7.8 0 0 0-1.5-.6L13.1 4h-1.8l-.7 2.1a7.8 7.8 0 0 0-1.5.6l-2-.9-1.3 1.3 1 2a7.6 7.6 0 0 0-.6 1.5l-2.1.7v1.8l2.1.7c.1.5.3 1 .6 1.5l-1 2 1.3 1.3 2-.9c.5.3 1 .5 1.5.6l.7 2.1h1.8l.7-2.1c.5-.1 1-.3 1.5-.6l2 .9 1.3-1.3-1-2c.3-.5.5-1 .6-1.5l2.1-.7Z" />
+        </svg>
+    </button>
+
+    <div class="settings-backdrop" id="settings-backdrop" hidden></div>
+    <section class="settings-panel" id="settings-panel" hidden>
+        <div class="settings-header">
+            <div>
+                <div class="settings-title">Drive Settings</div>
+                <div class="settings-status" id="settings-status">Saved for next start</div>
+            </div>
+            <button class="settings-close" id="settings-close" type="button" aria-label="Close">&times;</button>
+        </div>
+        <div class="settings-grid">
+            <label class="settings-toggle">
+                <span>USB iPhone tunnel</span>
+                <input id="set-start-usbmuxd" type="checkbox" data-setting="start_usbmuxd">
+            </label>
+            <label class="settings-toggle">
+                <span>Fullscreen browser</span>
+                <input id="set-open-browser" type="checkbox" data-setting="open_browser">
+            </label>
+            <label class="settings-toggle">
+                <span>CLRNet assist</span>
+                <input id="set-with-clrnet" type="checkbox" data-setting="with_clrnet">
+            </label>
+            <label class="settings-control wide">
+                <span><b>Target speed</b><output id="out-mph"></output></span>
+                <input type="range" min="1" max="8" step="0.5" data-setting="mph" data-output="out-mph" data-unit=" mph">
+            </label>
+            <label class="settings-control">
+                <span><b>Actor detector Hz</b><output id="out-actor-hz"></output></span>
+                <input type="range" min="0" max="10" step="0.5" data-setting="actor_detector_hz" data-output="out-actor-hz" data-unit=" Hz">
+            </label>
+            <label class="settings-control">
+                <span><b>Actor image size</b><output id="out-actor-imgsz"></output></span>
+                <input type="range" min="256" max="1024" step="32" data-setting="actor_detector_imgsz" data-output="out-actor-imgsz" data-unit=" px">
+            </label>
+            <label class="settings-control">
+                <span><b>Brake horizon</b><output id="out-horizon"></output></span>
+                <input type="range" min="0.5" max="6" step="0.1" data-setting="env_brake_horizon_s" data-output="out-horizon" data-unit=" s">
+            </label>
+            <label class="settings-control">
+                <span><b>Hard TTC</b><output id="out-hard-ttc"></output></span>
+                <input type="range" min="0.2" max="3" step="0.1" data-setting="env_brake_hard_ttc_s" data-output="out-hard-ttc" data-unit=" s">
+            </label>
+            <label class="settings-control">
+                <span><b>Near stop</b><output id="out-near-stop"></output></span>
+                <input type="range" min="0.5" max="5" step="0.1" data-setting="env_brake_near_stop_m" data-output="out-near-stop" data-unit=" m">
+            </label>
+            <label class="settings-control">
+                <span><b>Corridor half</b><output id="out-corridor"></output></span>
+                <input type="range" min="0.25" max="1.5" step="0.05" data-setting="env_brake_corridor_half_m" data-output="out-corridor" data-unit=" m">
+            </label>
+            <label class="settings-control">
+                <span><b>Object radius</b><output id="out-radius"></output></span>
+                <input type="range" min="0.05" max="0.75" step="0.01" data-setting="env_brake_object_radius_m" data-output="out-radius" data-unit=" m">
+            </label>
+            <label class="settings-control">
+                <span><b>Gas cut</b><output id="out-gas-cut"></output></span>
+                <input type="range" min="0" max="1" step="0.01" data-setting="env_brake_gas_cut_frac" data-output="out-gas-cut">
+            </label>
+            <label class="settings-control">
+                <span><b>Stop badge</b><output id="out-stop-frac"></output></span>
+                <input type="range" min="0" max="1" step="0.01" data-setting="env_brake_stop_frac" data-output="out-stop-frac">
+            </label>
+        </div>
+    </section>
+
     <!-- Left turn signal stack -->
     <div class="side-indicators left">
         <div class="indicator-dot"></div>
@@ -333,10 +404,119 @@
         const motorItem = document.getElementById('hw-motor');
         const arduinoItem = document.getElementById('hw-arduino');
         const egoItem = document.getElementById('hw-ego');
+        const settingsButton = document.getElementById('settings-button');
+        const settingsBackdrop = document.getElementById('settings-backdrop');
+        const settingsPanel = document.getElementById('settings-panel');
+        const settingsClose = document.getElementById('settings-close');
+        const settingsStatus = document.getElementById('settings-status');
+        const settingsInputs = Array.from(document.querySelectorAll('[data-setting]'));
+        let advancedSettings = {};
+        let settingsSaveTimer = 0;
 
         function setConnected(el, connected) {
             el.classList.toggle('connected', !!connected);
         }
+
+        function setSettingsOpen(open) {
+            settingsPanel.hidden = !open;
+            settingsBackdrop.hidden = !open;
+        }
+
+        function formatSettingValue(input) {
+            const raw = Number(input.value);
+            const unit = input.dataset.unit || '';
+            if (!Number.isFinite(raw)) return '';
+            if (input.dataset.setting === 'actor_detector_imgsz') {
+                return `${Math.round(raw)}${unit}`;
+            }
+            const step = Number(input.step) || 1;
+            const digits = step < 0.05 ? 2 : (step < 1 ? 1 : 0);
+            return `${raw.toFixed(digits)}${unit}`;
+        }
+
+        function updateSettingOutput(input) {
+            const outputId = input.dataset.output;
+            if (!outputId) return;
+            const output = document.getElementById(outputId);
+            if (output) output.textContent = formatSettingValue(input);
+        }
+
+        function applySettingsToForm(settings) {
+            advancedSettings = { ...settings };
+            for (const input of settingsInputs) {
+                const key = input.dataset.setting;
+                if (!(key in advancedSettings)) continue;
+                if (input.type === 'checkbox') {
+                    input.checked = !!advancedSettings[key];
+                } else {
+                    input.value = advancedSettings[key];
+                    updateSettingOutput(input);
+                }
+            }
+        }
+
+        async function loadSettings() {
+            try {
+                const r = await fetch('/settings', { cache: 'no-store' });
+                if (!r.ok) throw new Error(`settings ${r.status}`);
+                const payload = await r.json();
+                applySettingsToForm(payload.settings || {});
+                settingsStatus.textContent = 'Saved for next start';
+            } catch (err) {
+                settingsStatus.textContent = 'Settings unavailable';
+            }
+        }
+
+        async function saveSettings() {
+            settingsStatus.textContent = 'Saving...';
+            try {
+                const r = await fetch('/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ settings: advancedSettings }),
+                });
+                if (!r.ok) throw new Error(`settings ${r.status}`);
+                const payload = await r.json();
+                applySettingsToForm(payload.settings || advancedSettings);
+                settingsStatus.textContent = 'Saved for next start';
+            } catch (err) {
+                settingsStatus.textContent = 'Save failed';
+            }
+        }
+
+        function queueSettingsSave() {
+            clearTimeout(settingsSaveTimer);
+            settingsSaveTimer = setTimeout(saveSettings, 250);
+        }
+
+        for (const input of settingsInputs) {
+            input.addEventListener('input', () => {
+                const key = input.dataset.setting;
+                advancedSettings[key] = input.type === 'checkbox'
+                    ? input.checked
+                    : Number(input.value);
+                updateSettingOutput(input);
+                queueSettingsSave();
+            });
+            input.addEventListener('change', () => {
+                const key = input.dataset.setting;
+                advancedSettings[key] = input.type === 'checkbox'
+                    ? input.checked
+                    : Number(input.value);
+                updateSettingOutput(input);
+                queueSettingsSave();
+            });
+        }
+        settingsButton.addEventListener('click', () => {
+            setSettingsOpen(true);
+            loadSettings();
+        });
+        settingsClose.addEventListener('click', () => setSettingsOpen(false));
+        settingsBackdrop.addEventListener('click', () => setSettingsOpen(false));
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') setSettingsOpen(false);
+        });
+        loadSettings();
 
         // Autoware HUD + camera tile indicator.
         const awHud = document.getElementById('autoware-hud');

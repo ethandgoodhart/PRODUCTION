@@ -392,6 +392,139 @@ html, body {
     50%      { opacity: 1; }
 }
 
+/* ===== Advanced drive settings ===== */
+.settings-button {
+    position: fixed;
+    left: 20px;
+    bottom: 18px;
+    z-index: 80;
+    width: 42px;
+    height: 42px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(17, 18, 21, 0.12);
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.88);
+    color: var(--ink);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08), 0 10px 26px rgba(0, 0, 0, 0.08);
+    cursor: pointer;
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+}
+.settings-button svg {
+    width: 21px;
+    height: 21px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linejoin: round;
+}
+.settings-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 81;
+    background: rgba(17, 18, 21, 0.18);
+}
+.settings-panel {
+    position: fixed;
+    left: 24px;
+    bottom: 72px;
+    z-index: 82;
+    width: min(560px, calc(100vw - 48px));
+    max-height: min(760px, calc(100vh - 110px));
+    overflow: auto;
+    padding: 18px;
+    border: 1px solid rgba(17, 18, 21, 0.12);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.94);
+    box-shadow: 0 14px 44px rgba(0, 0, 0, 0.18);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+}
+.settings-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 18px;
+    margin-bottom: 16px;
+}
+.settings-title {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    color: var(--ink);
+}
+.settings-status {
+    margin-top: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted);
+}
+.settings-close {
+    width: 32px;
+    height: 32px;
+    border: 1px solid rgba(17, 18, 21, 0.12);
+    border-radius: 50%;
+    background: #fff;
+    color: var(--ink-soft);
+    cursor: pointer;
+    font-size: 19px;
+    line-height: 1;
+}
+.settings-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px 16px;
+}
+.settings-control,
+.settings-toggle {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+}
+.settings-control.wide {
+    grid-column: 1 / -1;
+}
+.settings-control span,
+.settings-toggle span {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    color: var(--ink-soft);
+    font-size: 12px;
+    font-weight: 600;
+}
+.settings-control b {
+    font: inherit;
+}
+.settings-control output {
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+.settings-control input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent);
+}
+.settings-toggle {
+    min-height: 42px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border: 1px solid rgba(17, 18, 21, 0.08);
+    border-radius: 8px;
+    background: rgba(246, 247, 249, 0.72);
+}
+.settings-toggle input {
+    width: 19px;
+    height: 19px;
+    accent-color: var(--accent);
+}
+
 /* ===== Stream grid (bottom-right) =====
    4×2 MJPEG tiles. Top row = raw cameras; bottom row = Autoware model
    outputs (lanes / depth / objects / seg). The tile feeding the

@@ -1,0 +1,15 @@
+{
+  "start_usbmuxd": true,
+  "open_browser": true,
+  "mph": 4.0,
+  "actor_detector_hz": 4.0,
+  "actor_detector_imgsz": 512,
+  "with_clrnet": false,
+  "env_brake_horizon_s": 2.3,
+  "env_brake_hard_ttc_s": 1.0,
+  "env_brake_near_stop_m": 1.8,
+  "env_brake_corridor_half_m": 0.6,
+  "env_brake_object_radius_m": 0.22,
+  "env_brake_gas_cut_frac": 0.22,
+  "env_brake_stop_frac": 0.65
+}
