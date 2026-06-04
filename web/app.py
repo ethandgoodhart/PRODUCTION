@@ -44,7 +44,7 @@ CAM_SLUGS = (
     "front", "front_left", "front_right",
     "front_wide", "front_narrow", "left", "right",
     "lanes", "depth", "seg", "objects",
-    "lanes_solo", "yolo", "mono3d",
+    "lanes_solo", "yolo",
     # Alpamayo-only viz: top-down trajectory tile written by alpamayo_infer.py.
     "bev",
 )

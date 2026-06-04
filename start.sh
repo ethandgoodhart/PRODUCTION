@@ -47,9 +47,10 @@ SEGMENTATION_CAMERA_SLOT="${SEGMENTATION_CAMERA_SLOT:-CAM_FRONT}"
 SEGMENTATION_CAMERA_INDEX="${SEGMENTATION_CAMERA_INDEX:-}"
 SEGMENTATION_WITH_CLRNET=""
 SEGMENTATION_CLRNET_CACHE="${SEGMENTATION_CLRNET_CACHE:-}"
-SEGMENTATION_REMOTE_MODAL="${SEGMENTATION_REMOTE_MODAL:-}"
-SEGMENTATION_MODAL_APP_NAME="${SEGMENTATION_MODAL_APP_NAME:-caddy-segformer-remote}"
-SEGMENTATION_MODAL_FUNCTION_NAME="${SEGMENTATION_MODAL_FUNCTION_NAME:-segment_jpeg}"
+SEGMENTATION_YOLO_LIVE="${SEGMENTATION_YOLO_LIVE:-}"
+SEGMENTATION_YOLO_MODEL="${SEGMENTATION_YOLO_MODEL:-yolo11x.pt}"
+SEGMENTATION_YOLO_IMGSZ="${SEGMENTATION_YOLO_IMGSZ:-960}"
+SEGMENTATION_YOLO_DEVICE="${SEGMENTATION_YOLO_DEVICE:-0}"
 SEGMENTATION_PUBLISH_HZ="${SEGMENTATION_PUBLISH_HZ:-}"
 SEGMENTATION_INFER_HZ="${SEGMENTATION_INFER_HZ:-}"
 SEGMENTATION_CACHE_META="${SEGMENTATION_CACHE_META:-}"
@@ -93,11 +94,13 @@ while [[ $# -gt 0 ]]; do
         --with-clrnet)             SEGMENTATION_WITH_CLRNET=1; shift ;;
         --clrnet-cache=*)          SEGMENTATION_CLRNET_CACHE="${1#*=}"; shift ;;
         --clrnet-cache)            SEGMENTATION_CLRNET_CACHE="$2"; shift 2 ;;
-        --seg-remote-modal)        SEGMENTATION_REMOTE_MODAL=1; shift ;;
-        --seg-modal-app-name=*)    SEGMENTATION_MODAL_APP_NAME="${1#*=}"; shift ;;
-        --seg-modal-app-name)      SEGMENTATION_MODAL_APP_NAME="$2"; shift 2 ;;
-        --seg-modal-function-name=*) SEGMENTATION_MODAL_FUNCTION_NAME="${1#*=}"; shift ;;
-        --seg-modal-function-name) SEGMENTATION_MODAL_FUNCTION_NAME="$2"; shift 2 ;;
+        --yolo-live)               SEGMENTATION_YOLO_LIVE=1; shift ;;
+        --yolo-model=*)            SEGMENTATION_YOLO_MODEL="${1#*=}"; shift ;;
+        --yolo-model)              SEGMENTATION_YOLO_MODEL="$2"; shift 2 ;;
+        --yolo-imgsz=*)            SEGMENTATION_YOLO_IMGSZ="${1#*=}"; shift ;;
+        --yolo-imgsz)              SEGMENTATION_YOLO_IMGSZ="$2"; shift 2 ;;
+        --yolo-device=*)           SEGMENTATION_YOLO_DEVICE="${1#*=}"; shift ;;
+        --yolo-device)             SEGMENTATION_YOLO_DEVICE="$2"; shift 2 ;;
         --seg-cache-meta=*)       SEGMENTATION_CACHE_META="${1#*=}"; shift ;;
         --seg-cache-meta)         SEGMENTATION_CACHE_META="$2"; shift 2 ;;
         --seg-yolo-cache=*)       SEGMENTATION_YOLO_CACHE="${1#*=}"; shift ;;
@@ -382,17 +385,12 @@ elif [[ "$MODEL" == "segmentation" ]]; then
     if [[ -n "$SEGMENTATION_CLRNET_CACHE" ]]; then
         INFER_ARGS+=(--clrnet-cache-file "$SEGMENTATION_CLRNET_CACHE")
     fi
-    if [[ -n "$SEGMENTATION_REMOTE_MODAL" ]]; then
-        if [[ -n "$SEGMENTATION_CACHE_META" ]]; then
-            SEGMENTATION_PUBLISH_HZ="${SEGMENTATION_PUBLISH_HZ:-30}"
-            SEGMENTATION_INFER_HZ="${SEGMENTATION_INFER_HZ:-30}"
-        else
-            SEGMENTATION_PUBLISH_HZ="${SEGMENTATION_PUBLISH_HZ:-4}"
-            SEGMENTATION_INFER_HZ="${SEGMENTATION_INFER_HZ:-4}"
-        fi
-        INFER_ARGS+=(--remote-segmentation-modal
-                     --modal-app-name "$SEGMENTATION_MODAL_APP_NAME"
-                     --modal-function-name "$SEGMENTATION_MODAL_FUNCTION_NAME")
+    if [[ -n "$SEGMENTATION_YOLO_LIVE" ]]; then
+        INFER_ARGS+=(--yolo-live
+                     --yolo-model "$SEGMENTATION_YOLO_MODEL"
+                     --yolo-imgsz "$SEGMENTATION_YOLO_IMGSZ"
+                     --yolo-device "$SEGMENTATION_YOLO_DEVICE"
+                     --yolo-min-conf "$SEGMENTATION_YOLO_MIN_CONF")
     fi
     if [[ -n "$SEGMENTATION_CACHE_META" ]]; then
         INFER_ARGS+=(--segmentation-cache-meta "$SEGMENTATION_CACHE_META")
@@ -424,18 +422,11 @@ elif [[ "$MODEL" == "segmentation" ]]; then
         echo "[start] VIDEO mode — replaying $VIDEO into segmentation pipeline" \
             >>/tmp/autoware_infer.log
     fi
-    SEGMENTATION_PY="/usr/bin/python3"
-    if [[ -n "$SEGMENTATION_REMOTE_MODAL" ]]; then
-        if [[ -x /opt/homebrew/bin/python3 ]]; then
-            SEGMENTATION_PY="/opt/homebrew/bin/python3"
-        else
-            SEGMENTATION_PY="$(command -v python3)"
-        fi
-    fi
+    SEGMENTATION_PY="$(command -v python3)"
     "$SEGMENTATION_PY" scripts/segmentation_infer.py "${INFER_ARGS[@]}" \
         >>/tmp/autoware_infer.log 2>&1 &
     AUTOWARE_PID=$!
-    echo "[start] model=segmentation (target ${SEGMENTATION_MPH} mph, homography_calib=$SEGMENTATION_HOMOGRAPHY_CALIB, remote_modal=${SEGMENTATION_REMOTE_MODAL:-0}, py=$SEGMENTATION_PY)" \
+    echo "[start] model=segmentation (target ${SEGMENTATION_MPH} mph, homography_calib=$SEGMENTATION_HOMOGRAPHY_CALIB, yolo_live=${SEGMENTATION_YOLO_LIVE:-0}, py=$SEGMENTATION_PY)" \
         >>/tmp/autoware_infer.log
 else
     # Alpamayo: remote Modal-hosted Alpamayo-R1 reached over a Modal

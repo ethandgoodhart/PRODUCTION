@@ -2,29 +2,29 @@ import React, { useEffect, useRef } from 'react';
 import SteeringWheel from './SteeringWheel';
 import PedalStack from './PedalStack';
 
-const MONO3D_REFRESH_MS = 250;
+const YOLO_REFRESH_MS = 250;
 
 export default function ControlStack({ state }) {
   const aw = state?.autoware || {};
-  const mono3dImgRef = useRef(null);
+  const yoloImgRef = useRef(null);
   const steerDeg = Number(state?.steer_deg) || 0;
   const segmentationActive =
     aw.running &&
     aw.inference &&
     (aw.model || '').toLowerCase() === 'segmentation';
-  const mono3dReady = segmentationActive && !!aw.viz && (aw.viz_streams || []).includes('mono3d');
+  const yoloReady = segmentationActive && !!aw.viz && (aw.viz_streams || []).includes('yolo');
 
   useEffect(() => {
-    if (!mono3dReady) return undefined;
+    if (!yoloReady) return undefined;
     const refresh = () => {
-      if (mono3dImgRef.current) {
-        mono3dImgRef.current.src = `/cam/mono3d.jpg?t=${Date.now()}`;
+      if (yoloImgRef.current) {
+        yoloImgRef.current.src = `/cam/yolo.jpg?t=${Date.now()}`;
       }
     };
     refresh();
-    const id = setInterval(refresh, MONO3D_REFRESH_MS);
+    const id = setInterval(refresh, YOLO_REFRESH_MS);
     return () => clearInterval(id);
-  }, [mono3dReady]);
+  }, [yoloReady]);
 
   const predictedWheelDeg = segmentationActive
     ? Number(aw.steer_deg) || 0
@@ -121,16 +121,16 @@ export default function ControlStack({ state }) {
       </div>
       <div className="relative overflow-hidden rounded-[8px] border border-line bg-[#101419] aspect-video">
         <img
-          ref={mono3dImgRef}
+          ref={yoloImgRef}
           alt=""
-          className={`block w-full h-full object-cover ${mono3dReady ? 'opacity-100' : 'opacity-0'}`}
+          className={`block w-full h-full object-cover ${yoloReady ? 'opacity-100' : 'opacity-0'}`}
         />
         <div className="absolute top-1.5 left-2 text-[9px] font-extrabold tracking-[0.16em] uppercase text-white bg-black/45 px-1.5 py-[2px] rounded">
-          3D detections
+          YOLO detections
         </div>
-        {!mono3dReady && (
+        {!yoloReady && (
           <div className="absolute inset-0 flex items-center justify-center text-[10px] font-bold tracking-[0.14em] uppercase text-[#7c8490]">
-            Waiting for 3D
+            Waiting for YOLO
           </div>
         )}
       </div>

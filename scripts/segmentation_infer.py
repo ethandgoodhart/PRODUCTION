@@ -31,7 +31,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -337,193 +336,6 @@ def object_cuboid_local_m(obj: dict) -> dict | None:
         "corners_m": bottom + top,
         "source": "yolo_ground_plane_class_priors",
     }
-
-
-def mono3d_objects_to_tracks(objects: list[dict] | None) -> list[dict]:
-    tracks: list[dict] = []
-    for i, obj in enumerate(objects or []):
-        if not isinstance(obj, dict):
-            continue
-        box = obj.get("camera_box3d")
-        if not isinstance(box, list) or len(box) < 7:
-            continue
-        try:
-            cam_x = float(box[0])
-            cam_z = float(box[2])
-            length_m = abs(float(box[3]))
-            height_m = abs(float(box[4]))
-            width_m = abs(float(box[5]))
-            yaw_rad = float(box[6])
-        except (TypeError, ValueError):
-            continue
-        if not all(math.isfinite(v) for v in (cam_x, cam_z, length_m, width_m, height_m, yaw_rad)):
-            continue
-        fwd_m = cam_z
-        left_m = cam_x
-        if fwd_m <= 0.2 or fwd_m > 90.0 or abs(left_m) > 50.0:
-            continue
-
-        vx_mps = 0.0
-        vy_mps = 0.0
-        if len(box) >= 9:
-            try:
-                vx_mps = float(box[8])
-                vy_mps = float(box[7])
-            except (TypeError, ValueError):
-                vx_mps = 0.0
-                vy_mps = 0.0
-        speed_mps = math.hypot(vx_mps, vy_mps)
-        future: list[list[float]] = []
-        if speed_mps > 0.05:
-            for step_s in (0.5, 1.0, 1.5, 2.0):
-                future.append([
-                    round(float(fwd_m + vx_mps * step_s), 3),
-                    round(float(left_m + vy_mps * step_s), 3),
-                ])
-
-        confidence = float(obj.get("confidence", 0.0) or 0.0)
-        class_name = str(obj.get("class_name") or "object")
-        track = {
-            "track_id": int(300000 + i),
-            "class_id": int(obj.get("class_id", -1) or -1),
-            "class_name": class_name,
-            "confidence": confidence,
-            "x_m": round(float(fwd_m), 3),
-            "y_m": round(float(left_m), 3),
-            "distance_m": round(float(math.hypot(fwd_m, left_m)), 3),
-            "vx_mps": round(float(vx_mps), 3),
-            "vy_mps": round(float(vy_mps), 3),
-            "speed_mps": round(float(speed_mps), 3),
-            "future_m": future,
-            "future_modes": [{"prob": 1.0, "future_m": future, "source": "mono3d_velocity"}],
-            "future_source": "mono3d_velocity",
-            "length_m": round(float(length_m), 3),
-            "width_m": round(float(width_m), 3),
-            "height_m": round(float(height_m), 3),
-            "yaw_rad": round(float(yaw_rad), 4),
-            "camera_box3d": [float(x) for x in box],
-            "box3d": {
-                "center_m": [round(float(fwd_m), 3), round(float(left_m), 3), round(float(height_m * 0.5), 3)],
-                "size_m": [round(float(length_m), 3), round(float(width_m), 3), round(float(height_m), 3)],
-                "yaw_rad": round(float(yaw_rad), 4),
-                "source": "mmdet3d_fcos3d_camera_box",
-            },
-            "provider": obj.get("provider", "mmdet3d_fcos3d_nuscenes"),
-        }
-        tracks.append(track)
-    return tracks
-
-
-def draw_mono3d_overlay(
-    frame_bgr: np.ndarray,
-    objects: list[dict] | None,
-    calib: dict,
-) -> np.ndarray:
-    out = frame_bgr.copy()
-    h, w = out.shape[:2]
-    intr = calib.get("intrinsics", {})
-    try:
-        fx = float(intr.get("fx", intr.get("focal_length")))
-        fy = float(intr.get("fy", intr.get("focal_length", fx)))
-        cx = float(intr["cx"])
-        cy = float(intr["cy"])
-    except (KeyError, TypeError, ValueError):
-        return out
-
-    def project(pt: tuple[float, float, float]) -> tuple[int, int] | None:
-        x, y, z = pt
-        if z <= 0.15 or not all(math.isfinite(v) for v in (x, y, z)):
-            return None
-        u = fx * x / z + cx
-        v = fy * y / z + cy
-        if not (math.isfinite(u) and math.isfinite(v)):
-            return None
-        return int(round(u)), int(round(v))
-
-    def draw_line(a: tuple[int, int] | None, b: tuple[int, int] | None, color: tuple[int, int, int], thick: int) -> None:
-        if a is None or b is None:
-            return
-        ax, ay = a
-        bx, by = b
-        if (
-            max(ax, bx) < -w or min(ax, bx) > 2 * w
-            or max(ay, by) < -h or min(ay, by) > 2 * h
-        ):
-            return
-        cv2.line(out, a, b, color, thick, cv2.LINE_AA)
-
-    drawn = 0
-    sorted_objects = sorted(
-        [o for o in (objects or []) if isinstance(o, dict)],
-        key=lambda o: float(o.get("confidence", 0.0) or 0.0),
-        reverse=True,
-    )
-    for obj in sorted_objects[:80]:
-        box = obj.get("camera_box3d")
-        if not isinstance(box, list) or len(box) < 7:
-            continue
-        try:
-            x = float(box[0])
-            y_bottom = float(box[1])
-            z = float(box[2])
-            size_x = max(0.05, abs(float(box[3])))
-            size_y = max(0.05, abs(float(box[4])))
-            size_z = max(0.05, abs(float(box[5])))
-            yaw = float(box[6])
-            conf = float(obj.get("confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            continue
-        if z <= 0.15 or not all(math.isfinite(v) for v in (x, y_bottom, z, size_x, size_y, size_z, yaw)):
-            continue
-
-        c = math.cos(yaw)
-        s = math.sin(yaw)
-        bottom_pts: list[tuple[float, float, float]] = []
-        top_pts: list[tuple[float, float, float]] = []
-        for x_sign, z_sign in ((1, 1), (1, -1), (-1, -1), (-1, 1)):
-            lx = x_sign * size_x * 0.5
-            lz = z_sign * size_z * 0.5
-            # Camera coordinates: x right, y down, z forward. FCOS3D yaw is
-            # around the camera vertical axis; this is enough for a clear
-            # overlay even when exact dataset conventions vary slightly.
-            px = x + c * lx + s * lz
-            pz = z - s * lx + c * lz
-            bottom_pts.append((px, y_bottom, pz))
-            top_pts.append((px, y_bottom - size_y, pz))
-
-        bottom = [project(p) for p in bottom_pts]
-        top = [project(p) for p in top_pts]
-        visible = [p for p in bottom + top if p is not None and -w <= p[0] <= 2 * w and -h <= p[1] <= 2 * h]
-        if not visible:
-            center = project((x, y_bottom - size_y * 0.5, z))
-            if center is None:
-                continue
-            visible = [center]
-
-        color_rgb = object_viz_color_rgb(obj.get("class_name"))
-        color = tuple(int(v) for v in reversed(color_rgb))
-        shadow = (0, 0, 0)
-        for ring in (bottom, top):
-            for a, b in zip(ring, ring[1:] + ring[:1]):
-                draw_line(a, b, shadow, 5)
-                draw_line(a, b, color, 2)
-        for a, b in zip(bottom, top):
-            draw_line(a, b, shadow, 5)
-            draw_line(a, b, color, 2)
-
-        anchor = min(visible, key=lambda p: p[1])
-        label = f"{obj.get('class_name', 'object')} {conf:.2f}"
-        tx = max(2, min(w - 2, anchor[0]))
-        ty = max(14, min(h - 4, anchor[1] - 6))
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-        cv2.rectangle(out, (tx, ty - th - 5), (min(w - 1, tx + tw + 6), ty + 3), shadow, -1)
-        cv2.putText(out, label, (tx + 3, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
-        drawn += 1
-
-    summary = f"FCOS3D {drawn}/{len(objects or [])}"
-    cv2.rectangle(out, (8, 8), (150, 30), (0, 0, 0), -1)
-    cv2.putText(out, summary, (14, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-    return out
 
 
 def draw_yolo_overlay(
@@ -1156,140 +968,6 @@ def timed_segment_frame(frame_rgb: np.ndarray, proc, model, device: str) -> tupl
     return seg, timings
 
 
-class ModalSegmentationClient:
-    def __init__(self, app_name: str, function_name: str, variant: str):
-        import modal
-
-        self.variant = variant
-        self.fn = modal.Function.from_name(app_name, function_name)
-
-    def segment(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, dict[str, float]]:
-        timings: dict[str, float] = {}
-
-        t = time.perf_counter()
-        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        ok, enc = cv2.imencode(
-            ".jpg",
-            frame_bgr,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 90],
-        )
-        if not ok:
-            raise RuntimeError("failed to JPEG-encode frame for Modal segmentation")
-        jpeg_bytes = enc.tobytes()
-        timings["modal_jpeg_encode_ms"] = (time.perf_counter() - t) * 1000.0
-        timings["modal_jpeg_bytes"] = float(len(jpeg_bytes))
-
-        t = time.perf_counter()
-        result = self.fn.remote(jpeg_bytes, self.variant)
-        timings["modal_roundtrip_ms"] = (time.perf_counter() - t) * 1000.0
-
-        t = time.perf_counter()
-        if result.get("dtype") != "uint8":
-            raise RuntimeError(f"Modal returned unsupported dtype: {result.get('dtype')}")
-        shape = tuple(int(x) for x in result["shape"])
-        raw = zlib.decompress(result["zlib"])
-        seg = np.frombuffer(raw, dtype=np.uint8).reshape(shape).copy()
-        timings["modal_decode_ms"] = (time.perf_counter() - t) * 1000.0
-
-        for k, v in (result.get("timings_ms") or {}).items():
-            try:
-                timings[k] = float(v)
-            except (TypeError, ValueError):
-                pass
-        return seg, timings
-
-
-def timed_segment_frame_modal(
-    frame_rgb: np.ndarray,
-    client: ModalSegmentationClient,
-) -> tuple[np.ndarray, dict[str, float]]:
-    return client.segment(frame_rgb)
-
-
-class ModalMonocular3DClient:
-    def __init__(self, app_name: str, function_name: str, calib: dict, score_thr: float):
-        import modal
-
-        intr = calib["intrinsics"]
-        self.fx = float(intr.get("fx", intr.get("focal_length")))
-        self.fy = float(intr.get("fy", intr.get("focal_length", self.fx)))
-        self.cx = float(intr["cx"])
-        self.cy = float(intr["cy"])
-        self.score_thr = float(score_thr)
-        self.fn = modal.Function.from_name(app_name, function_name)
-        self.provider = f"{app_name}/{function_name}"
-        self.last_ok = False
-        self.last_error = ""
-        self.last_latency_ms = 0.0
-
-    def detect(self, frame_bgr: np.ndarray) -> tuple[np.ndarray | None, list[dict], dict[str, float]]:
-        import base64
-
-        timings: dict[str, float] = {}
-        t = time.perf_counter()
-        ok, enc = cv2.imencode(
-            ".jpg",
-            frame_bgr,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 90],
-        )
-        if not ok:
-            raise RuntimeError("failed to JPEG-encode frame for Modal 3D detection")
-        jpeg_bytes = enc.tobytes()
-        timings["mono3d_jpeg_encode_ms"] = (time.perf_counter() - t) * 1000.0
-        timings["mono3d_jpeg_bytes"] = float(len(jpeg_bytes))
-
-        t = time.perf_counter()
-        try:
-            result = self.fn.remote(
-                jpeg_bytes,
-                self.fx,
-                self.fy,
-                self.cx,
-                self.cy,
-                self.score_thr,
-            )
-        except Exception as exc:
-            self.last_ok = False
-            self.last_error = f"{type(exc).__name__}: {exc}"
-            self.last_latency_ms = (time.perf_counter() - t) * 1000.0
-            timings["mono3d_roundtrip_ms"] = self.last_latency_ms
-            return None, [], timings
-        self.last_latency_ms = (time.perf_counter() - t) * 1000.0
-        timings["mono3d_roundtrip_ms"] = self.last_latency_ms
-
-        for k, v in (result.get("timings_ms") or {}).items():
-            try:
-                timings[f"mono3d_{k}"] = float(v)
-            except (TypeError, ValueError):
-                pass
-
-        viz_bgr = None
-        jpeg_b64 = result.get("viz_jpeg_b64")
-        if isinstance(jpeg_b64, str) and jpeg_b64:
-            raw = base64.b64decode(jpeg_b64)
-            arr = np.frombuffer(raw, dtype=np.uint8)
-            viz_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        objects = result.get("objects") if isinstance(result.get("objects"), list) else []
-        provider = str(result.get("provider") or self.provider)
-        for obj in objects:
-            if isinstance(obj, dict):
-                obj["provider"] = provider
-        self.provider = provider
-        self.last_ok = viz_bgr is not None
-        self.last_error = "" if self.last_ok else "no_visualization_returned"
-        return viz_bgr, objects, timings
-
-    def status(self) -> dict:
-        return {
-            "type": "modal_mmdet3d_fcos3d",
-            "provider": self.provider,
-            "ok": bool(self.last_ok),
-            "error": self.last_error,
-            "latency_ms": round(float(self.last_latency_ms), 3),
-            "score_threshold": float(self.score_thr),
-        }
-
-
 class SegmentationMapCache:
     def __init__(self, meta_path: Path):
         with meta_path.open() as f:
@@ -1482,7 +1160,7 @@ class GpsTrace:
 class CLRNetLaneCache:
     """Cached CLRNet lane detections for offline replay.
 
-    Loads the JSON output of precompute_clrnet_modal.py and returns
+    Loads a precomputed CLRNet lane detection cache JSON and returns
     per-frame lane lists in the same format as CLRerNetRunner.infer().
     """
 
@@ -1660,68 +1338,197 @@ class YoloDetectionCache:
         return objects
 
 
-class Mono3DDetectionCache:
-    def __init__(self, path: Path):
-        with path.open() as f:
-            data = json.load(f)
-        self.path = path
-        self.data = data
-        self.frame_count = int(data.get("frame_count") or 0)
-        self.fps = float(data.get("fps") or 30.0)
-        self.provider = str(data.get("provider") or data.get("model") or "mmdet3d_fcos3d_nuscenes")
-        self.score_threshold = float(data.get("score_threshold") or 0.0)
-        viz_dir_raw = str(data.get("viz_dir") or "")
-        self.viz_dir = (path.parent / viz_dir_raw) if viz_dir_raw else path.with_suffix(".viz")
-        self._index: dict[int, dict] = {}
-        for entry in data.get("frames", []):
-            try:
-                frame_index = int(entry.get("frame_index", -1))
-            except (TypeError, ValueError):
-                continue
-            if frame_index >= 0:
-                self._index[frame_index] = entry
+class LiveYoloDetector:
+    """On-device YOLO+ByteTrack detector matching the YoloDetectionCache interface."""
 
-    def entry_for_frame(self, frame_index: int) -> dict | None:
-        if not self._index:
+    SELECTED_CLASSES = [0, 1, 2, 3, 5, 7, 9, 11]
+
+    def __init__(
+        self,
+        model_name: str = "yolo11x.pt",
+        imgsz: int = 960,
+        conf: float = 0.20,
+        iou: float = 0.50,
+        device: str = "0",
+        history_frames: int = 90,
+    ):
+        from ultralytics import YOLO
+
+        self.yolo = YOLO(model_name)
+        self.model = model_name
+        self.imgsz = imgsz
+        self.conf = conf
+        self.iou = iou
+        self.device = device
+        self.names = getattr(self.yolo, "names", {}) or {}
+        self.fps = 30.0
+        self._history_frames = history_frames
+        self._frame_buffer: list[list[dict]] = []
+        self._frame_index = 0
+
+    def detect_frame(self, frame_bgr: np.ndarray) -> list[dict]:
+        results = self.yolo.track(
+            source=frame_bgr,
+            persist=True,
+            tracker="bytetrack.yaml",
+            imgsz=self.imgsz,
+            conf=self.conf,
+            iou=self.iou,
+            classes=self.SELECTED_CLASSES,
+            verbose=False,
+            device=self.device,
+        )
+        detections = []
+        if results:
+            result = results[0]
+            boxes = getattr(result, "boxes", None)
+            if boxes is not None and len(boxes) > 0:
+                xyxy = boxes.xyxy.detach().cpu().numpy()
+                confs = boxes.conf.detach().cpu().numpy() if boxes.conf is not None else []
+                clss = boxes.cls.detach().cpu().numpy() if boxes.cls is not None else []
+                ids = (
+                    boxes.id.detach().cpu().numpy()
+                    if getattr(boxes, "id", None) is not None
+                    else [None] * len(xyxy)
+                )
+                for i, box in enumerate(xyxy):
+                    cls_id = int(clss[i]) if i < len(clss) else -1
+                    track_id = None if ids[i] is None else int(ids[i])
+                    detections.append({
+                        "track_id": track_id,
+                        "class_id": cls_id,
+                        "class_name": str(self.names.get(cls_id, cls_id)),
+                        "confidence": round(float(confs[i]) if i < len(confs) else 0.0, 4),
+                        "xyxy": [round(float(v), 2) for v in box.tolist()],
+                    })
+        self._frame_buffer.append(detections)
+        if len(self._frame_buffer) > self._history_frames:
+            self._frame_buffer.pop(0)
+        self._frame_index += 1
+        return detections
+
+    def raw_detections(self, frame_index: int) -> list[dict]:
+        buf_start = self._frame_index - len(self._frame_buffer)
+        buf_idx = frame_index - buf_start
+        if 0 <= buf_idx < len(self._frame_buffer):
+            return list(self._frame_buffer[buf_idx])
+        return []
+
+    def detection_local(
+        self,
+        det: dict,
+        projector,
+    ) -> tuple[float, float, tuple[float, float]] | None:
+        xyxy = det.get("xyxy") or []
+        if len(xyxy) != 4:
             return None
-        idx = int(np.clip(frame_index, 0, max(0, self.frame_count - 1)))
-        return self._index.get(idx)
+        x1, _, x2, y2 = [float(v) for v in xyxy]
+        foot = ((x1 + x2) * 0.5, y2)
+        local = projector.image_to_local(*foot)
+        if local is None:
+            return None
+        return float(local[0]), float(local[1]), foot
 
-    def objects_for_frame(self, frame_index: int) -> list[dict]:
-        entry = self.entry_for_frame(frame_index)
-        raw = entry.get("objects", []) if isinstance(entry, dict) else []
+    def track_history(
+        self,
+        frame_index: int,
+        track_id: int | None,
+        projector,
+        history_s: float = 3.2,
+    ) -> list[list[float]]:
+        if track_id is None:
+            return []
+        buf_start = self._frame_index - len(self._frame_buffer)
+        buf_idx = frame_index - buf_start
+        if buf_idx < 0:
+            return []
+        start_buf = max(0, buf_idx - int(math.ceil(float(history_s) * self.fps)))
+        hist = []
+        for bi in range(start_buf, min(buf_idx + 1, len(self._frame_buffer))):
+            match = None
+            for prev in self._frame_buffer[bi]:
+                if prev.get("track_id") == track_id:
+                    match = prev
+                    break
+            if match is None:
+                continue
+            projected = self.detection_local(match, projector)
+            if projected is None:
+                continue
+            fwd, lat, _ = projected
+            t_s = (bi - buf_idx) / max(self.fps, 1e-6)
+            hist.append([round(float(t_s), 3), round(float(fwd), 3), round(float(lat), 3)])
+        return hist
+
+    def objects_for_frame(
+        self,
+        frame_index: int,
+        projector,
+        horizon_s: float = 4.0,
+        step_s: float = 0.5,
+        lookback_frames: int = 20,
+        history_s: float = 2.0,
+    ) -> list[dict]:
+        buf_start = self._frame_index - len(self._frame_buffer)
+        buf_idx = frame_index - buf_start
+        if buf_idx < 0 or buf_idx >= len(self._frame_buffer):
+            return []
+        dets = self._frame_buffer[buf_idx]
         objects = []
-        for obj in raw:
-            if not isinstance(obj, dict):
+        for det in dets:
+            xyxy = det.get("xyxy") or []
+            if len(xyxy) != 4:
                 continue
-            clean = dict(obj)
-            clean["provider"] = self.provider
-            objects.append(clean)
+            x1, y1, x2, y2 = [float(v) for v in xyxy]
+            projected = self.detection_local(det, projector)
+            if projected is None:
+                continue
+            fwd, lat, foot = projected
+            track_id = det.get("track_id")
+            vx = 0.0
+            vy = 0.0
+            if track_id is not None:
+                for lb in range(1, lookback_frames + 1):
+                    prev_bi = buf_idx - lb
+                    if prev_bi < 0:
+                        break
+                    prev_match = None
+                    for prev in self._frame_buffer[prev_bi]:
+                        if prev.get("track_id") == track_id:
+                            prev_match = prev
+                            break
+                    if prev_match is None:
+                        continue
+                    prev_local = self.detection_local(prev_match, projector)
+                    if prev_local is None:
+                        continue
+                    dt = lb / max(self.fps, 1e-6)
+                    if dt > 1e-6:
+                        vx = (fwd - prev_local[0]) / dt
+                        vy = (lat - prev_local[1]) / dt
+                    break
+            speed = float(math.hypot(vx, vy))
+            future = YoloDetectionCache.constant_velocity_future(fwd, lat, vx, vy, horizon_s, step_s)
+            objects.append({
+                "track_id": int(track_id) if track_id is not None else None,
+                "class_id": int(det.get("class_id", -1)),
+                "class_name": str(det.get("class_name", "object")),
+                "confidence": float(det.get("confidence", 0.0)),
+                "xyxy": [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
+                "footpoint": [round(foot[0], 2), round(foot[1], 2)],
+                "x_m": round(float(fwd), 3),
+                "y_m": round(float(lat), 3),
+                "distance_m": round(float(math.hypot(fwd, lat)), 3),
+                "vx_mps": round(float(vx), 3),
+                "vy_mps": round(float(vy), 3),
+                "speed_mps": round(speed, 3),
+                "future_m": future,
+                "future_modes": [{"prob": 1.0, "future_m": future, "source": "constant_velocity"}],
+                "future_source": "constant_velocity",
+                "history_m": self.track_history(frame_index, int(track_id) if track_id is not None else None, projector, history_s),
+            })
+        objects.sort(key=lambda o: o["distance_m"])
         return objects
-
-    def viz_for_frame(self, frame_index: int) -> np.ndarray | None:
-        entry = self.entry_for_frame(frame_index)
-        if not isinstance(entry, dict):
-            return None
-        rel = entry.get("viz")
-        if not rel:
-            return None
-        path = self.viz_dir / str(rel)
-        if not path.exists():
-            return None
-        return cv2.imread(str(path), cv2.IMREAD_COLOR)
-
-    def status(self) -> dict:
-        return {
-            "type": "cache_mmdet3d_fcos3d",
-            "provider": self.provider,
-            "ok": bool(self._index),
-            "error": "",
-            "latency_ms": 0.0,
-            "score_threshold": self.score_threshold,
-            "cache_file": str(self.path),
-            "viz_dir": str(self.viz_dir),
-        }
 
 
 class ObjectTrajectoryPredictorClient:
@@ -3093,8 +2900,6 @@ def gps_route_bearing_rad(args) -> float | None:
 def clrnet_device_from_seg_device(device: str) -> str:
     if device == "cuda":
         return "cuda:0"
-    if device == "modal":
-        return "cpu"
     return device
 
 
@@ -3617,17 +3422,14 @@ def main() -> None:
                    help="Ground height for E2E BEV projection when the E2E origin is camera-center.")
     p.add_argument("--model", default="b0", choices=("b0", "b2", "b5"))
     p.add_argument("--device", default=None)
-    p.add_argument("--remote-segmentation-modal", action="store_true",
-                   help="Run SegFormer inference on Modal and keep BEV/planning local.")
-    p.add_argument("--modal-app-name", default="caddy-segformer-remote")
-    p.add_argument("--modal-function-name", default="segment_jpeg")
-    p.add_argument("--mono3d-remote-modal", action="store_true",
-                   help="Run learned monocular 3D detection on Modal and publish mono3d.jpg.")
-    p.add_argument("--mono3d-cache-file", type=Path, default=None,
-                   help="Precomputed FCOS3D cache JSON produced by precompute_mono3d_modal.py.")
-    p.add_argument("--mono3d-modal-app-name", default="caddy-monocular3d-fcos3d")
-    p.add_argument("--mono3d-modal-function-name", default="detect_jpeg")
-    p.add_argument("--mono3d-score-threshold", type=float, default=0.05)
+    p.add_argument("--yolo-live", action="store_true",
+                   help="Run YOLO+ByteTrack live on-device instead of from a precomputed cache.")
+    p.add_argument("--yolo-model", default="yolo11x.pt",
+                   help="YOLO model name/path for --yolo-live.")
+    p.add_argument("--yolo-imgsz", type=int, default=960,
+                   help="YOLO input resolution for --yolo-live.")
+    p.add_argument("--yolo-device", default="0",
+                   help="Device for YOLO inference (0=first GPU, cpu, etc.).")
     p.add_argument("--segmentation-cache-meta", type=Path, default=None,
                    help="Precomputed uint8 segmentation cache metadata for offline video.")
     p.add_argument("--segmentation-cache-meta-left", type=Path, default=None,
@@ -3749,19 +3551,15 @@ def main() -> None:
     )
     rt.BEV_SIZE = args.bev_size
 
-    remote_segmentation = bool(args.remote_segmentation_modal)
-    if remote_segmentation:
-        device = "modal"
-    else:
-        import torch
+    import torch
 
-        if args.device:
-            device = args.device
-        elif torch.cuda.is_available():
-            device = "cuda"
-        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-            device = "mps"
-        else:
+    if args.device:
+        device = args.device
+    elif torch.cuda.is_available():
+        device = "cuda"
+    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        device = "mps"
+    else:
             device = "cpu"
 
     calib, e2e_slot = load_bev_calibration(args)
@@ -3787,31 +3585,19 @@ def main() -> None:
     )
     yolo_cache = YoloDetectionCache(args.yolo_cache_file) if args.yolo_cache_file else None
     ground_projector = GroundPlaneProjector(calib)
-    mono3d_cache = Mono3DDetectionCache(args.mono3d_cache_file) if args.mono3d_cache_file else None
-    mono3d_client: ModalMonocular3DClient | None = None
-    latest_mono3d_status: dict = {"type": "disabled", "ok": False}
-    if mono3d_cache is not None:
-        latest_mono3d_status = mono3d_cache.status()
+    yolo_live: LiveYoloDetector | None = None
+    if args.yolo_live:
+        yolo_live = LiveYoloDetector(
+            model_name=args.yolo_model,
+            imgsz=args.yolo_imgsz,
+            conf=args.yolo_min_conf,
+            device=args.yolo_device,
+        )
         print(
-            f"[mono3d] using cache {mono3d_cache.path} "
-            f"provider={mono3d_cache.provider} frames={mono3d_cache.frame_count} "
-            f"score_thr={mono3d_cache.score_threshold:.2f}",
+            f"[yolo] live on-device detector model={args.yolo_model} "
+            f"imgsz={args.yolo_imgsz} conf={args.yolo_min_conf} device={args.yolo_device}",
             flush=True,
         )
-    elif args.mono3d_remote_modal:
-        print(
-            f"[mono3d] using Modal learned 3D detector "
-            f"app={args.mono3d_modal_app_name} function={args.mono3d_modal_function_name} "
-            f"score_thr={args.mono3d_score_threshold:.2f}",
-            flush=True,
-        )
-        mono3d_client = ModalMonocular3DClient(
-            args.mono3d_modal_app_name,
-            args.mono3d_modal_function_name,
-            calib,
-            args.mono3d_score_threshold,
-        )
-        latest_mono3d_status = mono3d_client.status()
     object_predictor = ObjectTrajectoryPredictorClient(
         args.object_predictor_url,
         timeout_s=max(1.0, float(args.object_predictor_timeout_ms)) / 1000.0,
@@ -3873,7 +3659,6 @@ def main() -> None:
 
     proc = None
     model = None
-    modal_client: ModalSegmentationClient | None = None
     seg_cache: SegmentationMapCache | None = None
     seg_model_base = f"drive-by-segmentation-segformer-{args.model}"
     seg_model_full = seg_model_base
@@ -3911,22 +3696,8 @@ def main() -> None:
             flush=True,
         )
 
-    if remote_segmentation:
-        if seg_cache is None:
-            print(
-                f"[seg] using Modal segmentation app={args.modal_app_name} "
-                f"function={args.modal_function_name} variant={args.model}",
-                flush=True,
-            )
-            modal_client = ModalSegmentationClient(
-                args.modal_app_name,
-                args.modal_function_name,
-                args.model,
-            )
-            seg_model_full = f"{seg_model_full}-modal:{args.modal_app_name}/{args.modal_function_name}"
-    else:
-        if seg_cache is None:
-            proc, model = seg_live.load_segformer(args.model, device)
+    if seg_cache is None:
+        proc, model = seg_live.load_segformer(args.model, device)
     steer_est = rt.SteeringEstimator()
     clrnet = None
     clrnet_runner = None
@@ -4058,7 +3829,6 @@ def main() -> None:
     latest_bev_cls_map: np.ndarray | None = None
     latest_objects_bgr: np.ndarray | None = None
     latest_yolo_bgr: np.ndarray | None = None
-    latest_mono3d_bgr: np.ndarray | None = None
     latest_seg_map: np.ndarray | None = None
     latest_path: list[list[float]] = []
     latest_steer_raw = 0.0
@@ -4097,8 +3867,6 @@ def main() -> None:
         autospeed_ctrl, 0.0, 0, enabled=not args.no_protective_stop
     )
     latest_yolo_objects: list[dict] = []
-    latest_mono3d_objects: list[dict] = []
-    latest_mono3d_tracks: list[dict] = []
     latest_object_tracks: list[dict] = []
     latest_commanded_speed_mps = 0.0
     latest_autospeed_status: dict = autospeed_ctrl.status()
@@ -4171,10 +3939,6 @@ def main() -> None:
                             "seg_cache_lookup_ms": (time.perf_counter() - t_cache) * 1000.0,
                             "seg_cache_frame_index": float(source_frame_index),
                         }
-                    elif remote_segmentation:
-                        if modal_client is None:
-                            raise RuntimeError("Modal segmentation client was not initialized")
-                        seg_map, seg_stage_ms = timed_segment_frame_modal(frame_rgb, modal_client)
                     else:
                         seg_map, seg_stage_ms = timed_segment_frame(frame_rgb, proc, model, device)
                     latest_seg_map = seg_map
@@ -4296,18 +4060,21 @@ def main() -> None:
                         args.ego_state_file
                     )
                     latest_lookahead_m = adaptive_lookahead_m(latest_ego_speed_mph, latest_ego_speed_ok)
-                    # Autospeed: unified path-aware obstacle speed control.
-                    # When the Modal 3D detector is enabled, learned 3D boxes
-                    # are the object source. YOLO remains only as a fallback for
-                    # launches that do not enable mono3d.
                     latest_collision = None
                     latest_brake_corridor = None
                     protective_enabled = not args.no_protective_stop
                     latest_yolo_objects = []
-                    latest_mono3d_tracks = []
                     latest_object_tracks = []
-                    mono3d_enabled = mono3d_cache is not None or mono3d_client is not None
-                    if not mono3d_enabled and yolo_cache is not None and ground_projector is not None:
+                    if yolo_live is not None and ground_projector is not None:
+                        yolo_live.detect_frame(frame_bgr)
+                        yolo_live.fps = fps or 30.0
+                        latest_yolo_objects = yolo_live.objects_for_frame(
+                            yolo_live._frame_index - 1,
+                            ground_projector,
+                            horizon_s=AUTOSPEED_LOOKAHEAD_TIME,
+                        )
+                        mark("yolo_live_ms")
+                    elif yolo_cache is not None and ground_projector is not None:
                         latest_yolo_objects = yolo_cache.objects_for_frame(
                             source_frame_index,
                             ground_projector,
@@ -4324,29 +4091,10 @@ def main() -> None:
                         )
                     latest_yolo_bgr = (
                         draw_yolo_overlay(frame_bgr, latest_yolo_objects, None)
-                        if not mono3d_enabled and latest_yolo_objects
+                        if latest_yolo_objects
                         else None
                     )
-                    if mono3d_cache is not None:
-                        latest_mono3d_objects = mono3d_cache.objects_for_frame(source_frame_index)
-                        latest_mono3d_tracks = mono3d_objects_to_tracks(latest_mono3d_objects)
-                        latest_mono3d_bgr = draw_mono3d_overlay(frame_bgr, latest_mono3d_objects, calib)
-                        latest_mono3d_status = mono3d_cache.status()
-                    elif mono3d_client is not None:
-                        mono3d_bgr, mono3d_objects, mono3d_ms = mono3d_client.detect(frame_bgr)
-                        stage_ms.update(mono3d_ms)
-                        latest_mono3d_objects = mono3d_objects
-                        latest_mono3d_tracks = mono3d_objects_to_tracks(mono3d_objects)
-                        latest_mono3d_bgr = draw_mono3d_overlay(
-                            frame_bgr,
-                            latest_mono3d_objects,
-                            calib,
-                        ) if mono3d_objects else mono3d_bgr
-                        latest_mono3d_status = mono3d_client.status()
-                        mark("mono3d_ms")
-                    latest_object_tracks = (
-                        latest_mono3d_tracks if mono3d_enabled else latest_yolo_objects
-                    )
+                    latest_object_tracks = latest_yolo_objects
                     latest_occupancy = None
                     latest_image_brake = None
                     ego_mps = (
@@ -4372,7 +4120,11 @@ def main() -> None:
                     else:
                         latest_commanded_speed_mps = max_speed_mps
                     raw_stop_signs = []
-                    if not mono3d_enabled and yolo_cache is not None:
+                    if yolo_live is not None:
+                        for det in yolo_live.raw_detections(yolo_live._frame_index - 1):
+                            if str(det.get("class_name", "")) == "stop sign":
+                                raw_stop_signs.append(det)
+                    elif yolo_cache is not None:
                         for det in yolo_cache.raw_detections(source_frame_index):
                             if str(det.get("class_name", "")) == "stop sign":
                                 raw_stop_signs.append(det)
@@ -4594,10 +4346,6 @@ def main() -> None:
                     t = time.perf_counter()
                     write_jpeg_atomic(args.frames_dir / "yolo.jpg", latest_yolo_bgr, quality=82)
                     jpeg_ms["jpeg_yolo_ms"] = (time.perf_counter() - t) * 1000.0
-                if latest_mono3d_bgr is not None:
-                    t = time.perf_counter()
-                    write_jpeg_atomic(args.frames_dir / "mono3d.jpg", latest_mono3d_bgr, quality=82)
-                    jpeg_ms["jpeg_mono3d_ms"] = (time.perf_counter() - t) * 1000.0
                 if latest_clrnet_overlay_bgr is not None:
                     t = time.perf_counter()
                     write_jpeg_atomic(args.frames_dir / "lanes.jpg", latest_clrnet_overlay_bgr, quality=80)
@@ -4663,7 +4411,6 @@ def main() -> None:
                         or latest_bev_bgr is not None
                         or latest_objects_bgr is not None
                         or latest_yolo_bgr is not None
-                        or latest_mono3d_bgr is not None
                         or latest_clrnet_overlay_bgr is not None
                     ),
                     "viz_streams": [
@@ -4672,7 +4419,6 @@ def main() -> None:
                             ("bev", latest_bev_bgr),
                             ("objects", latest_objects_bgr),
                             ("yolo", latest_yolo_bgr),
-                            ("mono3d", latest_mono3d_bgr),
                             ("lanes", latest_clrnet_overlay_bgr),
                         )
                         if img is not None
@@ -4722,11 +4468,6 @@ def main() -> None:
                     },
                     "segmentation": {
                         "bev_mode": args.bev_mode,
-                        "remote_modal": bool(remote_segmentation),
-                        "modal_app_name": args.modal_app_name if remote_segmentation else None,
-                        "modal_function_name": (
-                            args.modal_function_name if remote_segmentation else None
-                        ),
                         "latency_ms": latest_latency_ms,
                         "jpeg_ms": {k: round(float(v), 3) for k, v in jpeg_ms.items()},
                         "publish_jpeg_total_ms": round(float(publish_jpeg_total_ms), 3),
@@ -4754,37 +4495,23 @@ def main() -> None:
                         "protective_stop": latest_protective_stop,
                         "object_detector": {
                             "type": (
-                                latest_mono3d_status.get("type", "modal_mmdet3d_fcos3d")
-                                if (mono3d_cache is not None or mono3d_client is not None)
-                                else "yolo11+bytetrack" if yolo_cache is not None
+                                "yolo11+bytetrack" if (yolo_cache is not None or yolo_live is not None)
                                 else "none"
                             ),
                             "model": (
-                                latest_mono3d_status.get("provider")
-                                if (mono3d_cache is not None or mono3d_client is not None)
+                                yolo_live.model if yolo_live is not None
                                 else yolo_cache.model if yolo_cache is not None
                                 else None
                             ),
                             "cache_file": (
-                                str(mono3d_cache.path) if mono3d_cache is not None
-                                else None if mono3d_client is not None
-                                else str(yolo_cache.path) if yolo_cache is not None
+                                str(yolo_cache.path) if yolo_cache is not None
                                 else None
                             ),
-                            "min_confidence": (
-                                float(latest_mono3d_status.get("score_threshold", args.mono3d_score_threshold))
-                                if (mono3d_cache is not None or mono3d_client is not None)
-                                else float(args.yolo_min_conf)
-                            ),
-                            "trajectory_predictor": (
-                                {"type": "mono3d_velocity", "provider": "mmdet3d_fcos3d_nuscenes"}
-                                if (mono3d_cache is not None or mono3d_client is not None)
-                                else object_predictor.status()
-                            ),
+                            "live": yolo_live is not None,
+                            "min_confidence": float(args.yolo_min_conf),
+                            "trajectory_predictor": object_predictor.status(),
                         },
                         "object_tracks": latest_object_tracks,
-                        "learned_3d_detector": latest_mono3d_status,
-                        "learned_3d_objects": latest_mono3d_objects,
                         "gps_route": latest_gps_route,
                         "offline_prediction": dict(offline_prediction_status),
                         "map_file": str(args.segmentation_map_file),
