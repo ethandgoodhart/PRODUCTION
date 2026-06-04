@@ -961,7 +961,18 @@ def teleop_command():
 
 @app.route("/quit", methods=["POST"])
 def quit_app():
-    subprocess.Popen(["pkill", "-f", "firefox"])
+    start_pid = os.environ.get("CART_START_PID", "")
+    if start_pid.isdigit():
+        subprocess.Popen([
+            "sh", "-c",
+            (
+                "sleep 0.2; "
+                "pkill -f 'firefox --no-remote --new-instance' 2>/dev/null || true; "
+                f"kill -TERM {int(start_pid)} 2>/dev/null || true"
+            ),
+        ])
+    else:
+        subprocess.Popen(["pkill", "-f", "firefox"])
     return "", 204
 
 

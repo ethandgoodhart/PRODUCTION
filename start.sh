@@ -164,6 +164,7 @@ cleanup() {
     rm -rf "$FRAMES_DIR"
 }
 trap cleanup EXIT
+trap 'exit 0' INT TERM
 
 # Best-effort stale process cleanup from a previous shell/thread before we bind
 # the Flask port or start a new inference sidecar.
@@ -186,6 +187,7 @@ export AUTOWARE_STATE_FILE
 export EGO_STATE_FILE
 export GPS_STATE_FILE
 export CART_FRAMES_DIR="$FRAMES_DIR"
+export CART_START_PID="$$"
 mkdir -p "$FRAMES_DIR"
 
 # iPhone ARKit ego-motion publisher. ego_link.sh supervises the
