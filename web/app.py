@@ -7,6 +7,7 @@ import subprocess
 import glob
 import threading
 import time
+from pathlib import Path
 
 from flask import Flask, Response, abort, jsonify, render_template, request, send_from_directory
 
@@ -18,6 +19,13 @@ EGO_STATE_FILE = os.environ.get("EGO_STATE_FILE", "/tmp/ego_state.json")
 FRAMES_DIR = os.environ.get("CART_FRAMES_DIR", "/tmp/cart_frames")
 TELEOP_CMD_FILE = "/tmp/teleop_cmd.json"
 VIDEO_CONTROL_FILE = os.environ.get("VIDEO_CONTROL_FILE", "/tmp/video_control.json")
+OFFLINE_PREDICTIONS_FILE = os.environ.get(
+    "OFFLINE_PREDICTIONS_FILE",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".cache", "offline_predictions", "manifest.json")),
+)
+OFFLINE_PREDICTION_SELECTION_FILE = os.environ.get(
+    "OFFLINE_PREDICTION_SELECTION_FILE", "/tmp/offline_prediction_selection.json"
+)
 NAV_ROUTE_FILE = os.environ.get("NAV_ROUTE_FILE", "/tmp/nav_route.json")
 GPS_STATE_FILE = os.environ.get("GPS_STATE_FILE", "/tmp/gps_state.json")
 TELEOP_CMD_FRESH_S = 0.50
@@ -264,6 +272,7 @@ def _load_json(path: str, fresh_s: float) -> tuple[dict, bool]:
 
 
 def _atomic_json_write(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
         json.dump(payload, f, separators=(",", ":"))
@@ -430,6 +439,7 @@ def state():
             if auto and isinstance(auto.get("ground_truth_control"), dict) else None
         ),
         "predicted_path": list(auto.get("predicted_path", [])),
+        "bev": dict(auto.get("bev", {})) if auto and isinstance(auto.get("bev"), dict) else {},
         "source": str(auto.get("source", "")) if auto else "",
         "video": dict(auto.get("video", {})) if auto and isinstance(auto.get("video"), dict) else None,
         # Pass the alpamayo diagnostics block through verbatim so the UI
@@ -442,6 +452,15 @@ def state():
         "stop_sign": dict(auto.get("stop_sign", {})) if auto else {},
         "stale": auto_stale,
     }
+    selection = _load_offline_prediction_selection()
+    data["offline_prediction"] = {
+        "id": selection.get("id"),
+        "label": selection.get("label"),
+        "video": selection.get("video"),
+        "segmentation_meta": selection.get("segmentation_meta"),
+        "clrnet_cache": selection.get("clrnet_cache"),
+        "ts": selection.get("ts"),
+    } if selection else None
 
     # iPhone ego-motion publisher status. ego_state_writer.py mirrors the
     # EgoSensor's connected flag + latest sample at ~10 Hz; if the writer
@@ -480,6 +499,88 @@ def offline_video_control():
         "pause": pause,
     })
     return jsonify({"ok": True, "seek_s": seek_s, "pause": pause})
+
+
+def _load_offline_predictions_manifest() -> dict:
+    try:
+        with open(OFFLINE_PREDICTIONS_FILE) as f:
+            manifest = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        manifest = {}
+    runs = manifest.get("runs", [])
+    if not isinstance(runs, list):
+        runs = []
+    clean_runs = []
+    for run in runs:
+        if not isinstance(run, dict) or not run.get("id"):
+            continue
+        clean = dict(run)
+        for key in ("segmentation_meta", "segmentation_cache", "clrnet_cache", "video"):
+            if clean.get(key):
+                clean[key] = str(clean[key])
+        clean["available"] = bool(
+            clean.get("segmentation_meta")
+            and Path(clean["segmentation_meta"]).exists()
+            and clean.get("clrnet_cache")
+            and Path(clean["clrnet_cache"]).exists()
+        )
+        clean_runs.append(clean)
+    manifest["runs"] = clean_runs
+    return manifest
+
+
+def _load_offline_prediction_selection() -> dict:
+    try:
+        with open(OFFLINE_PREDICTION_SELECTION_FILE) as f:
+            selection = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return selection if isinstance(selection, dict) else {}
+
+
+@app.route("/offline-predictions", methods=["GET", "POST"])
+def offline_predictions():
+    manifest = _load_offline_predictions_manifest()
+    runs = manifest.get("runs", [])
+
+    if request.method == "GET":
+        selection = _load_offline_prediction_selection()
+        active_id = selection.get("id")
+        active = next((r for r in runs if r.get("id") == active_id), None)
+        return jsonify({
+            "manifest": OFFLINE_PREDICTIONS_FILE,
+            "selection_file": OFFLINE_PREDICTION_SELECTION_FILE,
+            "active_id": active_id,
+            "active": active,
+            "runs": runs,
+        })
+
+    payload = request.get_json(silent=True) or {}
+    run_id = str(payload.get("id") or "")
+    if not run_id:
+        abort(400)
+    run = next((r for r in runs if r.get("id") == run_id), None)
+    if run is None:
+        return jsonify({"ok": False, "error": f"unknown prediction id: {run_id}"}), 404
+    if not run.get("available"):
+        return jsonify({"ok": False, "error": "prediction files are missing", "run": run}), 409
+    selection = {
+        "seq": time.time_ns(),
+        "ts": time.time(),
+        "id": run_id,
+        "label": run.get("label") or run_id,
+        "video": run.get("video"),
+        "segmentation_meta": run.get("segmentation_meta"),
+        "clrnet_cache": run.get("clrnet_cache"),
+    }
+    _atomic_json_write(OFFLINE_PREDICTION_SELECTION_FILE, selection)
+    _atomic_json_write(VIDEO_CONTROL_FILE, {
+        "seq": time.time_ns(),
+        "ts": time.time(),
+        "seek_s": 0.0,
+        "pause": False,
+    })
+    return jsonify({"ok": True, "active": run, "selection": selection})
 
 
 def _frame_path(slug: str) -> str | None:

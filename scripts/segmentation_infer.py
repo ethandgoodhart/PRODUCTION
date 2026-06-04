@@ -66,6 +66,9 @@ EGO_STATE_FILE_DEFAULT = Path(os.environ.get("EGO_STATE_FILE", "/tmp/ego_state.j
 GPS_STATE_FILE_DEFAULT = Path(os.environ.get("GPS_STATE_FILE", "/tmp/gps_state.json"))
 NAV_ROUTE_FILE_DEFAULT = Path(os.environ.get("NAV_ROUTE_FILE", "/tmp/nav_route.json"))
 VIDEO_CONTROL_FILE_DEFAULT = Path(os.environ.get("VIDEO_CONTROL_FILE", "/tmp/video_control.json"))
+OFFLINE_PREDICTION_SELECTION_FILE_DEFAULT = Path(
+    os.environ.get("OFFLINE_PREDICTION_SELECTION_FILE", "/tmp/offline_prediction_selection.json")
+)
 
 # Segmentation currently drives from the center-front E2E-calibrated camera.
 SLUGS = ("front",)
@@ -78,7 +81,7 @@ PUBLISH_HZ_DEFAULT = 15.0
 INFER_HZ_DEFAULT = 0.0
 MODEL_NAME = "segmentation"
 FRONT_CAMERA_BRIGHTNESS = 32
-STEERING_SIGN = -1.0
+STEERING_SIGN = 1.0
 STEERING_COLUMN_RATIO = 15.0
 STEERING_EMA = 0.35
 CLRNET_CONF_THRESHOLD = 0.60
@@ -899,6 +902,7 @@ class VideoReader(threading.Thread):
         self.source_frame_index = 0
         self.paused = False
         self.last_control_seq = None
+        self._reopen = threading.Event()
         self._stop = threading.Event()
 
     def _read_control(self) -> dict | None:
@@ -954,11 +958,31 @@ class VideoReader(threading.Thread):
                 "scrubbable": self.control_file is not None,
             }
 
+    def switch_video(self, video_path: str) -> bool:
+        video_path = str(video_path)
+        with self.lock:
+            if video_path == self.video_path:
+                return False
+            self.video_path = video_path
+            self.frame = None
+            self.frame_count = 0
+            self.last_ok_s = 0.0
+            self.duration_s = 0.0
+            self.total_frames = 0
+            self.position_s = 0.0
+            self.source_frame_index = 0
+            self.last_control_seq = None
+        self._reopen.set()
+        return True
+
     def run(self) -> None:
         while not self._stop.is_set():
-            cap = cv2.VideoCapture(self.video_path)
+            self._reopen.clear()
+            with self.lock:
+                video_path = self.video_path
+            cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
-                print(f"[video] failed to open {self.video_path}", flush=True)
+                print(f"[video] failed to open {video_path}", flush=True)
                 return
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -970,6 +994,8 @@ class VideoReader(threading.Thread):
             period = 1.0 / fps
             next_t = time.monotonic()
             while not self._stop.is_set():
+                if self._reopen.is_set():
+                    break
                 control_changed = self._apply_control(cap)
                 with self.lock:
                     paused = self.paused
@@ -1027,7 +1053,7 @@ def write_jpeg_atomic(path: Path, frame_bgr: np.ndarray, quality: int = JPEG_QUA
     ok, buf = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not ok:
         return
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_bytes(buf.tobytes())
     os.replace(tmp, path)
 
@@ -1037,14 +1063,14 @@ def write_png_atomic(path: Path, img: np.ndarray) -> None:
     ok, buf = cv2.imencode(".png", img)
     if not ok:
         return
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_bytes(buf.tobytes())
     os.replace(tmp, path)
 
 
 def write_json_atomic(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
     with tmp.open("w") as f:
         json.dump(payload, f, separators=(",", ":"))
     os.replace(tmp, path)
@@ -1288,6 +1314,34 @@ class SegmentationMapCache:
     def get(self, frame_index: int) -> np.ndarray:
         idx = int(np.clip(frame_index, 0, self.frame_count - 1))
         return np.asarray(self.maps[idx], dtype=np.uint8).copy()
+
+
+class OfflinePredictionSelection:
+    """File-backed active cache selector written by the Flask browser UI."""
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self._last_mtime_ns: int | None = None
+
+    def poll(self) -> dict | None:
+        if self.path is None:
+            return None
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        if self._last_mtime_ns == st.st_mtime_ns:
+            return None
+        self._last_mtime_ns = st.st_mtime_ns
+        try:
+            with self.path.open() as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, TypeError) as e:
+            print(f"[offline] failed to read selection {self.path}: {e}", flush=True)
+            return None
+        if not isinstance(data, dict) or not data.get("id"):
+            return None
+        return data
 
 
 class GroundPlaneProjector:
@@ -3522,6 +3576,9 @@ def main() -> None:
     p.add_argument("--no-loop", action="store_true")
     p.add_argument("--video-control-file", type=Path, default=VIDEO_CONTROL_FILE_DEFAULT,
                    help="JSON control file for offline video seek/pause.")
+    p.add_argument("--offline-prediction-selection-file", type=Path,
+                   default=OFFLINE_PREDICTION_SELECTION_FILE_DEFAULT,
+                   help="JSON file written by the browser to switch offline cache bundles.")
     p.add_argument("--control-log-file", type=Path, default=None,
                    help="Recorded control.jsonl to synchronize ground-truth steering/gas/brake in offline mode.")
     p.add_argument("--max-scan", type=int, default=16)
@@ -3709,15 +3766,23 @@ def main() -> None:
         )
 
     gps_trace: GpsTrace | None = None
-    if args.video:
-        gps_candidate = Path(args.video).resolve().parent / "gps.json"
+    def load_gps_trace_for_video(video_path: str | None) -> GpsTrace | None:
+        if not video_path:
+            return None
+        gps_candidate = Path(video_path).resolve().parent / "gps.json"
         if gps_candidate.exists():
-            gps_trace = GpsTrace(gps_candidate)
+            trace = GpsTrace(gps_candidate)
             print(
-                f"[gps] using recorded trace {gps_trace.path} "
-                f"samples={len(gps_trace.times)}",
+                f"[gps] using recorded trace {trace.path} "
+                f"samples={len(trace.times)}",
                 flush=True,
             )
+            return trace
+        print(f"[gps] no recorded trace for {video_path}", flush=True)
+        return None
+
+    if args.video:
+        gps_trace = load_gps_trace_for_video(args.video)
 
     readers = make_sources(args)
     for r in readers:
@@ -3733,7 +3798,8 @@ def main() -> None:
     model = None
     modal_client: ModalSegmentationClient | None = None
     seg_cache: SegmentationMapCache | None = None
-    seg_model_full = f"drive-by-segmentation-segformer-{args.model}"
+    seg_model_base = f"drive-by-segmentation-segformer-{args.model}"
+    seg_model_full = seg_model_base
     if args.segmentation_cache_meta is not None:
         seg_cache = SegmentationMapCache(args.segmentation_cache_meta)
         seg_model_full = f"{seg_model_full}-cache:{seg_cache.meta_path.name}"
@@ -3815,6 +3881,86 @@ def main() -> None:
             clrnet = None
             clrnet_runner = None
 
+    offline_selection = OfflinePredictionSelection(
+        args.offline_prediction_selection_file if args.video else None
+    )
+    offline_prediction_status: dict = {}
+
+    def apply_offline_prediction_selection(selection: dict) -> None:
+        nonlocal seg_cache, seg_model_full, clrnet_lane_cache, clrnet
+        nonlocal offline_prediction_status, gps_trace
+
+        run_id = str(selection.get("id") or "")
+        seg_path_raw = selection.get("segmentation_meta")
+        clr_path_raw = selection.get("clrnet_cache")
+        if not seg_path_raw or not clr_path_raw:
+            offline_prediction_status = {
+                "id": run_id,
+                "label": selection.get("label") or run_id,
+                "ok": False,
+                "error": "selection missing segmentation_meta or clrnet_cache",
+            }
+            print(f"[offline] invalid selection {run_id}: missing cache paths", flush=True)
+            return
+
+        seg_path = Path(str(seg_path_raw)).expanduser()
+        clr_path = Path(str(clr_path_raw)).expanduser()
+        if not seg_path.exists() or not clr_path.exists():
+            offline_prediction_status = {
+                "id": run_id,
+                "label": selection.get("label") or run_id,
+                "ok": False,
+                "error": "selected cache file does not exist",
+                "segmentation_meta": str(seg_path),
+                "clrnet_cache": str(clr_path),
+            }
+            print(
+                f"[offline] selected cache missing: seg={seg_path.exists()} "
+                f"clrnet={clr_path.exists()} id={run_id}",
+                flush=True,
+            )
+            return
+
+        seg_cache = SegmentationMapCache(seg_path)
+        seg_model_full = f"{seg_model_base}-cache:{seg_cache.meta_path.name}"
+        clrnet_lane_cache = CLRNetLaneCache(clr_path)
+        selected_video = selection.get("video")
+        if selected_video and isinstance(active_reader, VideoReader):
+            if active_reader.switch_video(str(selected_video)):
+                print(f"[offline] switched replay video to {selected_video}", flush=True)
+            gps_trace = load_gps_trace_for_video(str(selected_video))
+        if clrnet is None:
+            try:
+                clrnet = import_clrnet_stack()
+            except Exception as e:
+                print(
+                    f"[offline] CLRNet steering helpers unavailable for cache "
+                    f"{clr_path}: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+        offline_prediction_status = {
+            "id": run_id,
+            "label": selection.get("label") or run_id,
+            "ok": True,
+            "video": selection.get("video"),
+            "segmentation_meta": str(seg_path),
+            "segmentation_cache": str(seg_cache.data_path),
+            "clrnet_cache": str(clr_path),
+            "frame_count": int(min(seg_cache.frame_count, clrnet_lane_cache.frame_count)),
+            "segmentation_frames": int(seg_cache.frame_count),
+            "clrnet_frames": int(clrnet_lane_cache.frame_count),
+            "ts": selection.get("ts"),
+        }
+        print(
+            f"[offline] active prediction {run_id}: "
+            f"seg={seg_cache.meta_path.name} clrnet={clr_path.name}",
+            flush=True,
+        )
+
+    initial_selection = offline_selection.poll()
+    if initial_selection is not None:
+        apply_offline_prediction_selection(initial_selection)
+
     palette = np.array(colors, dtype=np.uint8)
     road_color = np.array(colors[0], dtype=np.uint8)
     grid_color = np.clip(road_color.astype(np.int16) + 35, 0, 255).astype(np.uint8)
@@ -3895,6 +4041,9 @@ def main() -> None:
     try:
         while True:
             now = time.monotonic()
+            selection = offline_selection.poll()
+            if selection is not None:
+                apply_offline_prediction_selection(selection)
 
             if now >= next_infer_t:
                 stage_start = time.perf_counter()
@@ -4256,17 +4405,13 @@ def main() -> None:
                             if float(l.get("score", 0.0)) >= CLRNET_CONF_THRESHOLD
                         ]
                         latest_clrnet_fresh_count = len(fresh_lanes)
-                        if fresh_lanes:
+                        if fresh_lanes and clrnet is not None:
                             chosen_left = clrnet.best_on_side(fresh_lanes, "left")
                             chosen_right = clrnet.best_on_side(fresh_lanes, "right")
-                            if chosen_left is None and chosen_right is not None:
-                                chosen_left = clrnet._mirror_lane(chosen_right)
-                            if chosen_right is None and chosen_left is not None:
-                                chosen_right = clrnet._mirror_lane(chosen_left)
                             steer_state = clrnet.compute_steering(chosen_left, chosen_right)
                             if steer_state.get("centerline") and not hold_steering:
                                 latest_clrnet_steer_state = steer_state
-                                geom_deg = -float(steer_state.get("steering_deg", 0.0))
+                                geom_deg = float(steer_state.get("steering_deg", 0.0))
                                 latest_clrnet_steer_raw = float(np.clip(
                                     geom_deg * clrnet.STEER_AMP,
                                     -clrnet.STEER_CLAMP_DEG,
@@ -4428,6 +4573,7 @@ def main() -> None:
                 state = {
                     "steer_deg": latest_steer_raw,
                     "steer_deg_raw": latest_steer_raw,
+                    "steer_sign": 1.0,
                     "active_cam": active_slug,
                     "inference": inference_ok and not camera_stale and not inference_stale,
                     "viz": (
@@ -4511,7 +4657,9 @@ def main() -> None:
                         ),
                         "camera_stale": bool(camera_stale),
                         "inference_stale": bool(inference_stale),
-                        "clrnet_enabled": bool(clrnet_runner is not None),
+                        "clrnet_enabled": bool(
+                            clrnet_runner is not None or clrnet_lane_cache is not None
+                        ),
                         "clrnet_override": bool(latest_clrnet_override),
                         "clrnet_conf_threshold": float(CLRNET_CONF_THRESHOLD),
                         "clrnet_lanes": len(latest_clrnet_lanes),
@@ -4556,6 +4704,7 @@ def main() -> None:
                         "learned_3d_detector": latest_mono3d_status,
                         "learned_3d_objects": latest_mono3d_objects,
                         "gps_route": latest_gps_route,
+                        "offline_prediction": dict(offline_prediction_status),
                         "map_file": str(args.segmentation_map_file),
                         "map_schema": "caddy.segmentation_map.v1",
                     },

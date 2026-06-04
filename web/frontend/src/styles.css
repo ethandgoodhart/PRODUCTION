@@ -1,0 +1,150 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #111215;
+  --color-ink-soft: #2a2d33;
+  --color-muted: #8a8f98;
+  --color-line: #e5e7eb;
+  --color-accent: #1f6feb;
+  --color-accent-soft: #d6e4ff;
+  --color-warn: #ff8a00;
+}
+
+@layer base {
+  html, body {
+    height: 100%;
+    width: 100%;
+    font-family: "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-feature-settings: "tnum" 1, "cv11" 1, "ss01" 1;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    letter-spacing: -0.01em;
+  }
+}
+
+@layer components {
+  /* Three.js scene container */
+  #scene-container {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+  }
+
+  /* Steering wheel SVG */
+  .wheel-rotate {
+    transform-origin: center;
+    transform-box: fill-box;
+    transition: transform 90ms linear;
+  }
+
+  /* Pedal pulse animation */
+  .pedal-edge {
+    animation: pedal-pulse 1.3s ease-in-out infinite;
+  }
+
+  /* Protective stop pulse */
+  .protective-pulse {
+    animation: protective-stop-pulse 0.65s ease-in-out infinite;
+  }
+
+  /* Turn banner pulse */
+  .turn-pulse {
+    animation: turn-banner-pulse 0.7s ease-in-out infinite;
+  }
+
+  /* Video range custom styling */
+  .video-range {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 6px;
+    border-radius: 3px;
+    background: linear-gradient(to right, var(--color-accent) var(--pct, 0%), #dde0e4 var(--pct, 0%));
+    outline: none;
+    cursor: pointer;
+  }
+  .video-range::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--color-accent);
+    border: 2px solid #fff;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.18);
+    cursor: grab;
+    transition: transform 0.12s;
+  }
+  .video-range::-webkit-slider-thumb:active {
+    cursor: grabbing;
+    transform: scale(1.2);
+  }
+  .video-range::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--color-accent);
+    border: 2px solid #fff;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.18);
+    cursor: grab;
+  }
+  .video-range::-moz-range-track {
+    height: 6px;
+    border-radius: 3px;
+    background: #dde0e4;
+  }
+
+  /* Quit ring SVG */
+  .quit-ring-bg {
+    fill: none;
+    stroke: rgba(0, 0, 0, 0.08);
+    stroke-width: 2.5;
+  }
+  .quit-ring-fg {
+    fill: none;
+    stroke: #d84a4a;
+    stroke-width: 2.5;
+    stroke-linecap: round;
+    transform: rotate(-90deg);
+    transform-origin: center;
+  }
+
+  /* Leaflet mini-map marker */
+  .mini-ego-marker {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #2563eb;
+    border: 3px solid #fff;
+    box-shadow: 0 0 0 2px rgba(37,99,235,0.4), 0 0 8px rgba(0,0,0,0.5);
+  }
+
+  /* Leaflet map container needs explicit height */
+  #mini-map {
+    width: 100%;
+    height: 100%;
+  }
+
+  /* Accel bar gradient segments */
+  .as-accel-decel {
+    background: linear-gradient(90deg, #dc2626 0%, #f59e0b 100%);
+  }
+  .as-accel-accel {
+    background: linear-gradient(90deg, #10b981 0%, #22c55e 100%);
+  }
+}
+
+@keyframes pedal-pulse {
+  0%, 100% { opacity: 0.78; }
+  50% { opacity: 1; }
+}
+
+@keyframes protective-stop-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
+@keyframes turn-banner-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}

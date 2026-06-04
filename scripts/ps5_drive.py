@@ -1518,8 +1518,17 @@ def main() -> int:
             # Autoware command scaled to cart authority + sign-corrected.
             # Reused by both integrated and absolute branches below; computed
             # once so the diagnostics field matches what we actually send.
+            # Models that write the physical column angle directly (positive =
+            # right turn) set steer_sign=1.0 in their state to opt out of the
+            # legacy AUTOSTEER_SIGN flip.
+            auto_steer_sign = AUTOSTEER_SIGN
+            if auto_state is not None:
+                try:
+                    auto_steer_sign = float(auto_state.get("steer_sign", AUTOSTEER_SIGN))
+                except (TypeError, ValueError):
+                    pass
             auto_cmd_deg = (
-                auto_steer_deg * AUTOSTEER_GAIN * AUTOSTEER_SIGN
+                auto_steer_deg * AUTOSTEER_GAIN * auto_steer_sign
                 if auto_steer_deg is not None
                 else None
             )

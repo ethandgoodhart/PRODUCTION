@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
 import ImuPath from './ImuPath';
-import BevCanvas from './BevCanvas';
 
 const FRAME_REFRESH_MS = 66;
 
@@ -89,7 +88,6 @@ export default function CamGrid({ state }) {
         const isActive = slug === activeCam;
         const vizReady = isViz && vizLive && liveStreams.has(slug);
         const isObjectsViz = slug === 'objects';
-        const isBevCanvas = slug === 'bev';
         const containFit = slug === 'bev' || slug === 'seg' || slug === 'objects' || segmentationMode;
 
         const tile = (
@@ -102,9 +100,6 @@ export default function CamGrid({ state }) {
             }`}
             data-cam={slug}
           >
-            {isBevCanvas ? (
-              <BevCanvas state={state} />
-            ) : (
             <img
               alt=""
               className={`block w-full h-full ${containFit ? `${isObjectsViz ? 'object-contain bg-white' : 'object-contain bg-black'}` : 'object-cover bg-[#0b0c0f]'} ${
@@ -125,7 +120,7 @@ export default function CamGrid({ state }) {
               }}
               onLoad={() => handleLoad(slug)}
               onError={() => handleError(slug)}
-            />)}
+            />
             {isObjectsViz && (
               <div className="absolute top-2 right-2 pointer-events-auto flex items-center gap-1.5 rounded-[8px] border border-ink/10 bg-white/85 px-2 py-1 shadow-[0_2px_10px_rgba(0,0,0,0.12)] backdrop-blur-sm">
                 <span className="text-[11px] font-bold text-[#1d2430] leading-none">⌕</span>

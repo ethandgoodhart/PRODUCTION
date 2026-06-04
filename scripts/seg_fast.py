@@ -270,12 +270,82 @@ def _snap_point_to_road(bx: float, by: float, scan: np.ndarray, bev_size: int):
     return float(bxi), float(byi)
 
 
+def _pick_fork_run(
+    runs: list,
+    y: int,
+    step: int,
+    scan: np.ndarray,
+    dist: np.ndarray,
+    bev_size: int,
+    prev_center: float,
+    ego_start_y: int,
+    gps_bearing_rad: float,
+    range_fwd: float,
+    range_side: float,
+) -> tuple:
+    """At a fork, probe each branch 30 rows ahead and pick the one whose
+    heading best matches the GPS route bearing."""
+    PROBE_ROWS = 30
+
+    def _branch_heading(run_left: int, run_right: int) -> float | None:
+        """Trace centerline of this run for PROBE_ROWS and return heading in
+        BEV coords (radians, 0 = straight ahead / -y, positive = right / +x)."""
+        start_bx = (run_left + run_right) / 2.0
+        cx = start_bx
+        pts_x, pts_y = [cx], [float(y)]
+        for py in range(y - step, max(y - step * PROBE_ROWS, -1), -step):
+            if py < 0:
+                break
+            row = scan[py]
+            if not row.any():
+                continue
+            local_runs = _find_runs(row)
+            if not local_runs:
+                continue
+            best = min(local_runs, key=lambda r: abs((r[0] + r[1]) / 2.0 - cx))
+            rl, rr = best
+            row_dist = dist[py, rl:rr + 1]
+            if row_dist.size > 0 and row_dist.max() > 0:
+                cx = float(rl + np.argmax(row_dist))
+            else:
+                cx = (rl + rr) / 2.0
+            pts_x.append(cx)
+            pts_y.append(float(py))
+        if len(pts_x) < 3:
+            return None
+        dx_bev = pts_x[-1] - pts_x[0]
+        dy_bev = pts_y[-1] - pts_y[0]
+        # BEV coords: -y is forward, +x is right
+        fwd_m = -dy_bev / bev_size * range_fwd
+        right_m = (dx_bev / bev_size) * 2 * range_side
+        if fwd_m < 0.5:
+            return None
+        return math.atan2(right_m, fwd_m)
+
+    best_run = min(runs, key=lambda r: abs((r[0] + r[1]) / 2.0 - prev_center))
+    best_score = float("inf")
+    for run in runs:
+        heading = _branch_heading(run[0], run[1])
+        if heading is None:
+            score = abs((run[0] + run[1]) / 2.0 - prev_center)
+        else:
+            diff = heading - gps_bearing_rad
+            # Normalize to [-pi, pi]
+            diff = (diff + math.pi) % (2 * math.pi) - math.pi
+            score = abs(diff)
+        if score < best_score:
+            best_score = score
+            best_run = run
+    return best_run
+
+
 def lane_aware_centerline_path_fast(
     road_mask: np.ndarray,
     bev_size: int = 500,
     range_fwd: float = 15.24,
     range_side: float = 7.62,
     road_width_ft: float = 20.0,
+    gps_bearing_rad: float | None = None,
 ):
     """Lane-aware centerline planner — algorithm identical to
     ``path_planning.lane_aware_centerline_path``, but scipy ops replaced
@@ -295,7 +365,10 @@ def lane_aware_centerline_path_fast(
     if not scan.any():
         return None, None
 
-    # 4-iteration 3x3 binary_erosion ≈ single 9x9 erosion (same support).
+    # Erosion narrows the road for better centering via distance transform.
+    # Keep the pre-erosion scan for fork detection — erosion can break the
+    # junction and _ego_connected_road_cv would then discard one branch.
+    scan_wide = scan.copy()
     eroded = cv2.erode(scan.astype(np.uint8),
                        np.ones((9, 9), np.uint8)) > 0
     eroded_conn = _ego_connected_road_cv(eroded, bev_size)
@@ -325,18 +398,31 @@ def lane_aware_centerline_path_fast(
 
     for y in range(ego_start_y - step, -1, -step):
         row = scan[y]
-        if not row.any():
+        row_wide = scan_wide[y]
+        if not row.any() and not row_wide.any():
             gap_count += 1
             if gap_count > 20 and len(centers) > 5:
                 break
             continue
+        if not row.any():
+            row = row_wide
         gap_count = 0
 
         runs = _find_runs(row)
         if not runs:
             continue
 
-        best_run = min(runs, key=lambda r: abs((r[0] + r[1]) / 2.0 - prev_center))
+        # Check the wide (pre-erosion) mask for forks the eroded mask missed.
+        wide_runs = _find_runs(row_wide) if gps_bearing_rad is not None else runs
+        fork_runs = wide_runs if len(wide_runs) > len(runs) else runs
+
+        if len(fork_runs) <= 1 or gps_bearing_rad is None:
+            best_run = min(runs, key=lambda r: abs((r[0] + r[1]) / 2.0 - prev_center))
+        else:
+            best_run = _pick_fork_run(
+                fork_runs, y, step, scan_wide, dist, bev_size, prev_center,
+                ego_start_y, gps_bearing_rad, range_fwd, range_side,
+            )
         run_left, run_right = best_run
         run_width = run_right - run_left + 1
         run_mid = (run_left + run_right) / 2.0

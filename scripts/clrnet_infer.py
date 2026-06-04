@@ -108,6 +108,7 @@ LOOKAHEAD_Y = 0.55          # bottom-half lookahead (closer than 0.25 because
                             # 640x480 fisheye sees less road than CULane)
 HEADING_Y_NEAR = 0.85
 HEADING_Y_FAR = 0.55
+K_HEADING_DEG = 0.4
 # Steering ratio: geometric road-wheel deg -> column-deg. alpamayo uses
 # STEER_AMP=15. Keep parity here so the wheel feel matches across models.
 STEER_AMP = 15.0
@@ -373,7 +374,12 @@ def best_on_side(lane_list, side):
     cands = [l for l in lane_list if _side_of(l) == side]
     if not cands:
         return None
-    return max(cands, key=lambda l: float(l.get("score", 0.0)))
+    def _bottom_x(lane):
+        pts = lane["points"]
+        ys = pts[:, 1]
+        bottom = pts[ys >= 0.5, 0] if (ys >= 0.5).sum() >= 2 else pts[:, 0]
+        return float(np.mean(bottom))
+    return min(cands, key=lambda l: abs(_bottom_x(l) - 0.5))
 
 
 def compute_steering(left, right):
@@ -418,7 +424,16 @@ def compute_steering(left, right):
     out["lookahead"] = (cl_la, y_la)
     out["lateral_err"] = lateral_err
 
-    raw = K_LATERAL_DEG * lateral_err
+    heading_deg = 0.0
+    cl_near = _centerline_x_at_y(left, right, HEADING_Y_NEAR)
+    cl_far = _centerline_x_at_y(left, right, HEADING_Y_FAR)
+    if cl_near is not None and cl_far is not None:
+        dx = cl_far - cl_near
+        dy = HEADING_Y_NEAR - HEADING_Y_FAR
+        heading_deg = math.degrees(math.atan2(dx, dy))
+    out["heading_deg"] = heading_deg
+
+    raw = K_LATERAL_DEG * lateral_err + K_HEADING_DEG * heading_deg
     out["steering_deg"] = float(np.clip(raw, -MAX_GEOMETRIC_DEG, MAX_GEOMETRIC_DEG))
     return out
 

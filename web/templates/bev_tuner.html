@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BEV Projection Tuner</title>
+<style>
+  :root { --bg: #111; --panel: #1a1a1f; --border: #2a2a30; --accent: #3b82f6; --text: #e4e4e7; --muted: #71717a; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: "Inter", system-ui, sans-serif; height: 100vh; display: flex; }
+  .sidebar { width: 320px; background: var(--panel); border-right: 1px solid var(--border); padding: 20px; overflow-y: auto; flex-shrink: 0; }
+  .sidebar h1 { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .sidebar .sub { font-size: 11px; color: var(--muted); margin-bottom: 20px; }
+  .group { margin-bottom: 16px; }
+  .group-title { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+  .param { margin-bottom: 10px; }
+  .param label { display: flex; justify-content: space-between; font-size: 12px; font-weight: 500; margin-bottom: 3px; }
+  .param .val { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; min-width: 60px; text-align: right; }
+  .param input[type=range] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+  .preview { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 20px; min-width: 0; }
+  .images { display: flex; gap: 16px; align-items: start; flex-wrap: wrap; justify-content: center; }
+  .img-box { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .img-box .lbl { font-size: 10px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+  .img-box img { border-radius: 8px; border: 1px solid var(--border); background: #000; max-height: 70vh; }
+  #bev-img { image-rendering: pixelated; }
+  .status { font-size: 11px; color: var(--muted); }
+  .btn-row { display: flex; gap: 8px; margin-top: 12px; }
+  button { padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); color: var(--text); font-size: 12px; font-weight: 600; cursor: pointer; }
+  button:hover { background: #252530; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #2563eb; }
+  pre.json { margin-top: 12px; font-size: 10px; background: #0d0d10; border: 1px solid var(--border); border-radius: 6px; padding: 10px; overflow-x: auto; color: #a1a1aa; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; }
+</style>
+</head>
+<body>
+<div class="sidebar">
+  <h1>BEV Projection Tuner</h1>
+  <div class="sub">Adjust calibration params, see BEV update live</div>
+
+  <div class="group">
+    <div class="group-title">Extrinsics</div>
+    <div class="param">
+      <label>Height (m) <span class="val" id="v-height">1.783</span></label>
+      <input type="range" id="height_m" min="0.3" max="3.0" step="0.001" value="1.783">
+    </div>
+    <div class="param">
+      <label>Pitch (°) <span class="val" id="v-pitch">3.5</span></label>
+      <input type="range" id="pitch_deg" min="-15" max="30" step="0.1" value="3.5">
+    </div>
+    <div class="param">
+      <label>Roll (°) <span class="val" id="v-roll">0.0</span></label>
+      <input type="range" id="roll_deg" min="-10" max="10" step="0.1" value="0.0">
+    </div>
+    <div class="param">
+      <label>Yaw (°) <span class="val" id="v-yaw">0.0</span></label>
+      <input type="range" id="yaw_deg" min="-15" max="15" step="0.1" value="0.0">
+    </div>
+  </div>
+
+  <div class="group">
+    <div class="group-title">Intrinsics</div>
+    <div class="param">
+      <label>fx <span class="val" id="v-fx">428.0</span></label>
+      <input type="range" id="fx" min="200" max="800" step="0.5" value="428.0">
+    </div>
+    <div class="param">
+      <label>fy <span class="val" id="v-fy">427.0</span></label>
+      <input type="range" id="fy" min="200" max="800" step="0.5" value="427.0">
+    </div>
+    <div class="param">
+      <label>cx <span class="val" id="v-cx">317.0</span></label>
+      <input type="range" id="cx" min="100" max="500" step="0.5" value="317.0">
+    </div>
+    <div class="param">
+      <label>cy <span class="val" id="v-cy">247.0</span></label>
+      <input type="range" id="cy" min="100" max="400" step="0.5" value="247.0">
+    </div>
+  </div>
+
+  <div class="group">
+    <div class="group-title">BEV Range</div>
+    <div class="param">
+      <label>Forward (ft) <span class="val" id="v-fwd">100</span></label>
+      <input type="range" id="forward_ft" min="20" max="200" step="1" value="100">
+    </div>
+    <div class="param">
+      <label>Side (ft) <span class="val" id="v-side">50</span></label>
+      <input type="range" id="side_ft" min="10" max="100" step="1" value="50">
+    </div>
+  </div>
+
+  <div class="btn-row">
+    <button class="primary" onclick="copyJson()">Copy JSON</button>
+    <button onclick="resetAll()">Reset</button>
+  </div>
+  <pre class="json" id="json-out"></pre>
+</div>
+
+<div class="preview">
+  <div class="images">
+    <div class="img-box">
+      <span class="lbl">Camera Frame</span>
+      <img id="cam-img" src="" width="480">
+    </div>
+    <div class="img-box">
+      <span class="lbl">BEV Projection</span>
+      <img id="bev-img" src="" width="400">
+    </div>
+  </div>
+  <div class="status" id="status">Loading…</div>
+</div>
+
+<script>
+const PARAMS = ['height_m','pitch_deg','roll_deg','yaw_deg','fx','fy','cx','cy','forward_ft','side_ft'];
+const LABELS = ['v-height','v-pitch','v-roll','v-yaw','v-fx','v-fy','v-cx','v-cy','v-fwd','v-side'];
+const DEFAULTS = [1.783, 3.5, 0.0, 0.0, 428.0, 427.0, 317.0, 247.0, 100, 50];
+const DECIMALS = [3, 1, 1, 1, 1, 1, 1, 1, 0, 0];
+
+let pending = false;
+let dirty = false;
+let camInterval;
+
+function getVals() {
+  const o = {};
+  PARAMS.forEach((p, i) => {
+    const v = parseFloat(document.getElementById(p).value);
+    o[p] = v;
+    document.getElementById(LABELS[i]).textContent = v.toFixed(DECIMALS[i]);
+  });
+  return o;
+}
+
+function buildQS(vals) {
+  return Object.entries(vals).map(([k,v]) => `${k}=${v}`).join('&');
+}
+
+function updateJson(vals) {
+  const calib = {
+    intrinsics: { model: "pinhole", fx: vals.fx, fy: vals.fy, cx: vals.cx, cy: vals.cy },
+    extrinsics: { height_m: vals.height_m, pitch_deg: vals.pitch_deg, roll_deg: vals.roll_deg, yaw_deg: vals.yaw_deg },
+    bev_range: { forward_ft: vals.forward_ft, side_ft: vals.side_ft }
+  };
+  document.getElementById('json-out').textContent = JSON.stringify(calib, null, 2);
+}
+
+function refreshBev() {
+  if (pending) { dirty = true; return; }
+  pending = true;
+  const vals = getVals();
+  updateJson(vals);
+  const img = document.getElementById('bev-img');
+  const t = Date.now();
+  const url = `/bev-tuner/preview?${buildQS(vals)}&t=${t}`;
+  const tmp = new Image();
+  tmp.onload = () => {
+    img.src = tmp.src;
+    document.getElementById('status').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    pending = false;
+    if (dirty) { dirty = false; refreshBev(); }
+  };
+  tmp.onerror = () => {
+    document.getElementById('status').textContent = 'Error loading BEV';
+    pending = false;
+    if (dirty) { dirty = false; refreshBev(); }
+  };
+  tmp.src = url;
+}
+
+function refreshCam() {
+  const img = document.getElementById('cam-img');
+  img.src = `/cam/front.jpg?t=${Date.now()}`;
+}
+
+function resetAll() {
+  PARAMS.forEach((p, i) => {
+    document.getElementById(p).value = DEFAULTS[i];
+  });
+  refreshBev();
+}
+
+function copyJson() {
+  const text = document.getElementById('json-out').textContent;
+  navigator.clipboard.writeText(text);
+}
+
+PARAMS.forEach(p => {
+  document.getElementById(p).addEventListener('input', refreshBev);
+});
+
+refreshBev();
+refreshCam();
+camInterval = setInterval(refreshCam, 500);
+</script>
+</body>
+</html>
