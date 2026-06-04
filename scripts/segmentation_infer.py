@@ -2188,14 +2188,15 @@ class AutoSpeedController:
             })
 
         # Curvature-based turn speed limit — physics: v_max = sqrt(a_lat / κ).
-        # Compute curvature at each path point, find the max safe speed for
-        # each upcoming curve, and decelerate early enough to reach it.
+        # Skip the first ~2m (we're already in that turn) and smooth curvature
+        # over a 3-point window to avoid noisy single-point spikes.
         TURN_LAT_ACCEL = 1.8  # comfortable lateral accel for golf cart (m/s²)
         TURN_MIN_CURV = 0.02  # ignore gentler curves
+        TURN_SKIP_M = 2.0     # ignore curvature in the first 2m (already in turn)
+        TURN_MIN_SPEED_MPS = 0.6  # ~1.3 mph floor — need speed to turn the wheel
         if path_ok and len(path) >= 3:
-            # Compute arc-length distances and curvatures along path
             arc_dists = [0.0]
-            curvatures = [0.0]
+            raw_curvatures = [0.0]
             for j in range(1, len(path)):
                 seg = math.hypot(
                     float(path[j, 0] - path[j - 1, 0]),
@@ -2210,30 +2211,34 @@ class AutoSpeedController:
                 d2x, d2y = cx - bx, cy - by
                 cross = abs(d1x * d2y - d1y * d2x)
                 seg_len = math.hypot(d1x, d1y) * math.hypot(d2x, d2y)
-                curvatures.append(cross / seg_len if seg_len > 1e-6 else 0.0)
-            curvatures.append(0.0)
+                raw_curvatures.append(cross / seg_len if seg_len > 1e-6 else 0.0)
+            raw_curvatures.append(0.0)
 
-            # For each path point with significant curvature, compute the
-            # speed we need to be at by the time we reach it, then work
-            # backwards to find the speed limit NOW given decel budget.
+            # Smooth curvatures with a 3-point window
+            curvatures = list(raw_curvatures)
+            for j in range(1, len(curvatures) - 1):
+                curvatures[j] = (raw_curvatures[j - 1] + raw_curvatures[j] + raw_curvatures[j + 1]) / 3.0
+
             turn_speed = max_speed
             turn_dist = 0.0
             for j in range(len(path)):
+                if arc_dists[j] < TURN_SKIP_M:
+                    continue
                 k = curvatures[j]
                 if k < TURN_MIN_CURV:
                     continue
-                v_curve = math.sqrt(TURN_LAT_ACCEL / k)
+                v_curve = max(TURN_MIN_SPEED_MPS, math.sqrt(TURN_LAT_ACCEL / k))
                 v_curve = min(v_curve, max_speed)
-                dist_to_curve = arc_dists[j]
-                # v_now² = v_curve² + 2 * a_decel * dist
+                dist_to_curve = arc_dists[j] - TURN_SKIP_M
                 v_now = math.sqrt(
                     v_curve ** 2 + 2.0 * AUTOSPEED_COMFORT_DECEL * dist_to_curve
                 )
                 v_now = min(v_now, max_speed)
                 if v_now < turn_speed:
                     turn_speed = v_now
-                    turn_dist = dist_to_curve
+                    turn_dist = arc_dists[j]
 
+            turn_speed = max(TURN_MIN_SPEED_MPS, turn_speed)
             if turn_speed < max_speed - 0.05:
                 speed_limits_raw.append(turn_speed)
                 speed_limit_details.append({
