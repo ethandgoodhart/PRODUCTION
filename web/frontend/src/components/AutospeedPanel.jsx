@@ -14,8 +14,8 @@ export default function AutospeedPanel({ state }) {
   const maxMph = Number(as.max_speed_mph) || 0;
   const emergency = !!as.emergency_active;
   const accel = Number(as.desired_accel) || 0;
-  const range = 4.7;
-  const pct = clamp(((accel + 3.5) / range) * 100, 2, 98);
+  const range = 2.95;
+  const pct = clamp(((accel + 1.75) / range) * 100, 2, 98);
 
   let accelLabel, accelColor;
   if (emergency) {
@@ -55,7 +55,7 @@ export default function AutospeedPanel({ state }) {
         </div>
       </div>
       <div className="relative h-1.5 rounded-[3px] bg-line mb-1 overflow-visible flex">
-        <div className="flex-[3.5] as-accel-decel rounded-l-[3px] opacity-40" />
+        <div className="flex-[1.75] as-accel-decel rounded-l-[3px] opacity-40" />
         <div className="flex-[0.5] bg-gray-300" />
         <div className="flex-[1.2] as-accel-accel rounded-r-[3px] opacity-40" />
         <div
@@ -75,17 +75,23 @@ export default function AutospeedPanel({ state }) {
           return (
             <div
               key={i}
-              className={`flex gap-1.5 items-baseline text-[10px] text-ink-soft p-[2px_4px] rounded ${
+              className={`flex items-baseline justify-between text-[10px] text-ink-soft p-[2px_4px] rounded ${
                 isMostLimiting ? 'bg-amber-400/12 font-semibold' : 'bg-black/[0.03]'
               }`}
             >
-              <span className="font-bold tabular-nums min-w-[36px]">
-                {Number(lim.speed_mph).toFixed(1)}
+              <span className="capitalize">{lim.obstacle_class || '?'}</span>
+              <span className="tabular-nums text-muted text-[9px]">{Number(lim.distance_m).toFixed(1)}m</span>
+              {lim.ttc_s != null ? (
+                <span className={`tabular-nums text-[9px] font-semibold ${lim.ttc_s < 2 ? 'text-red-600' : lim.ttc_s < 4 ? 'text-amber-500' : 'text-muted'}`}>
+                  {Number(lim.ttc_s).toFixed(1)}s
+                </span>
+              ) : (
+                <span className="tabular-nums text-[9px] text-muted">—</span>
+              )}
+              <span className="font-bold tabular-nums">
+                {Number(lim.speed_mph).toFixed(0)}
                 <span className="font-normal text-muted"> mph</span>
               </span>
-              <span className="min-w-[50px] capitalize">{lim.obstacle_class || '?'}</span>
-              <span className="tabular-nums text-muted text-[9px]">{Number(lim.distance_m).toFixed(1)}m</span>
-              <span className="tabular-nums text-muted text-[9px]">{Number(lim.lateral_offset_m).toFixed(1)}m lat</span>
             </div>
           );
         })}

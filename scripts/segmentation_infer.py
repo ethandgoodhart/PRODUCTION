@@ -182,9 +182,9 @@ TURN_ANNOUNCE_MAX_M = 40.0   # don't announce turns farther out than this
 # the old TTC-brake + PI speed-control stack with a single controller that
 # outputs a commanded_speed in m/s from path geometry and obstacle predictions.
 AUTOSPEED_PATH_WIDTH = 2.0        # half-width (m) of the corridor around the path
-AUTOSPEED_COMFORT_DECEL = 1.5     # max deceleration for normal smooth stops (m/s^2)
+AUTOSPEED_COMFORT_DECEL = 3.0     # max deceleration for normal smooth stops (m/s^2)
 AUTOSPEED_EMERGENCY_DECEL = 3.5   # max deceleration for emergency only (m/s^2)
-AUTOSPEED_MAX_JERK = 0.9          # max rate of change of acceleration (m/s^3)
+AUTOSPEED_MAX_JERK = 1.8          # max rate of change of acceleration (m/s^3)
 AUTOSPEED_LOOKAHEAD_TIME = 6.0    # how far ahead in time to care about obstacles (s)
 AUTOSPEED_MIN_GAP = 2.0           # absolute minimum distance to maintain (m)
 AUTOSPEED_REACTION_BUFFER = 0.5   # extra time margin for safety (s)
@@ -200,7 +200,7 @@ ENV_BRAKE_NEAR_STOP_M = AUTOSPEED_MIN_GAP
 # Stop sign controller: detects stop signs via YOLO, estimates distance from
 # BEV projection, and manages a smooth stop→wait→depart cycle.
 STOP_SIGN_APPROACH_M = 18.0
-STOP_SIGN_STOP_BUFFER_M = 4.0
+STOP_SIGN_STOP_BUFFER_M = 2.5
 STOP_SIGN_WAIT_S = 1.5
 STOP_SIGN_DEPART_RAMP_S = 2.5
 STOP_SIGN_MIN_CONF = 0.28
@@ -608,7 +608,7 @@ class SteeringEstimator:
     @property
     def steering_deg(self) -> float:
         raw = self.W_BEV * self._ema_heading + self.INTERCEPT
-        return max(-270.0, min(270.0, raw))
+        return max(-320.0, min(320.0, raw))
 
     def update_bev(self, lane_local: np.ndarray | None) -> None:
         if lane_local is None or len(lane_local) < 4:
@@ -2004,6 +2004,7 @@ class AutoSpeedController:
         self.speed_limits: list[dict] = []
         self.emergency_active = False
         self.desired_accel = 0.0
+        self.last_commanded_speed: float | None = None
 
     def reset(self) -> None:
         self.previous_accel = 0.0
@@ -2011,6 +2012,7 @@ class AutoSpeedController:
         self.speed_limits = []
         self.emergency_active = False
         self.desired_accel = 0.0
+        self.last_commanded_speed = None
 
     @staticmethod
     def _find_closest_point_on_path(
@@ -2076,9 +2078,9 @@ class AutoSpeedController:
         obstacles: list[dict],
         current_speed: float,
         max_speed: float,
+        dt: float = AUTOSPEED_DT,
     ) -> float:
         """Compute commanded speed (m/s) from path, obstacles, and current state."""
-        dt = AUTOSPEED_DT
         self.speed_limits = []
         self.emergency_active = False
 
@@ -2172,6 +2174,7 @@ class AutoSpeedController:
                 safe_speed = safe_speed + (max_speed - safe_speed) * (1.0 - lateral_factor)
 
             speed_limits_raw.append(safe_speed)
+            ttc_s = (conflict_path_distance / closing_speed) if closing_speed > 0.1 else None
             speed_limit_details.append({
                 "speed_mps": round(float(safe_speed), 3),
                 "speed_mph": round(float(safe_speed) * 2.23694, 1),
@@ -2180,8 +2183,70 @@ class AutoSpeedController:
                 "lateral_offset_m": round(float(lateral_offset), 2),
                 "lateral_factor": round(float(lateral_factor), 3),
                 "closing_speed_mps": round(float(closing_speed), 2),
+                "ttc_s": round(float(ttc_s), 1) if ttc_s is not None else None,
                 "track_id": obj.get("track_id"),
             })
+
+        # Curvature-based turn speed limit — physics: v_max = sqrt(a_lat / κ).
+        # Compute curvature at each path point, find the max safe speed for
+        # each upcoming curve, and decelerate early enough to reach it.
+        TURN_LAT_ACCEL = 1.8  # comfortable lateral accel for golf cart (m/s²)
+        TURN_MIN_CURV = 0.02  # ignore gentler curves
+        if path_ok and len(path) >= 3:
+            # Compute arc-length distances and curvatures along path
+            arc_dists = [0.0]
+            curvatures = [0.0]
+            for j in range(1, len(path)):
+                seg = math.hypot(
+                    float(path[j, 0] - path[j - 1, 0]),
+                    float(path[j, 1] - path[j - 1, 1]),
+                )
+                arc_dists.append(arc_dists[-1] + seg)
+            for j in range(1, len(path) - 1):
+                ax, ay = float(path[j - 1, 0]), float(path[j - 1, 1])
+                bx, by = float(path[j, 0]), float(path[j, 1])
+                cx, cy = float(path[j + 1, 0]), float(path[j + 1, 1])
+                d1x, d1y = bx - ax, by - ay
+                d2x, d2y = cx - bx, cy - by
+                cross = abs(d1x * d2y - d1y * d2x)
+                seg_len = math.hypot(d1x, d1y) * math.hypot(d2x, d2y)
+                curvatures.append(cross / seg_len if seg_len > 1e-6 else 0.0)
+            curvatures.append(0.0)
+
+            # For each path point with significant curvature, compute the
+            # speed we need to be at by the time we reach it, then work
+            # backwards to find the speed limit NOW given decel budget.
+            turn_speed = max_speed
+            turn_dist = 0.0
+            for j in range(len(path)):
+                k = curvatures[j]
+                if k < TURN_MIN_CURV:
+                    continue
+                v_curve = math.sqrt(TURN_LAT_ACCEL / k)
+                v_curve = min(v_curve, max_speed)
+                dist_to_curve = arc_dists[j]
+                # v_now² = v_curve² + 2 * a_decel * dist
+                v_now = math.sqrt(
+                    v_curve ** 2 + 2.0 * AUTOSPEED_COMFORT_DECEL * dist_to_curve
+                )
+                v_now = min(v_now, max_speed)
+                if v_now < turn_speed:
+                    turn_speed = v_now
+                    turn_dist = dist_to_curve
+
+            if turn_speed < max_speed - 0.05:
+                speed_limits_raw.append(turn_speed)
+                speed_limit_details.append({
+                    "speed_mps": round(float(turn_speed), 3),
+                    "speed_mph": round(float(turn_speed) * 2.23694, 1),
+                    "obstacle_class": "turn",
+                    "distance_m": round(float(turn_dist), 1),
+                    "lateral_offset_m": 0.0,
+                    "lateral_factor": 1.0,
+                    "closing_speed_mps": round(float(current_speed), 2),
+                    "ttc_s": round(turn_dist / current_speed, 1) if current_speed > 0.1 else None,
+                    "track_id": None,
+                })
 
         if not speed_limits_raw:
             desired_speed = max_speed
@@ -2189,8 +2254,14 @@ class AutoSpeedController:
             desired_speed = min(speed_limits_raw)
         desired_speed = max(0.0, min(max_speed, desired_speed))
 
+        # Use our own last commanded speed for ramping so we track ourselves,
+        # not the (possibly stale) ego speed from mock/sensors.
+        ramp_speed = current_speed
+        if self.last_commanded_speed is not None:
+            ramp_speed = min(current_speed, self.last_commanded_speed)
+
         # Jerk-limited smoothing
-        desired_accel = (desired_speed - current_speed) / max(dt, 1e-6)
+        desired_accel = (desired_speed - ramp_speed) / max(dt, 1e-6)
         if desired_accel > 0:
             desired_accel = min(desired_accel, AUTOSPEED_COMFORT_DECEL * 0.8)
         else:
@@ -2203,10 +2274,11 @@ class AutoSpeedController:
                 max_accel_change, accel_change
             )
 
-        commanded_speed = current_speed + desired_accel * dt
+        commanded_speed = ramp_speed + desired_accel * dt
         commanded_speed = max(0.0, min(max_speed, commanded_speed))
         self.previous_accel = desired_accel
         self.desired_accel = desired_accel
+        self.last_commanded_speed = commanded_speed
 
         # Emergency override
         for obj in obstacles:
@@ -2530,7 +2602,7 @@ def lookahead_heading_steering_deg(lane_local: np.ndarray, lookahead_m: float) -
            alpha = atan2(yL, xL)                          # bearing, ±π
            delta = atan2(2 L sin(alpha), Ld)              # road-wheel rad
        alpha ranges across the full ±π, so delta * STEERING_COLUMN_RATIO
-       can ride all the way to ±270°.
+       can ride all the way to ±320°.
     """
     global _lookahead_point_filt
 
@@ -2565,7 +2637,7 @@ def lookahead_heading_steering_deg(lane_local: np.ndarray, lookahead_m: float) -
     alpha = math.atan2(yLf, xLf)
     delta = math.atan2(2.0 * WHEELBASE_M * math.sin(alpha), Ld)
     column_deg = math.degrees(delta) * STEERING_COLUMN_RATIO * STEER_GAIN
-    return float(np.clip(column_deg, -270.0, 270.0))
+    return float(np.clip(column_deg, -320.0, 320.0))
 
 
 def make_sources(args) -> list[CameraReader | VideoReader | RealSenseReader]:
@@ -2845,7 +2917,7 @@ def route_steering_deg_from_gps(fix: dict, route: dict,
         "course_deg": round(float(course_deg), 1),
         "h_acc_m": round(float(h_acc), 2),
     }
-    return float(np.clip(column_deg, -270.0, 270.0)), diag
+    return float(np.clip(column_deg, -320.0, 320.0)), diag
 
 
 def _wrap_deg(d: float) -> float:
@@ -3259,7 +3331,7 @@ def draw_bev_viz(bev_rgb: np.ndarray, lane_traj: np.ndarray | None,
         cv2.polylines(out, [right], False, corr_col, 1, cv2.LINE_AA)
 
     if lane_traj is not None:
-        rt.draw_trajectory(out, lane_traj, (255, 255, 0), 3)
+        rt.draw_trajectory(out, lane_traj, (255, 255, 0), 18)
     la_point, _ = rt.lookahead_point(lane_local)
     if la_point is not None:
         la_bx = int((la_point[1] / rt.RANGE_SIDE * 0.5 + 0.5) * rt.BEV_SIZE)
@@ -3660,7 +3732,7 @@ def main() -> None:
     args.bev_size = int(np.clip(args.bev_size, 256, 800))
     # Ceiling is the steering-column travel limit, not 90°, so a strong route
     # authority can actually pull the cart through a turn instead of saturating.
-    args.gps_route_max_bias_deg = float(np.clip(args.gps_route_max_bias_deg, 0.0, 270.0))
+    args.gps_route_max_bias_deg = float(np.clip(args.gps_route_max_bias_deg, 0.0, 320.0))
     target_gas_ff = constant_gas_for_mph(args.target_mph)
     autospeed_ctrl = AutoSpeedController()
     stop_sign_ctrl = StopSignController()
@@ -4030,6 +4102,7 @@ def main() -> None:
     inference_ok = False
     latest_latency_ms: dict[str, float] = {}
     infer_count = 0
+    last_infer_t = time.monotonic()
     last_processed_frame_count = -1
     latest_camera_frame_count = 0
     latest_camera_last_ok_s = 0.0
@@ -4278,11 +4351,15 @@ def main() -> None:
                     )
                     max_speed_mps = args.target_mph * 0.44704
                     if protective_enabled:
+                        frame_now = time.monotonic()
+                        frame_dt = max(0.001, frame_now - last_infer_t)
+                        last_infer_t = frame_now
                         latest_commanded_speed_mps = autospeed_ctrl.compute(
                             path=lane_local if path_ok else None,
                             obstacles=latest_object_tracks,
                             current_speed=ego_mps,
                             max_speed=max_speed_mps,
+                            dt=frame_dt,
                         )
                         latest_brake_corridor = forward_stop_corridor_bev(
                             bev_geom, AUTOSPEED_MIN_GAP
@@ -4361,8 +4438,8 @@ def main() -> None:
                         )
                         latest_steer_base = float(np.clip(
                             seg_steer_base + route_bias,
-                            -270.0,
-                            270.0,
+                            -320.0,
+                            320.0,
                         ))
                         if latest_gps_route.get("gps_ok") and abs(route_bias) > 1e-3:
                             latest_steer_source = "segmentation+gps"
@@ -4370,7 +4447,7 @@ def main() -> None:
                             STEERING_EMA * latest_steer_base
                             + (1.0 - STEERING_EMA) * latest_steer_filtered
                         )
-                        latest_steer_raw = float(np.clip(latest_steer_filtered, -270.0, 270.0))
+                        latest_steer_raw = float(np.clip(latest_steer_filtered, -320.0, 320.0))
                     else:
                         latest_gps_route = {"active": False}
                     # else: no path — hold latest_steer_* at their previous values.

@@ -207,21 +207,56 @@ function drawTrajectory(ctx, aw, bevSize, rangeFwdM, rangeSideM) {
   const path = aw.predicted_path;
   if (!Array.isArray(path) || path.length < 2) return;
 
-  ctx.strokeStyle = 'rgba(255,255,0,0.9)';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  let started = false;
+  const CART_HALF_WIDTH_M = 24.0;
+
+  const pts = [];
   for (const pt of path) {
     if (!Array.isArray(pt) || pt.length < 2) continue;
     const [bx, by] = localToBev(pt[0], pt[1], rangeFwdM, rangeSideM, bevSize);
     if (bx < 0 || bx >= bevSize || by < 0 || by >= bevSize) continue;
-    if (!started) {
-      ctx.moveTo(bx, by);
-      started = true;
-    } else {
-      ctx.lineTo(bx, by);
-    }
+    pts.push({ fwd: pt[0], left: pt[1], bx, by });
   }
+  if (pts.length < 2) return;
+
+  const leftEdge = [];
+  const rightEdge = [];
+  for (let i = 0; i < pts.length; i++) {
+    let dx, dy;
+    if (i === 0) {
+      dx = pts[1].bx - pts[0].bx;
+      dy = pts[1].by - pts[0].by;
+    } else if (i === pts.length - 1) {
+      dx = pts[i].bx - pts[i - 1].bx;
+      dy = pts[i].by - pts[i - 1].by;
+    } else {
+      dx = pts[i + 1].bx - pts[i - 1].bx;
+      dy = pts[i + 1].by - pts[i - 1].by;
+    }
+    const len = Math.sqrt(dx * dx + dy * dy) || 1;
+    const nx = -dy / len;
+    const ny = dx / len;
+    const halfPx = CART_HALF_WIDTH_M / rangeSideM * 0.5 * bevSize;
+    leftEdge.push([pts[i].bx + nx * halfPx, pts[i].by + ny * halfPx]);
+    rightEdge.push([pts[i].bx - nx * halfPx, pts[i].by - ny * halfPx]);
+  }
+
+  ctx.fillStyle = 'rgba(255,255,0,0.35)';
+  ctx.beginPath();
+  ctx.moveTo(leftEdge[0][0], leftEdge[0][1]);
+  for (let i = 1; i < leftEdge.length; i++) ctx.lineTo(leftEdge[i][0], leftEdge[i][1]);
+  for (let i = rightEdge.length - 1; i >= 0; i--) ctx.lineTo(rightEdge[i][0], rightEdge[i][1]);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(255,255,0,0.9)';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  ctx.moveTo(leftEdge[0][0], leftEdge[0][1]);
+  for (let i = 1; i < leftEdge.length; i++) ctx.lineTo(leftEdge[i][0], leftEdge[i][1]);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(rightEdge[0][0], rightEdge[0][1]);
+  for (let i = 1; i < rightEdge.length; i++) ctx.lineTo(rightEdge[i][0], rightEdge[i][1]);
   ctx.stroke();
 }
 

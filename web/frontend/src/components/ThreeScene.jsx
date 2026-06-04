@@ -173,8 +173,8 @@ export default function ThreeScene({ state }) {
       autoware: { core: 0xd4a017, halo: 0xf2c94c, haloOpacity: 0.2 },
     };
     const PATH_TRAJ_SCALE = 1.0;
-    const TUBE_RADIUS_CORE = 0.1;
-    const TUBE_RADIUS_HALO = 0.32;
+    const TUBE_RADIUS_CORE = 1.0;
+    const TUBE_RADIUS_HALO = 1.47;
 
     function curveFromTrajectory(traj) {
       const pts = [new THREE.Vector3(0, 0.09, 1.5)];
