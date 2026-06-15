@@ -27,6 +27,7 @@ import argparse
 import json
 import math
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -85,6 +86,7 @@ JPEG_QUALITY = 72
 PUBLISH_HZ_DEFAULT = 15.0
 INFER_HZ_DEFAULT = 8.0    # CLRerNet on Thor: ~10-15 ms/frame, leave headroom
 MODEL_NAME = "clrnet"
+FRONT_CAMERA_BRIGHTNESS = 32
 
 # CLRerNet was trained on CULane (1640x590, cropped to y=270:590 -> 1640x320,
 # then resized to 800x320). The test pipeline does the crop+resize for us as
@@ -162,6 +164,20 @@ def open_camera(index: int) -> "cv2.VideoCapture | None":
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
+
+
+def apply_front_camera_controls(index: int, slug: str) -> None:
+    if not slug.startswith("front"):
+        return
+    for ctrl, value in (("auto_exposure", 3), ("brightness", FRONT_CAMERA_BRIGHTNESS)):
+        try:
+            subprocess.run(
+                ["v4l2-ctl", "-d", f"/dev/video{index}", "-c", f"{ctrl}={value}"],
+                check=False, timeout=2,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return
 
 
 def center_crop_zoom(frame: np.ndarray, ratio: float) -> np.ndarray:
@@ -425,6 +441,21 @@ def _denorm(pts, w, h):
     return out.astype(np.int32)
 
 
+def _draw_lane_confidence(canvas: np.ndarray, lane: dict, color) -> None:
+    pts = lane["points"]
+    if pts.shape[0] == 0:
+        return
+    h, w = canvas.shape[:2]
+    bottom_idx = int(np.argmax(pts[:, 1]))
+    x = int(np.clip(round(pts[bottom_idx, 0] * w), 0, w - 1))
+    y = int(np.clip(round(pts[bottom_idx, 1] * h), 16, h - 8))
+    text = f"{float(lane.get('score', 0.0)):.2f}"
+    cv2.putText(canvas, text, (x + 5, y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(canvas, text, (x + 5, y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
+
+
 def render_overlay(frame, lanes_norm, steer_state,
                     fresh: bool, mph_target: float,
                     mph_actual: float | None,
@@ -464,10 +495,16 @@ def render_overlay(frame, lanes_norm, steer_state,
                 continue
             pts = _denorm(ego_lane["points"], w, h).reshape(-1, 1, 2)
             cv2.polylines(canvas, [pts], False, OFF_EGO_COLOR, 2, cv2.LINE_AA)
+            _draw_lane_confidence(canvas, ego_lane, OFF_EGO_COLOR)
 
         for side, pts in ego_pts.items():
             cv2.polylines(canvas, [pts.reshape(-1, 1, 2)], False,
                           EGO_COLOR, 4, cv2.LINE_AA)
+        if left is not None:
+            _draw_lane_confidence(canvas, left, EGO_COLOR)
+        if right is not None and (
+                left is None or not np.array_equal(right["points"], left["points"])):
+            _draw_lane_confidence(canvas, right, EGO_COLOR)
 
     cl = steer_state.get("centerline", [])
     if len(cl) >= 2:
@@ -486,7 +523,14 @@ def render_overlay(frame, lanes_norm, steer_state,
 
     # HUD
     pad = 8
-    box_w, box_h = 240, 92
+    scores = sorted(
+        [float(l.get("score", 0.0)) for l in lanes_norm],
+        reverse=True,
+    )
+    score_summary = "conf: " + (
+        " ".join(f"{s:.2f}" for s in scores[:4]) if scores else "none"
+    )
+    box_w, box_h = 270, 112
     overlay = canvas.copy()
     cv2.rectangle(overlay, (0, 0), (box_w, box_h), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0, dst=canvas)
@@ -495,11 +539,12 @@ def render_overlay(frame, lanes_norm, steer_state,
         f"steer: {column_deg:+6.1f} deg",
         f"target: {mph_target:.1f} mph"
         + (f"  cur: {mph_actual:.1f}" if mph_actual is not None else "  cur: —"),
+        score_summary,
         "FRESH" if fresh else "FALLBACK",
     ]
     for i, txt in enumerate(lines):
         y = pad + (i + 1) * 18 - 4
-        col = (60, 220, 60) if (i == 3 and fresh) else (240, 240, 240)
+        col = (60, 220, 60) if (i == 4 and fresh) else (240, 240, 240)
         cv2.putText(canvas, txt, (pad, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
     return canvas
@@ -709,6 +754,7 @@ def main() -> int:
             if cap is None:
                 print(f"[cams] WARN: idx {idx} ({slug}) failed")
                 continue
+            apply_front_camera_controls(idx, slug)
             r = CameraReader(cap, slug)
             r.start()
             readers.append(r)

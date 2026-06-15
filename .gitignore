@@ -28,3 +28,4 @@ Depth_Caddy-Training-Data-*/
 models/
 ego_evals/
 .claude/
+web/.mapbox_token

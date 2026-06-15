@@ -45,6 +45,7 @@ import json
 import math
 import os
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -256,6 +257,7 @@ AUTO_BRAKE_TARGET_MPH = 0.5      # below this target speed we start applying bra
 # 12 points is enough for a smooth Catmull-Rom curve without sending
 # excess JSON in /state every poll.
 PATH_DOWNSAMPLE_N = 12
+FRONT_CAMERA_BRIGHTNESS = 32
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -349,6 +351,20 @@ def open_camera(index: int) -> "cv2.VideoCapture | None":
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
+
+
+def apply_front_camera_controls(index: int, slug: str) -> None:
+    if not slug.startswith("front"):
+        return
+    for ctrl, value in (("auto_exposure", 3), ("brightness", FRONT_CAMERA_BRIGHTNESS)):
+        try:
+            subprocess.run(
+                ["v4l2-ctl", "-d", f"/dev/video{index}", "-c", f"{ctrl}={value}"],
+                check=False, timeout=2,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return
 
 
 class CameraReader(threading.Thread):
@@ -1477,6 +1493,7 @@ def main() -> int:
             if cap is None:
                 print(f"[cams] WARN: idx {idx} ({slug}) failed to open")
                 continue
+            apply_front_camera_controls(idx, slug)
             r = CameraReader(cap, slug)
             r.start()
             readers.append(r)

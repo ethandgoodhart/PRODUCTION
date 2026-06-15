@@ -14,12 +14,9 @@ Cameras are auto-discovered by USB topology (e.g. usb-...-4.1.2) so the
 breaking the mapping. Pass --front-narrow N etc to override discovery
 for a single channel; pass --front-narrow -1 to disable it.
 
-Note on the Global Shutter cam (back-left): its UVC firmware insists on
-the largest isoc altsetting (11) regardless of negotiated resolution,
-which exceeds the USB-2.0 bus budget when all 5 H264 cams are also
-streaming. It coexists only when front-narrow is unplugged. To run all
-6 simultaneously, replug back-left on a different USB bus (e.g. the
-opposite-side USB-C port).
+Current Thor wiring: five cameras on the dock hub and one camera plugged
+directly into the Thor. The auto-discovery table below is keyed by USB
+topology, not /dev/videoN, so unplug/replug ordering should not matter.
 
 Also captures the iPhone ARKit ego-motion stream (TCP via usbmuxd; same
 source as PRODUCTION's ego_state_writer). When recording, every fresh
@@ -69,6 +66,17 @@ GPS_FRESH_S = 5.0  # fixes arrive 1-5 Hz depending on phone state
 # as long as only one ps5_drive is alive.
 CART_STATE_FILE = os.environ.get("CART_STATE_FILE", "/tmp/cart_state.json")
 CART_FRESH_S = 0.5  # ps5_drive publishes at CONTROL_HZ (~60 Hz)
+AUTOWARE_STATE_FILE = os.environ.get("AUTOWARE_STATE_FILE", "/tmp/autoware_state.json")
+SEGMENTATION_MAP_FILE = os.environ.get(
+    "SEGMENTATION_MAP_FILE", "/tmp/cart_frames/segmentation_map.json"
+)
+SEGMENTATION_MAP_FRESH_S = 1.0
+MODEL_FRAMES_DIR = Path(os.environ.get("CART_FRAMES_DIR", "/tmp/cart_frames"))
+MODEL_TILE_FILES = (
+    ("model-front", "front.jpg"),
+    ("segmentation", "seg.jpg"),
+    ("bev-planner", "bev.jpg"),
+)
 PRODUCTION_DIR = Path(__file__).resolve().parent.parent
 PS5_DRIVE_SCRIPT = str(Path(__file__).resolve().parent / "ps5_drive.py")
 
@@ -78,30 +86,72 @@ PS5_DRIVE_SCRIPT = str(Path(__file__).resolve().parent / "ps5_drive.py")
 CAM_NAMES = ["front-left", "front", "front-right", "back-left", "back-right", "front-narrow"]
 CAM_OPEN_ORDER = list(CAM_NAMES)
 
-# From PRODUCTION/scripts/alpamayo_infer.py: front-narrow is mounted
-# upside-down + y-mirrored on this cart, so flip code -1 (180°).
-CAMERA_FLIP = {"front-narrow": -1}
+# Per-cam OpenCV flip codes. The old cart had front-narrow mounted
+# upside-down (flip -1); on the current rig it's mounted right-side up,
+# so the entry is removed.
+CAMERA_FLIP: dict[str, int] = {}
 
-# Logical camera name -> stable USB sub-path (suffix of the bus_info
-# string v4l2-ctl prints). The cart has these cameras wired this way;
-# /dev/videoN numbers shift across reboots so we look the cameras up by
-# this suffix at startup instead.
-CAM_USB_PATH = {
-    "front-left":   "usb-4.1.1.4",    # H264 USB Camera
-    "front":        "usb-4.1.3",      # H264 USB Camera
-    "front-right":  "usb-4.1.1.2",    # H264 USB Camera
-    "back-left":    "usb-4.1.1.3",    # Global Shutter Camera (see note above)
-    "back-right":   "usb-4.1.1.1",    # H264 USB Camera
-    "front-narrow": "usb-4.1.2",      # HD USB Camera
+# Per-cam v4l2 control overrides applied after _open(). Each entry is
+# (control_name, value). auto_exposure=3 (Aperture Priority) hands exposure
+# back to the cam's firmware; brightness=32 lifts the front view without
+# pushing it to the top of the UVC [-64, 64] range.
+CAMERA_CONTROLS: dict[str, tuple[tuple[str, int], ...]] = {
+    "front": (
+        ("auto_exposure", 3),
+        ("brightness", 32),
+    ),
+    "back-right": (
+        ("auto_exposure", 3),
+        ("brightness", 32),
+        ("gain", 200),
+    ),
+}
+
+# Logical camera name -> stable USB sub-path suffixes from the bus_info
+# string v4l2-ctl prints. New Thor wiring is five cameras on the dock hub
+# (usb-4.2.*) plus one direct Thor camera (usually usb-4.1.3). The old
+# usb-4.1.* suffixes stay as fallbacks so the recorder still works if the
+# cart is moved back to the previous cabling.
+CAM_USB_PATHS: dict[str, tuple[str, ...]] = {
+    # Current Thor wiring (6 cams: 3 GS on the chained hub, 2 GS + 1 H264
+    # on the dock hub). Earlier suffixes kept as fallbacks for older
+    # wirings of the same cart.
+    "front": (
+        "usb-4.1.1.1",  # cam_front symlink
+        "usb-4.1.3",
+    ),
+    "front-right": (
+        "usb-4.1.1.2",  # cam_front_right symlink
+        "usb-4.2.1.2",
+    ),
+    "front-left": (
+        "usb-4.1.1.3",  # cam_front_left symlink
+        "usb-4.2.1.4",
+        "usb-4.1.1.4",
+    ),
+    "back-left": (
+        "usb-2.1",      # unlabelled GS on hub port 1
+        "usb-4.2.1.3",
+    ),
+    "back-right": (
+        "usb-2.2",      # unlabelled GS on hub port 2
+        "usb-4.2.1.1",
+    ),
+    "front-narrow": (
+        "usb-2.3",      # H264 USB Cam on hub port 3
+        "usb-4.2.2",
+        "usb-4.1.2",
+    ),
 }
 
 
 def discover_video_devices() -> dict[str, int]:
     """Return {logical_name: /dev/videoN index} by parsing v4l2-ctl.
 
-    Each H264 USB Camera exposes 4 /dev/video nodes; only one of them
-    actually streams MJPG. We probe each node for MJPG format support
-    and return the lowest matching index per USB path.
+    UVC cameras usually expose one capture node and one metadata node;
+    older H264 cameras can expose more. Only the capture node advertises
+    MJPG, so we probe each node for MJPG support and return the lowest
+    matching index per USB path.
     """
     try:
         out = subprocess.run(
@@ -138,16 +188,40 @@ def discover_video_devices() -> dict[str, int]:
                 return idx
         return None
 
-    mapping: dict[str, int] = {}
-    for name, suffix in CAM_USB_PATH.items():
-        match = next(
-            (p for p in by_path if p.endswith(suffix)), None,
-        )
-        if match is None:
-            continue
-        idx = first_mjpg(by_path[match])
+    mjpg_by_path: dict[str, int] = {}
+    for path, indices in by_path.items():
+        idx = first_mjpg(indices)
         if idx is not None:
-            mapping[name] = idx
+            mjpg_by_path[path] = idx
+
+    mapping: dict[str, int] = {}
+    used_paths: set[str] = set()
+    for name, suffixes in CAM_USB_PATHS.items():
+        for suffix in suffixes:
+            match = next(
+                (p for p in mjpg_by_path if p.endswith(suffix) and p not in used_paths),
+                None,
+            )
+            if match is None:
+                continue
+            mapping[name] = mjpg_by_path[match]
+            used_paths.add(match)
+            break
+
+    # If the direct Thor camera lands on a topology suffix we have not seen
+    # yet, still show and record it. Assign remaining MJPG-capable devices
+    # to any unfilled camera slots in the declared grid order.
+    remaining = [
+        (path, idx) for path, idx in sorted(mjpg_by_path.items())
+        if path not in used_paths
+    ]
+    for name in CAM_NAMES:
+        if name in mapping or not remaining:
+            continue
+        path, idx = remaining.pop(0)
+        mapping[name] = idx
+        used_paths.add(path)
+        print(f"[CAM] {name}: using unmatched USB path {path} -> /dev/video{idx}")
     return mapping
 
 
@@ -184,6 +258,19 @@ class Camera:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not cap.isOpened():
             print(f"[WARN] Could not open /dev/video{self.device} for {self.name}")
+        # Apply per-cam v4l2 control overrides (out-of-band — OpenCV can't
+        # touch most of these). v4l2-ctl talks to the same /dev/videoN
+        # node and the values stick for the lifetime of the open fd.
+        for ctrl, value in CAMERA_CONTROLS.get(self.name, ()):
+            try:
+                subprocess.run(
+                    ["v4l2-ctl", "-d", f"/dev/video{self.device}",
+                     "-c", f"{ctrl}={value}"],
+                    check=False, timeout=2,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
         return cap
 
     def _loop(self):
@@ -282,6 +369,76 @@ class Camera:
         self.thread.join(timeout=1)
         self.stop_recording()
         self.cap.release()
+
+
+class ModelFrameRecorder:
+    """Record a model-published JPEG stream, e.g. /tmp/cart_frames/front.jpg."""
+
+    def __init__(self, name: str, frame_path: Path, fps: int = 15):
+        self.name = name
+        self.frame_path = frame_path
+        self.fps = fps
+        self.writer: cv2.VideoWriter | None = None
+        self.writer_thread: threading.Thread | None = None
+        self.writer_stop = threading.Event()
+        self.out_path: Path | None = None
+        self.size: tuple[int, int] | None = None
+        self.last_frame: np.ndarray | None = None
+
+    def _read_frame(self) -> np.ndarray | None:
+        frame = cv2.imread(str(self.frame_path), cv2.IMREAD_COLOR)
+        if frame is None:
+            return None
+        return frame
+
+    def _write_loop(self):
+        period = 1.0 / max(1, self.fps)
+        next_tick = time.monotonic()
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        while not self.writer_stop.is_set():
+            frame = self._read_frame()
+            if frame is not None:
+                self.last_frame = frame
+            elif self.last_frame is not None:
+                frame = self.last_frame
+
+            if frame is not None and self.out_path is not None:
+                h, w = frame.shape[:2]
+                if self.writer is None:
+                    self.size = (w, h)
+                    self.writer = cv2.VideoWriter(
+                        str(self.out_path), fourcc, self.fps, self.size
+                    )
+                elif self.size is not None and (w, h) != self.size:
+                    frame = cv2.resize(frame, self.size)
+                if self.writer is not None:
+                    self.writer.write(frame)
+
+            next_tick += period
+            sleep_for = next_tick - time.monotonic()
+            if sleep_for > 0:
+                self.writer_stop.wait(sleep_for)
+            else:
+                next_tick = time.monotonic()
+
+    def start_recording(self, out_path: Path):
+        self.out_path = out_path
+        self.size = None
+        self.last_frame = None
+        self.writer = None
+        self.writer_stop.clear()
+        self.writer_thread = threading.Thread(target=self._write_loop, daemon=True)
+        self.writer_thread.start()
+
+    def stop_recording(self):
+        if self.writer_thread is not None:
+            self.writer_stop.set()
+            self.writer_thread.join(timeout=2)
+            self.writer_thread = None
+        if self.writer is not None:
+            self.writer.release()
+            self.writer = None
+        self.out_path = None
 
 
 class EgoRecorder:
@@ -624,6 +781,111 @@ class CartRecorder:
         # Belt-and-braces: kill any straggler ps5_drive we own.
         subprocess.run(["pkill", "-f", "scripts/ps5_drive.py"],
                        capture_output=True)
+
+
+class SegmentationMapRecorder:
+    """Records raw semantic segmentation label maps published by
+    scripts/segmentation_infer.py.
+
+    The sidecar writes one latest-map JSON file atomically. While the camera
+    recorder is active, this class snapshots each new infer_count into
+    segmentation_maps.jsonl. Rows keep the map's RLE JSON payload and include
+    the current autosteer state when it is fresh so offline analysis can align
+    labels, planned path, steering, and pedals.
+    """
+
+    def __init__(self, map_file: str = SEGMENTATION_MAP_FILE,
+                 state_file: str = AUTOWARE_STATE_FILE):
+        self.map_file = map_file
+        self.state_file = state_file
+        self._lock = threading.Lock()
+        self._fp = None  # type: ignore[var-annotated]
+        self._last_key: tuple[int | None, float | None] | None = None
+        self._rec_stop = threading.Event()
+        self._rec_thread: threading.Thread | None = None
+
+    @staticmethod
+    def _read_json(path: str) -> tuple[dict, bool]:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {}, True
+        if not isinstance(data, dict):
+            return {}, True
+        try:
+            ts = float(data.get("ts", 0.0))
+        except (TypeError, ValueError):
+            return data, True
+        return data, (time.time() - ts) > SEGMENTATION_MAP_FRESH_S
+
+    def latest(self) -> dict:
+        data, stale = self._read_json(self.map_file)
+        return {
+            "connected": bool(data) and not stale,
+            "stale": stale,
+            "map_file": self.map_file,
+            "infer_count": data.get("infer_count"),
+            "shape": data.get("shape"),
+            "encoding": data.get("encoding"),
+        }
+
+    def _record_loop(self, started_wall: float):
+        while not self._rec_stop.is_set():
+            data, stale = self._read_json(self.map_file)
+            if data and not stale:
+                key = (data.get("infer_count"), data.get("ts"))
+                if key != self._last_key:
+                    self._last_key = key
+                    rec = {
+                        "wall_t": time.time(),
+                        "rel_t": time.time() - started_wall,
+                        **data,
+                    }
+                    autosteer, autosteer_stale = self._read_json(self.state_file)
+                    if autosteer and not autosteer_stale:
+                        rec["autosteer_state"] = autosteer
+                    with self._lock:
+                        if self._fp is not None:
+                            self._fp.write(json.dumps(rec) + "\n")
+                            self._fp.flush()
+            self._rec_stop.wait(0.01)
+
+    def start_recording(self, out_path: Path):
+        self._last_key = None
+        self._fp = open(out_path, "w", buffering=1)
+        header = {
+            "_schema": "caddy.segmentation_maps_jsonl.v1",
+            "_row_schema": "caddy.segmentation_map.v1",
+            "_source": "scripts/segmentation_infer.py latest-map JSON",
+            "_source_file": self.map_file,
+            "_autosteer_state_file": self.state_file,
+            "_encoding": "rle_flat_c_order",
+            "_note": "Data rows contain the raw semantic label map as RLE JSON. "
+                     "Decode with np.repeat(row['rle']['values'], "
+                     "row['rle']['counts']).astype(np.uint8).reshape(row['shape']).",
+            "started_wall_t": time.time(),
+        }
+        self._fp.write(json.dumps(header) + "\n")
+        self._fp.flush()
+        self._rec_stop.clear()
+        self._rec_thread = threading.Thread(
+            target=self._record_loop, args=(time.time(),), daemon=True
+        )
+        self._rec_thread.start()
+
+    def stop_recording(self):
+        if self._rec_thread is not None:
+            self._rec_stop.set()
+            self._rec_thread.join(timeout=2)
+            self._rec_thread = None
+        with self._lock:
+            if self._fp is not None:
+                self._fp.close()
+                self._fp = None
+
+    def shutdown(self):
+        self.stop_recording()
 
 
 class GpsRecorder:
@@ -1020,9 +1282,13 @@ class RealSenseRecorder:
 
 app = Flask(__name__)
 cameras: dict[str, Camera] = {}
+model_recorders: dict[str, ModelFrameRecorder] = {
+    "front": ModelFrameRecorder("front", MODEL_FRAMES_DIR / "front.jpg")
+}
 ego: EgoRecorder | None = None
 cart: CartRecorder | None = None
 gps: GpsRecorder | None = None
+segmentation_maps: SegmentationMapRecorder | None = None
 realsense: RealSenseRecorder | None = None
 show_realsense_color = True
 state = {"recording": False, "folder": None, "started_at": None}
@@ -1570,22 +1836,58 @@ def _rs_tile(label: str, frame: np.ndarray | None, w: int, h: int) -> np.ndarray
     return frame
 
 
+def _missing_tile(name: str, w: int, h: int) -> np.ndarray:
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    cv2.rectangle(frame, (0, 0), (w, 28), (0, 0, 0), -1)
+    cv2.putText(frame, f"{name}  NO DEVICE", (8, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (190, 190, 190), 1, cv2.LINE_AA)
+    cv2.putText(frame, "NO DEVICE", (18, h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 255), 2, cv2.LINE_AA)
+    return frame
+
+
+def _model_tile(label: str, filename: str, w: int, h: int) -> np.ndarray | None:
+    path = MODEL_FRAMES_DIR / filename
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if frame is None:
+        return None
+    if time.time() - st.st_mtime > 2.0:
+        cv2.putText(
+            frame, "STALE", (18, min(frame.shape[0] - 18, 58)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 255), 2, cv2.LINE_AA,
+        )
+    if frame.shape[1] != w or frame.shape[0] != h:
+        frame = cv2.resize(frame, (w, h))
+    cv2.rectangle(frame, (0, 0), (w, 28), (0, 0, 0), -1)
+    cv2.putText(
+        frame, label, (8, 20),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    return frame
+
+
 @app.route("/grid_feed")
 def grid_feed():
     def gen():
         names = CAM_NAMES
-        # RealSense always contributes depth; color can be hidden when the
-        # operator wants a compact camera+depth grid.
-        extras = (2 if show_realsense_color else 1) if realsense is not None else 0
-        total = len(names) + extras
-        cols = 3 if total > 4 else 2
-        rows = (total + cols - 1) // cols
         while True:
-            tiles = [_tile_for(name, cameras[name]) for name in names]
-            if tiles:
-                tile_w, tile_h = tiles[0].shape[1], tiles[0].shape[0]
-            else:
-                tile_w, tile_h = 640, 480
+            first_cam = next(iter(cameras.values()), None)
+            tile_w = first_cam.width if first_cam is not None else 640
+            tile_h = first_cam.height if first_cam is not None else 480
+            tiles = []
+            for label, filename in MODEL_TILE_FILES:
+                tile = _model_tile(label, filename, tile_w, tile_h)
+                if tile is not None:
+                    tiles.append(tile)
+            tiles.extend(
+                _tile_for(name, cameras[name])
+                for name in names
+                if name in cameras
+            )
             if realsense is not None:
                 if show_realsense_color:
                     tiles.append(_rs_tile("realsense color",
@@ -1595,6 +1897,8 @@ def grid_feed():
             if not tiles:
                 time.sleep(0.1)
                 continue
+            cols = 3 if len(tiles) > 4 else 2
+            rows = (len(tiles) + cols - 1) // cols
             blank = np.zeros_like(tiles[0])
             while len(tiles) < rows * cols:
                 tiles.append(blank.copy())
@@ -1663,22 +1967,35 @@ def gps_state():
     return jsonify(gps.latest() if gps is not None else {"connected": False, "fix": None})
 
 
+@app.route("/segmentation_maps")
+def segmentation_maps_state():
+    return jsonify(
+        segmentation_maps.latest()
+        if segmentation_maps is not None
+        else {"connected": False}
+    )
+
+
 @app.route("/start", methods=["POST"])
 def start():
     with state_lock:
         if state["recording"]:
             return jsonify(ok=True)
         ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        folder = Path.cwd() / f"Caddy-Training-Data-{ts}"
+        folder = Path.home() / f"CADDY-6-CAM-EVAL-{ts}"
         folder.mkdir(parents=True, exist_ok=True)
         for name, cam in cameras.items():
             cam.start_recording(folder / f"{name}.mp4")
+        for name, rec in model_recorders.items():
+            rec.start_recording(folder / f"{name}.mp4")
         if ego is not None:
             ego.start_recording(folder / "ego.jsonl")
         if cart is not None:
             cart.start_recording(folder / "control.jsonl")
         if gps is not None:
             gps.start_recording(folder / "gps.jsonl")
+        if segmentation_maps is not None:
+            segmentation_maps.start_recording(folder / "segmentation_maps.jsonl")
         if realsense is not None:
             realsense.start_recording(folder)
         # Wall-clock start time captured AFTER the writers/log threads are
@@ -1706,12 +2023,16 @@ def stop():
         stop_t = time.time()
         for cam in cameras.values():
             cam.stop_recording()
+        for rec in model_recorders.values():
+            rec.stop_recording()
         if ego is not None:
             ego.stop_recording()
         if cart is not None:
             cart.stop_recording()
         if gps is not None:
             gps.stop_recording()
+        if segmentation_maps is not None:
+            segmentation_maps.stop_recording()
         if realsense is not None:
             realsense.stop_recording()
         folder = state["folder"]
@@ -1742,13 +2063,10 @@ def parse_args():
     p.add_argument("--front-right", type=int, default=-1)
     p.add_argument("--back-left", type=int, default=-1)
     p.add_argument("--back-right", type=int, default=-1)
-    # front-narrow (HD USB Camera) is currently unplugged; skip by default.
-    p.add_argument("--front-narrow", type=int, default=-2)
+    p.add_argument("--front-narrow", type=int, default=-1)
     # 640x480 matches production inference (alpamayo_infer / autoware_infer).
-    # Two of the H264 cameras share a USB 2.0 hub branch and can't both
-    # negotiate bandwidth at 1280x720 MJPG — the second open succeeds but
-    # cap.read() returns False forever. Bump only if you replug onto
-    # separate hubs.
+    # Keep this conservative for six simultaneous USB streams. Bump only
+    # after confirming the dock/direct split has enough bus bandwidth.
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--fps", type=int, default=30)
@@ -1770,6 +2088,13 @@ def parse_args():
                    help="Don't spawn the GPS iproxy/TCP reader.")
     p.add_argument("--gps-host", default="127.0.0.1")
     p.add_argument("--gps-port", type=int, default=5006)
+    p.add_argument("--no-segmentation-maps", action="store_true",
+                   help="Do not record raw segmentation map JSON snapshots "
+                        "from scripts/segmentation_infer.py.")
+    p.add_argument("--segmentation-map-file", default=SEGMENTATION_MAP_FILE,
+                   help="Latest-map JSON path published by segmentation_infer.py.")
+    p.add_argument("--autoware-state-file", default=AUTOWARE_STATE_FILE,
+                   help="Autosteer state file to attach to segmentation map rows.")
     p.add_argument("--no-realsense", action="store_true",
                    help="Skip auto-detection and disable RealSense capture.")
     p.add_argument("--rs-width", type=int, default=640)
@@ -1782,7 +2107,7 @@ def parse_args():
 
 
 def main():
-    global ego, cart, gps, realsense, show_realsense_color
+    global ego, cart, gps, segmentation_maps, realsense, show_realsense_color
     args = parse_args()
     show_realsense_color = not args.rs_depth_only
     overrides = {
@@ -1808,10 +2133,6 @@ def main():
             devices[name] = discovered[name]
         else:
             print(f"[CAM] {name}: not discovered and no override — skipping")
-    # Drop names with no device from the grid so the UI doesn't render
-    # blank tiles for them.
-    active_names = [n for n in CAM_NAMES if n in devices]
-    CAM_NAMES[:] = active_names
     CAM_OPEN_ORDER[:] = [n for n in CAM_OPEN_ORDER if n in devices]
     for name in CAM_OPEN_ORDER:
         cameras[name] = Camera(
@@ -1834,6 +2155,15 @@ def main():
         # false-match our ego_link.sh 5006 child.
         gps = GpsRecorder(host=args.gps_host, port=args.gps_port)
         print(f"[GPS] reading TCP {args.gps_host}:{args.gps_port}")
+
+    if args.no_segmentation_maps:
+        print("[SEG] --no-segmentation-maps: segmentation_maps.jsonl disabled")
+    else:
+        segmentation_maps = SegmentationMapRecorder(
+            map_file=args.segmentation_map_file,
+            state_file=args.autoware_state_file,
+        )
+        print(f"[SEG] recording maps from {args.segmentation_map_file}")
 
     if args.no_realsense:
         print("[RS] --no-realsense: RealSense capture disabled")
@@ -1867,12 +2197,16 @@ def main():
     finally:
         for cam in cameras.values():
             cam.release()
+        for rec in model_recorders.values():
+            rec.stop_recording()
         if ego is not None:
             ego.shutdown()
         if cart is not None:
             cart.shutdown()
         if gps is not None:
             gps.shutdown()
+        if segmentation_maps is not None:
+            segmentation_maps.shutdown()
         if realsense is not None:
             realsense.release()
 

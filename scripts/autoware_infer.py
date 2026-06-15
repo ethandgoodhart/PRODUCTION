@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -93,6 +94,7 @@ ALL_STREAM_SLUGS = SLUGS + VIZ_SLUGS + AUX_SLUGS
 
 CAM_W, CAM_H = 640, 480     # per-camera capture; four 1080p streams saturate USB2
 INF_SIZE = (640, 320)       # SceneSeg / Scene3D / EgoLanes / AutoSteer input (w, h)
+FRONT_CAMERA_BRIGHTNESS = 32
 AUTOSPEED_SIZE = 640        # AutoSpeed input is square, letterboxed
 JPEG_QUALITY = 72            # 72 ≈ 35 KB per 640x480 frame
 STEER_SMOOTHING = 0.8        # matches run_live.py; first-order EMA on argmax
@@ -152,6 +154,20 @@ def open_camera(index: int) -> cv2.VideoCapture | None:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
+
+
+def apply_front_camera_controls(index: int, slug: str) -> None:
+    if not slug.startswith("front"):
+        return
+    for ctrl, value in (("auto_exposure", 3), ("brightness", FRONT_CAMERA_BRIGHTNESS)):
+        try:
+            subprocess.run(
+                ["v4l2-ctl", "-d", f"/dev/video{index}", "-c", f"{ctrl}={value}"],
+                check=False, timeout=2,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return
 
 
 def center_crop_zoom(frame: np.ndarray, ratio: float) -> np.ndarray:
@@ -828,6 +844,7 @@ def main() -> int:
             if cap is None:
                 print(f"[cams] WARN: idx {idx} ({slug}) failed to open")
                 continue
+            apply_front_camera_controls(idx, slug)
             crop = narrow_crop_ratio if slug == INFERENCE_SLUG else 1.0
             r = CameraReader(cap, slug, crop_ratio=crop)
             r.start()

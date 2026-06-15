@@ -403,19 +403,19 @@ html, body {
     right: 40px;
     z-index: 10;
     display: grid;
-    grid-template-columns: repeat(4, 300px);
-    grid-template-rows: repeat(2, 180px);
+    grid-template-columns: repeat(3, 240px);
+    grid-template-rows: repeat(2, 144px);
     gap: 12px;
     pointer-events: none;
     transition: grid-template-columns 220ms ease, grid-template-rows 220ms ease;
 }
 /* Manual / non-autonomous: shrink the camera grid so the cards don't
-   dominate the screen. We keep the original 300×180 footprint only while
+   dominate the screen. We keep the larger 240×144 footprint only while
    Autoware is actively driving (body lacks .compact-cams). JS in
    index.html toggles .compact-cams on <body> off the autoware status. */
 body.compact-cams .cam-grid {
-    grid-template-columns: repeat(4, 160px);
-    grid-template-rows: repeat(2, 96px);
+    grid-template-columns: repeat(3, 140px);
+    grid-template-rows: repeat(2, 84px);
     gap: 8px;
 }
 body.compact-cams .cam-tile .cam-label,
@@ -514,18 +514,14 @@ body.compact-cams .cam-tile .cam-badge {
 .cam-tile.viz-tile.viz-ready .cam-pending { display: none; }
 .cam-tile.viz-tile:not(.viz-ready) img { opacity: 0; }
 
-/* Enlarged viz tiles for BEV (alpamayo) and Segmentation (segmentation
-   model) — make their preview 3× the standard 300×180 cam tile so the
-   operator can read the BEV grid and segmentation detail. Spans 3
-   columns × 3 rows; gaps make the final footprint exactly 3× the base.
-   compact-cams (manual mode) isn't expected here since viz tiles only
-   appear when a model is engaged, but cover both cases for safety. */
-.cam-grid { grid-auto-rows: 180px; }
-body.compact-cams .cam-grid { grid-auto-rows: 96px; }
+/* Larger model previews for BEV (alpamayo) and Segmentation
+   (segmentation model), without letting them dominate the whole view. */
+.cam-grid { grid-auto-rows: 144px; }
+body.compact-cams .cam-grid { grid-auto-rows: 84px; }
 .cam-tile[data-cam="bev"],
 .cam-tile[data-cam="seg"] {
-    grid-column: span 3;
-    grid-row: span 3;
+    grid-column: span 2;
+    grid-row: span 2;
 }
 /* The enlarged BEV/seg images are letterboxed instead of cropped so
    the grid labels (and the seg image's bottom edge) stay visible.
@@ -535,21 +531,20 @@ body.compact-cams .cam-grid { grid-auto-rows: 96px; }
     object-fit: contain;
     background: #000;
 }
-/* Push the autoware HUD up to clear the enlarged viz tile (base 424px
-   + 2 extra 180px rows + 2×12px gaps = 808px). */
+/* Push the autoware HUD up to clear the enlarged viz tile. */
 body:has(.cam-tile[data-cam="bev"].viz-ready) .autoware-hud,
 body:has(.cam-tile[data-cam="seg"].viz-ready) .autoware-hud {
-    bottom: 808px;
+    bottom: 376px;
 }
 
 /* Autoware HUD — a small readout above the cam grid with predicted angle
    + status (autoware/human/stale/idle). Sits where the route-time footer
    used to, so we don't crowd the speed cluster. */
 .autoware-hud {
-    /* Sits above the 4x2 stream grid: 40 bottom margin + 180*2 rows + 12
-       gap + 12 breathing room = 424. Keep in sync with .cam-grid. */
+    /* Sits above the 3x2 stream grid: 40 bottom margin + 144*2 rows + 12
+       gap + 12 breathing room = 352. Keep in sync with .cam-grid. */
     position: fixed;
-    bottom: 424px;
+    bottom: 352px;
     right: 40px;
     z-index: 10;
     display: flex;
@@ -563,10 +558,10 @@ body:has(.cam-tile[data-cam="seg"].viz-ready) .autoware-hud {
     font-variant-numeric: tabular-nums;
     transition: bottom 220ms ease;
 }
-/* Compact grid is 96*2 + 8 gap = 200 tall, plus 40 bottom margin + 12
-   breathing room = 252. Mirrors the calculation above. */
+/* Compact grid is 84*2 + 8 gap = 176 tall, plus 40 bottom margin + 12
+   breathing room = 228. Mirrors the calculation above. */
 body.compact-cams .autoware-hud {
-    bottom: 252px;
+    bottom: 228px;
 }
 .autoware-hud .aw-status-dot {
     width: 8px;
@@ -592,6 +587,74 @@ body.compact-cams .autoware-hud {
     letter-spacing: 0;
     font-size: 13px;
     text-transform: none;
+}
+.lane-confidence {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 210px;
+}
+.lane-confidence[hidden] {
+    display: none;
+}
+.lane-confidence .lc-label,
+.lane-confidence .lc-detail {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    white-space: nowrap;
+}
+.lane-confidence .lc-value {
+    min-width: 30px;
+    color: var(--ink);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0;
+    text-align: right;
+}
+.lane-confidence .lc-bar {
+    position: relative;
+    width: 58px;
+    height: 6px;
+    overflow: hidden;
+    border-radius: 3px;
+    background: rgba(20, 24, 32, 0.16);
+}
+.lane-confidence .lc-fill {
+    display: block;
+    width: 0%;
+    height: 100%;
+    border-radius: inherit;
+    background: #d84a4a;
+    transition: width 90ms linear, background-color 160ms ease;
+}
+.lane-confidence.ok .lc-fill {
+    background: #1f9d68;
+}
+.lane-confidence.ok .lc-value {
+    color: #1f9d68;
+}
+.lane-confidence.low .lc-value {
+    color: #d84a4a;
+}
+.protective-stop {
+    padding: 4px 8px;
+    border-radius: 4px;
+    background: #d84a4a;
+    color: #ffffff;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    white-space: nowrap;
+    animation: protective-stop-pulse 0.65s ease-in-out infinite;
+}
+.protective-stop[hidden] {
+    display: none;
+}
+@keyframes protective-stop-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
 }
 
 /* Top-of-screen alpamayo per-prediction latency + live MB/s strip.
@@ -797,4 +860,38 @@ body.compact-cams .autoware-hud {
     font-weight: 400;
     margin-left: 8px;
     letter-spacing: 0.01em;
+}
+
+/* GPS route turn announcement banner (kiosk top-center). Driven by
+   autoware.segmentation.gps_route.turn_text in pollState. */
+.turn-banner {
+    position: absolute;
+    top: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 60;
+    display: none;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 26px;
+    border-radius: 14px;
+    background: rgba(20, 20, 20, 0.85);
+    color: #fff;
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 1;
+    box-shadow: 0 3px 18px rgba(0, 0, 0, 0.5);
+}
+.turn-banner.now {
+    background: rgba(220, 38, 38, 0.95);
+    animation: turn-banner-pulse 0.7s ease-in-out infinite;
+}
+.turn-banner .turn-arrow {
+    font-size: 34px;
+    line-height: 1;
+}
+@keyframes turn-banner-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
 }
